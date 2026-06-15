@@ -1,0 +1,27 @@
+name: PR
+
+# Pull-request validation. Runs the same reusable build-cloud.yml leaf as CI
+# (lint + test + aarch64 build) so a PR is gated on exactly what lands on main.
+
+on:
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same PR.
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-cloud:
+    name: Build Cloud
+    permissions:
+      # check-cloud uploads clippy SARIF to Code Scanning.
+      security-events: write
+      actions: read
+      contents: read
+    uses: ./.github/workflows/build-cloud.yml
+    secrets: inherit

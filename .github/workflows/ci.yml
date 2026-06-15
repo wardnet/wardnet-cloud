@@ -1,0 +1,29 @@
+name: CI
+
+# Continuous integration for pushes to the default branch. The whole repo is a
+# single cloud service, so every push is in scope — no change-detection gating.
+# The actual lint + test + aarch64 build lives in the reusable build-cloud.yml
+# leaf (shared with pr.yml and release-cloud.yml).
+
+on:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-cloud:
+    name: Build Cloud
+    permissions:
+      # check-cloud uploads clippy SARIF to Code Scanning.
+      security-events: write
+      actions: read
+      contents: read
+    uses: ./.github/workflows/build-cloud.yml
+    secrets: inherit
