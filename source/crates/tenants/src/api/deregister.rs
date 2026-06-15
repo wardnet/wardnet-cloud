@@ -16,18 +16,21 @@ pub fn register(router: OpenApiRouter<AppState>) -> OpenApiRouter<AppState> {
     delete,
     path = "/v1/installs/{id}",
     tag = "installs",
-    description = "Deregister an installation. Deletes the Cloudflare A record and any \
-                   active ACME TXT record immediately, then removes the install row. \
+    description = "Deregister an installation by tombstoning its global identity. The \
+                   install can no longer authenticate or refresh its token, so its \
+                   identity JWT becomes inert within one TTL. \
                    \n\n\
-                   Idempotent on the DNS side — if Cloudflare records are already absent \
-                   the delete calls are skipped gracefully.",
+                   Regional DNS cleanup (the Cloudflare A record + any ACME TXT records) \
+                   is performed asynchronously by the DDNS reconcile reaper, which polls \
+                   the mesh introspect endpoint for tombstoned installs — it is not done \
+                   inline here (DDNS lives in a separate service).",
     params(
         ("id" = String, Path, description = "Installation UUID"),
     ),
     responses(
-        (status = 204, description = "Installation deregistered"),
+        (status = 204, description = "Installation deregistered (identity tombstoned)"),
         (status = 401, description = "Authentication required or invalid"),
-        (status = 403, description = "Bearer token does not own this install ID"),
+        (status = 403, description = "Credential does not own this install ID"),
         (status = 500, description = "Internal server error"),
     ),
 )]
@@ -38,22 +41,20 @@ pub async fn deregister(
 ) -> Result<StatusCode, ApiError> {
     if install.id != id {
         return Err(ApiError::Forbidden(
-            "bearer token does not match the requested install ID".to_string(),
+            "credential does not match the requested install ID".to_string(),
         ));
     }
 
-    // DDNS tears down the regional DNS state (A record + any live ACME TXT
-    // records) and drops the operational row; idempotent if none exists.
-    state.ddns().delete_records(&id).await?;
-
-    // Tenants removes the global identity (3d flips it to a tombstone instead).
+    // Tombstone the global identity. DNS teardown is the DDNS reaper's job (it
+    // reconciles against this service's mesh introspect endpoint) — Tenants holds
+    // no regional DNS state.
     state
         .tenants()
         .deregister_identity(&id)
         .await
         .map_err(ApiError::Internal)?;
 
-    tracing::info!(install_id = %id, name = %install.name, "installation deregistered");
+    tracing::info!(install_id = %id, name = %install.name, "installation deregistered (tombstoned)");
     Ok(StatusCode::NO_CONTENT)
 }
 

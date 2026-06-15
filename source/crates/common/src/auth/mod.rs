@@ -11,13 +11,37 @@
 //! opaque-bearer DB lookup), so it lives in each service crate and composes these
 //! primitives.
 
+use std::future::Future;
+
 use axum::http::request::Parts;
-use axum::{Json, extract::FromRequestParts, http::StatusCode};
+use axum::{
+    Json,
+    extract::{FromRequestParts, Request, State},
+    http::StatusCode,
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
+use sha2::{Digest, Sha256};
 
 use crate::error::ErrorBody;
-use crate::token::Verifier;
+use crate::replay_cache::ReplayCache;
+use crate::token::{Verifier, canonical_request_payload};
+
+/// Maximum allowed clock skew between the daemon and the service (seconds).
+const TIMESTAMP_WINDOW_SECS: i64 = 60;
+
+/// Hard body-size limit applied to **every** incoming request — a `DoS` guard that
+/// runs before any auth check so an attacker cannot exhaust memory by streaming a
+/// large body to an unauthenticated endpoint.
+const MAX_BODY_BYTES: usize = 1024 * 1024; // 1 MiB
+
+/// Path prefix for all authenticated install endpoints. The middleware only
+/// attempts authentication when the request path starts with this prefix, so
+/// unauthenticated endpoints never incur a credential resolution (closing a `DoS`
+/// vector).
+pub const AUTHENTICATED_PATH_PREFIX: &str = "/v1/installs/";
 
 // ── Authenticated principal ────────────────────────────────────────────────────
 
@@ -124,4 +148,173 @@ pub fn verify_signature_bytes(
 
     verifying_key.verify(message, &signature)?;
     Ok(())
+}
+
+// ── Generic signed-request middleware ──────────────────────────────────────────
+
+/// Per-service context the generic [`auth_layer`] middleware needs: the replay
+/// cache and a service-specific credential resolver.
+///
+/// Each service's `AppState` implements this. The credential resolver is the only
+/// part that differs between services — Tenants resolves both the identity JWT and
+/// the opaque bearer (DB lookup); DDNS/Tunneller resolve the JWT **offline only**
+/// (the identity DB lives in Tenants). Everything else — the body-size guard, the
+/// `/v1/installs/*` path gate, the ±60 s timestamp window, the canonical-payload
+/// Ed25519 proof-of-possession check, and the replay cache — is shared here so the
+/// security-critical core is identical across services.
+pub trait AuthContext: Clone + Send + Sync + 'static {
+    /// The service's in-memory replay-prevention cache.
+    fn replay_cache(&self) -> &ReplayCache;
+
+    /// Resolve a `Bearer` value to the authenticated [`Principal`] plus the daemon
+    /// public key its request signature must verify against. On failure, returns
+    /// the HTTP [`Response`] to send (a hard `401`/`500`).
+    fn resolve_credential(
+        &self,
+        token: &str,
+    ) -> impl Future<Output = Result<(Principal, [u8; 32]), Response>> + Send;
+}
+
+/// Axum middleware: an unconditional body-size guard, plus Ed25519 signed-request
+/// authentication on `/v1/installs/*` endpoints carrying an `Authorization` header.
+///
+/// Generic over the service's [`AuthContext`]; pass `auth_layer::<MyState>` to
+/// `axum::middleware::from_fn_with_state`. On success the verified [`Principal`] is
+/// stamped into request extensions (read via [`AuthenticatedInstall`]).
+pub async fn auth_layer<S: AuthContext>(
+    State(state): State<S>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let (mut parts, body) = request.into_parts();
+
+    // ── Body-size guard (runs for ALL requests) ───────────────────────────
+    let Ok(body_bytes) = axum::body::to_bytes(body, MAX_BODY_BYTES).await else {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ErrorBody {
+                error: "request body exceeds 1 MiB limit".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    // ── Auth (only for /v1/installs/* when Authorization header is present) ─
+    let path = parts.uri.path();
+    let auth_header = parts
+        .headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    if path.starts_with(AUTHENTICATED_PATH_PREFIX)
+        && let Some(auth_str) = auth_header
+    {
+        let Some(token) = auth_str.strip_prefix("Bearer ") else {
+            return unauthorized("invalid Authorization header format");
+        };
+
+        let (principal, pub_key_bytes) = match state.resolve_credential(token).await {
+            Ok(resolved) => resolved,
+            Err(rejection) => return rejection,
+        };
+
+        if let Err(rejection) =
+            verify_signed_request(&parts, &body_bytes, &principal, &pub_key_bytes, &state)
+        {
+            return rejection;
+        }
+
+        parts.extensions.insert(principal);
+    }
+
+    // Reconstitute the request with the buffered body so downstream extractors
+    // (`Json<T>`, `axum::body::Bytes`) see a normal body stream.
+    let request = Request::from_parts(parts, axum::body::Body::from(body_bytes));
+    next.run(request).await
+}
+
+/// The shared security core: the ±60 s timestamp window, the canonical signed
+/// payload (method + path-and-query + timestamp + body hash), the Ed25519
+/// signature/PoP check against `pub_key_bytes`, and the replay-cache insert (key
+/// `{install_id}:{timestamp}:{body_hash}`). Returns the rejection `Response` on any
+/// failure.
+// The `Err` is a deliberately-constructed HTTP `Response`, not a large error enum
+// that ought to be boxed — boxing would only add an allocation on the reject path.
+#[allow(clippy::result_large_err)]
+fn verify_signed_request<S: AuthContext>(
+    parts: &Parts,
+    body_bytes: &[u8],
+    principal: &Principal,
+    pub_key_bytes: &[u8; 32],
+    state: &S,
+) -> Result<(), Response> {
+    // ── Timestamp window. ──
+    let timestamp_str = parts
+        .headers
+        .get("X-Wardnet-Timestamp")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let timestamp: i64 = timestamp_str
+        .parse()
+        .map_err(|_| unauthorized("missing or invalid X-Wardnet-Timestamp"))?;
+    let now = chrono::Utc::now().timestamp();
+    if (now - timestamp).abs() > TIMESTAMP_WINDOW_SECS {
+        return Err(unauthorized("X-Wardnet-Timestamp outside ±60 s window"));
+    }
+
+    // ── Canonical payload (path AND query covered). ──
+    let method = parts.method.as_str();
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or(parts.uri.path(), axum::http::uri::PathAndQuery::as_str);
+    let body_hash = hex::encode(Sha256::digest(body_bytes));
+    let payload = canonical_request_payload(method, path_and_query, timestamp, &body_hash);
+
+    // ── Ed25519 signature check (PoP against the resolved key). ──
+    let sig_b64 = parts
+        .headers
+        .get("X-Wardnet-Signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if let Err(e) = verify_signature_bytes(pub_key_bytes, payload.as_bytes(), sig_b64) {
+        tracing::warn!(install_id = %principal.id, error = %e, "request signature verification failed");
+        return Err(unauthorized("invalid request signature"));
+    }
+
+    // ── Replay check. ──
+    let replay_key = format!("{}:{}:{}", principal.id, timestamp, body_hash);
+    if state.replay_cache().contains_or_insert(&replay_key, now) {
+        tracing::warn!(install_id = %principal.id, "replayed signed request rejected");
+        return Err(unauthorized("replayed request"));
+    }
+
+    Ok(())
+}
+
+// ── Rejection helpers (shared by service credential resolvers) ──────────────────
+
+/// Build a `401 Unauthorized` JSON response.
+#[must_use]
+pub fn unauthorized(msg: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(ErrorBody {
+            error: msg.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+/// Build a `500 Internal Server Error` JSON response (for resolver infra errors).
+#[must_use]
+pub fn internal_error() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorBody {
+            error: "internal server error".to_string(),
+        }),
+    )
+        .into_response()
 }

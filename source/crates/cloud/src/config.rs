@@ -38,12 +38,9 @@ pub struct Config {
     /// `127.0.0.1:8853` (public `:853` via nginx); forwards to tenant tunnels on 853.
     pub dot_listen_addr: String,
 
-    /// `PostgreSQL` DSN for this bridge's **regional** install DB.
+    /// `PostgreSQL` DSN for this region's **regional** install DB (operational
+    /// DNS state). The global naming authority lives in the Tenants service.
     pub database_url: String,
-
-    /// `PostgreSQL` DSN for the **global naming authority** (shared across the
-    /// fleet; holds the `names` allocation lock).
-    pub global_database_url: String,
 
     /// Cloudflare API token scoped to DNS:Edit on [`Self::cloudflare_zone_id`].
     pub cloudflare_api_token: String,
@@ -68,7 +65,6 @@ impl std::fmt::Debug for Config {
             .field("https_listen_addr", &self.https_listen_addr)
             .field("dot_listen_addr", &self.dot_listen_addr)
             .field("database_url", &"<redacted>")
-            .field("global_database_url", &"<redacted>")
             .field("cloudflare_api_token", &"<redacted>")
             .field("cloudflare_zone_id", &self.cloudflare_zone_id)
             .field("region", &self.region)
@@ -91,7 +87,6 @@ impl Config {
             dot_listen_addr: std::env::var("DOT_LISTEN_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:8853".to_string()),
             database_url: required("DATABASE_URL")?,
-            global_database_url: required("GLOBAL_DATABASE_URL")?,
             cloudflare_api_token: required("CLOUDFLARE_API_TOKEN")?,
             cloudflare_zone_id: required("CLOUDFLARE_ZONE_ID")?,
             region: required("INFORGE_DEPLOYMENT_REGION_SLUG")?,

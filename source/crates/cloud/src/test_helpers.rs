@@ -27,19 +27,6 @@ pub async fn test_pool() -> sqlx::PgPool {
     pool
 }
 
-/// Like [`test_pool`] but for the **global Tenants DB** — runs the
-/// `./migrations-global` set (identities, registration challenges, registration
-/// log). Both pools share the same test server (`CLOUD_TEST_DATABASE_URL`); each
-/// gets its own freshly-created database.
-pub async fn test_pool_global() -> sqlx::PgPool {
-    let pool = fresh_database().await;
-    sqlx::migrate!("./migrations-global")
-        .run(&pool)
-        .await
-        .expect("apply global migrations");
-    pool
-}
-
 /// Create a fresh, empty per-test database on the test server and return a pool
 /// connected to it (no migrations applied — the caller chooses the set).
 async fn fresh_database() -> sqlx::PgPool {

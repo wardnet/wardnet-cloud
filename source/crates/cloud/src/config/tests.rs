@@ -6,7 +6,6 @@ fn test_config() -> Config {
         https_listen_addr: "127.0.0.1:8443".to_string(),
         dot_listen_addr: "127.0.0.1:8853".to_string(),
         database_url: "postgres://ignored".to_string(),
-        global_database_url: "postgres://ignored-global".to_string(),
         cloudflare_api_token: "token".to_string(),
         cloudflare_zone_id: "zone-id".to_string(),
         region: "use1".to_string(),
@@ -18,7 +17,6 @@ fn test_config() -> Config {
 fn from_env_reads_required_and_optional_vars() {
     let keys = [
         "DATABASE_URL",
-        "GLOBAL_DATABASE_URL",
         "CLOUDFLARE_API_TOKEN",
         "CLOUDFLARE_ZONE_ID",
         "INFORGE_DEPLOYMENT_REGION_SLUG",
@@ -32,10 +30,6 @@ fn from_env_reads_required_and_optional_vars() {
     // SAFETY: single-threaded test binary; no concurrent env access.
     unsafe {
         std::env::set_var("DATABASE_URL", "postgres://test:test@localhost/db");
-        std::env::set_var(
-            "GLOBAL_DATABASE_URL",
-            "postgres://test:test@localhost/global",
-        );
         std::env::set_var("CLOUDFLARE_API_TOKEN", "cf-token");
         std::env::set_var("CLOUDFLARE_ZONE_ID", "cf-zone");
         std::env::set_var("INFORGE_DEPLOYMENT_REGION_SLUG", "use1");
@@ -48,10 +42,7 @@ fn from_env_reads_required_and_optional_vars() {
     let cfg = Config::from_env().expect("from_env should succeed with all required vars set");
 
     assert_eq!(cfg.region, "use1");
-    assert_eq!(
-        cfg.global_database_url,
-        "postgres://test:test@localhost/global"
-    );
+    assert_eq!(cfg.database_url, "postgres://test:test@localhost/db");
     assert_eq!(cfg.api_listen_addr, "127.0.0.1:8080"); // default
     assert_eq!(cfg.https_listen_addr, "127.0.0.1:8443"); // default
     assert_eq!(cfg.dot_listen_addr, "127.0.0.1:8853"); // default
@@ -114,5 +105,4 @@ fn debug_redacts_secrets() {
     assert!(dump.contains("zone-id")); // cloudflare_zone_id is not secret
     // Secret values must not leak (field *names* may still appear).
     assert!(!dump.contains("postgres://ignored")); // database_url redacted
-    assert!(!dump.contains("postgres://ignored-global")); // global_database_url redacted
 }

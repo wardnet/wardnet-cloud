@@ -1,11 +1,5 @@
 pub mod acme;
-pub mod challenge;
-pub mod deregister;
-pub mod introspect;
 pub mod ip;
-pub mod names;
-pub mod register;
-pub mod token;
 pub mod tunnel;
 
 use axum::Router;
@@ -14,23 +8,22 @@ use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 
-use crate::auth::middleware::auth_layer;
-use crate::error::ErrorBody;
+use wardnet_common::error::ErrorBody;
+
 use crate::state::AppState;
 
-/// `OpenAPI` document metadata.
+/// `OpenAPI` document metadata for the cloud (DDNS + Tunneller) API.
 #[derive(OpenApi)]
 #[openapi(
     info(
-        title = "Wardnet Bridge API",
-        description = "DDNS + ACME credential proxy for wardnet installations.",
+        title = "Wardnet Cloud API (DDNS + Tunneller)",
+        description = "Regional DDNS (IP + ACME challenge) and reverse-tunnel endpoints.",
         version = "0.2.0",
     ),
     tags(
         (name = "health",   description = "Liveness probes"),
-        (name = "installs", description = "Registration, IP updates, and ACME challenge lifecycle"),
+        (name = "installs", description = "IP updates and ACME challenge lifecycle"),
         (name = "tunnel",   description = "Reverse-tunnel WebSocket endpoint"),
-        (name = "internal", description = "Service-internal endpoints (mesh-mTLS-gated at the split)"),
     ),
     components(schemas(ErrorBody)),
 )]
@@ -40,24 +33,23 @@ struct ApiDoc;
 fn build_openapi_router() -> OpenApiRouter<AppState> {
     let mut r = OpenApiRouter::<AppState>::with_openapi(ApiDoc::openapi());
     r = wardnet_common::health::register(r);
-    r = challenge::register(r);
-    r = register::register(r);
-    r = names::register(r);
     r = ip::register(r);
     r = acme::register(r);
-    r = deregister::register(r);
-    r = token::register(r);
-    r = introspect::register(r);
     r = tunnel::register(r);
     r
 }
 
-/// Build the complete Axum [`Router`] with middleware applied.
+/// Build the complete Axum [`Router`] with the shared signed-request auth
+/// middleware applied. These endpoints authenticate the **external daemon** by
+/// identity JWT only — the opaque-bearer DB path lives in the Tenants service.
 pub fn router(state: AppState) -> Router {
     let (api_router, _openapi) = build_openapi_router().split_for_parts();
 
     api_router
-        .layer(middleware::from_fn_with_state(state.clone(), auth_layer))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            wardnet_common::auth::auth_layer::<AppState>,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

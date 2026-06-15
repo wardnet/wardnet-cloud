@@ -29,7 +29,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use rustls::RootCertStore;
-use rustls::pki_types::CertificateDer;
+use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::server::danger::ClientCertVerifier;
 
@@ -89,6 +90,40 @@ pub fn client_verifier_from_pem(
     WebPkiClientVerifier::builder(Arc::new(roots))
         .build()
         .map_err(|e| anyhow::anyhow!("failed to build mTLS client verifier: {e}"))
+}
+
+/// Build a rustls [`ServerConfig`] for an internal mesh listener: it presents the
+/// `server_cert_pem` chain + `server_key_pem`, and **requires** a client
+/// certificate chained to `mesh_root_pem`. A handshake presenting no client cert,
+/// or one from a different CA, is rejected — so mTLS *is* the authentication for
+/// the endpoints served behind it (e.g. Tenants' `/v1/introspect`).
+///
+/// # Errors
+/// Returns an error if any PEM is malformed/empty or the config cannot be built.
+pub fn server_config_from_pem(
+    server_cert_pem: &[u8],
+    server_key_pem: &[u8],
+    mesh_root_pem: &[u8],
+) -> anyhow::Result<Arc<ServerConfig>> {
+    let verifier = client_verifier_from_pem(mesh_root_pem)?;
+
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &server_cert_pem[..])
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("failed to parse mesh server certificate PEM: {e}"))?;
+    if certs.is_empty() {
+        anyhow::bail!("mesh server certificate PEM contained no certificates");
+    }
+
+    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut &server_key_pem[..])
+        .map_err(|e| anyhow::anyhow!("failed to parse mesh server key PEM: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("mesh server key PEM contained no private key"))?;
+
+    let config = ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)
+        .map_err(|e| anyhow::anyhow!("failed to build mesh server config: {e}"))?;
+
+    Ok(Arc::new(config))
 }
 
 /// Build a `reqwest::Client` that presents `leaf` as its client identity and

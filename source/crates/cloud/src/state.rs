@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
-use crate::config::Config;
-use crate::service::{DdnsService, TenantsService};
-use crate::tunnel::TunnelRegistry;
 use wardnet_common::replay_cache::ReplayCache;
 use wardnet_common::token::Verifier;
+
+use crate::config::Config;
+use crate::service::DdnsService;
+use crate::tunnel::TunnelRegistry;
 
 /// Shared application state injected into every Axum handler via
 /// [`axum::extract::State`].
@@ -12,22 +13,21 @@ use wardnet_common::token::Verifier;
 /// Holds the **service layer**, not repositories — handlers call services, and
 /// each service owns its own repositories (see [`crate::service`]). Cloning is
 /// cheap: the inner data lives behind an [`Arc`].
+///
+/// Identity authentication here is **JWT-only**: the global identity DB lives in
+/// the Tenants service, so this bin verifies daemon identity JWTs offline (no DB)
+/// — it holds no `TenantsService`.
 #[derive(Clone)]
 pub struct AppState(Arc<Inner>);
 
 struct Inner {
     config: Config,
-    /// Global identity + naming (registration, challenges, auth).
-    tenants: Arc<TenantsService>,
     /// Regional DNS operational plane (Cloudflare records).
     ddns: Arc<DdnsService>,
-    /// Offline verifier for Tenants-signed identity JWTs. Cross-cutting auth
-    /// infra in the monolith; at the service split this lives in DDNS/Tunneller.
+    /// Offline verifier for Tenants-signed identity JWTs.
     verifier: Verifier,
-    /// In-memory replay-prevention cache.
-    ///
-    /// Keyed by `"{install_id}:{timestamp}:{body_hash}"`; prevents a valid
-    /// signed request from being replayed within the ±60 s timestamp window.
+    /// In-memory replay-prevention cache, keyed
+    /// `"{install_id}:{timestamp}:{body_hash}"`.
     replay_cache: Arc<ReplayCache>,
     /// Registry of active Pi reverse-tunnel WebSocket connections.
     tunnel_registry: Arc<TunnelRegistry>,
@@ -37,14 +37,12 @@ impl AppState {
     #[must_use]
     pub fn new(
         config: Config,
-        tenants: Arc<TenantsService>,
         ddns: Arc<DdnsService>,
         verifier: Verifier,
         tunnel_registry: Arc<TunnelRegistry>,
     ) -> Self {
         Self(Arc::new(Inner {
             config,
-            tenants,
             ddns,
             verifier,
             replay_cache: Arc::new(ReplayCache::new()),
@@ -55,12 +53,6 @@ impl AppState {
     #[must_use]
     pub fn config(&self) -> &Config {
         &self.0.config
-    }
-
-    /// The global identity + naming service.
-    #[must_use]
-    pub fn tenants(&self) -> &TenantsService {
-        &self.0.tenants
     }
 
     /// The regional DNS operational service.

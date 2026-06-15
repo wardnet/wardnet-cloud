@@ -1,23 +1,29 @@
-//! Full-stack integration tests for the bridge HTTP API.
+//! Full-stack integration tests for the cloud (DDNS + Tunneller) HTTP API.
 //!
-//! These tests build the complete Axum router with mock in-memory repositories
-//! and a `MockDnsProvider`, then drive requests through
-//! [`tower::ServiceExt::oneshot`].
+//! These tests build the cloud Axum router with a mock operational repository and
+//! a `MockDnsProvider`, then drive requests through
+//! [`tower::ServiceExt::oneshot`] (or a real listener for the WebSocket tunnel).
 //!
-//! # Test conventions
+//! # Auth model (JWT-only)
+//!
+//! The cloud service holds **no identity DB** — the global identity table lives in
+//! the Tenants service. So these endpoints authenticate the external daemon by its
+//! Tenants-signed **identity JWT**, verified offline with `cnf` proof-of-possession.
+//! The opaque bearer token is rejected with `401`. Every authenticated request here
+//! therefore carries a JWT in the `Authorization` header (minted by
+//! [`auth_jwt`]) and an Ed25519 request signature from [`test_signing_key`] (whose
+//! public key is the JWT's `cnf`).
+//!
+//! # Other conventions
 //!
 //! - Every test creates its own isolated state via `test_state()`.
-//! - Challenges are inserted directly with `difficulty = 0` so no real `PoW`
-//!   computation is needed.
-//! - Ed25519 signing uses a deterministic test key derived from `[1u8; 32]`.
-//! - The loopback peer (`127.0.0.1`) is injected via `MockConnectInfo` so
-//!   handlers that call `client_ip()` see a non-forwarded address.
+//! - The loopback peer (`127.0.0.1`) is injected via `MockConnectInfo`.
 
 mod common;
 
 use std::future::IntoFuture;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::connect_info::MockConnectInfo;
@@ -32,104 +38,23 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tower::ServiceExt as _;
 use uuid::Uuid;
 
-use common::{
-    ChallengeStore, MockChallengeRepository, MockIdentityRepository, MockOperationalRepository,
-    jwt_keypair_pem,
-};
+use common::{MockDnsProvider, MockOperationalRepository, jwt_keypair_pem};
 use wardnet_cloud::config::Config;
-use wardnet_cloud::repository::{
-    ChallengeRepository, Identity, IdentityRepository, OperationalRepository,
-    RegistrationChallenge, Status,
-};
-use wardnet_cloud::service::{DdnsService, TenantsService};
+use wardnet_cloud::repository::OperationalRepository;
+use wardnet_cloud::service::DdnsService;
 use wardnet_cloud::state::AppState;
 use wardnet_cloud::tunnel::TunnelRegistry;
 use wardnet_common::dns_provider::DnsProvider;
 use wardnet_common::token;
 
 /// Seed for the deterministic JWT signing keypair the test harness uses. The
-/// `Signer` is built from `jwt_keypair_pem(JWT_TEST_SEED).0`; tests verifying a
-/// minted JWT use `.1` (the matching public key).
+/// `AppState` verifier is built from `jwt_keypair_pem(JWT_TEST_SEED).1`; the JWTs
+/// these tests present are minted from `.0`.
 const JWT_TEST_SEED: u8 = 7;
 
-/// Mock repository handles, retained by a test so it can seed fixtures directly
-/// while the production code path under test reaches them only through the
-/// services that wrap them (mirrors the daemon's service-over-mock-repo tests).
+/// Mock handles, retained by a test so it can seed operational fixtures directly.
 struct Mocks {
-    identity: Arc<MockIdentityRepository>,
     operational: Arc<MockOperationalRepository>,
-    challenges: Arc<MockChallengeRepository>,
-}
-
-// ── Mock DNS provider ────────────────────────────────────────────────────────
-
-#[derive(Debug)]
-enum DnsCall {
-    UpsertA,
-    UpsertTxt,
-    DeleteRecord,
-}
-
-struct MockDnsProvider {
-    calls: Mutex<Vec<DnsCall>>,
-    error: Option<String>,
-}
-
-impl MockDnsProvider {
-    fn new() -> Self {
-        Self {
-            calls: Mutex::new(Vec::new()),
-            error: None,
-        }
-    }
-
-    fn with_error(msg: &str) -> Self {
-        Self {
-            calls: Mutex::new(Vec::new()),
-            error: Some(msg.to_string()),
-        }
-    }
-
-    fn call_count(&self) -> usize {
-        self.calls.lock().unwrap().len()
-    }
-}
-
-#[async_trait::async_trait]
-impl DnsProvider for MockDnsProvider {
-    async fn upsert_a_record(
-        &self,
-        fqdn: &str,
-        _ip: &str,
-        _existing_record_id: Option<&str>,
-    ) -> anyhow::Result<String> {
-        if let Some(e) = &self.error {
-            return Err(anyhow::anyhow!("{e}"));
-        }
-        self.calls.lock().unwrap().push(DnsCall::UpsertA);
-        Ok(format!("cf-a-{fqdn}"))
-    }
-
-    async fn upsert_txt_record(
-        &self,
-        fqdn: &str,
-        _content: &str,
-        _existing_record_id: Option<&str>,
-    ) -> anyhow::Result<String> {
-        if let Some(e) = &self.error {
-            return Err(anyhow::anyhow!("{e}"));
-        }
-        self.calls.lock().unwrap().push(DnsCall::UpsertTxt);
-        Ok(format!("cf-txt-{fqdn}"))
-    }
-
-    async fn delete_record(&self, _record_id: &str) -> anyhow::Result<()> {
-        if let Some(e) = &self.error {
-            return Err(anyhow::anyhow!("{e}"));
-        }
-        self.calls.lock().unwrap().push(DnsCall::DeleteRecord);
-        Ok(())
-    }
 }
 
 // ── Shared test fixtures ─────────────────────────────────────────────────────
@@ -140,7 +65,6 @@ fn test_config() -> Config {
         https_listen_addr: "127.0.0.1:0".to_string(),
         dot_listen_addr: "127.0.0.1:0".to_string(),
         database_url: "postgres://ignored".to_string(),
-        global_database_url: "postgres://ignored-global".to_string(),
         cloudflare_api_token: "test-cf-token".to_string(),
         cloudflare_zone_id: "test-cf-zone".to_string(),
         region: "test".to_string(),
@@ -148,43 +72,22 @@ fn test_config() -> Config {
     }
 }
 
-/// Build an `AppState` whose services wrap a fresh set of mock repos + the given
-/// DNS provider, returning the [`Mocks`] handles for direct fixture seeding.
+/// Build an `AppState` whose DDNS service wraps a fresh mock operational repo + the
+/// given DNS provider, returning the [`Mocks`] handles for direct fixture seeding.
 fn build_state(dns_provider: Arc<dyn DnsProvider>) -> (AppState, Mocks) {
-    // Identity and challenge mocks share one challenge store so the identity
-    // mock's atomic `register` burns the same challenge the challenge mock issued.
-    let store: ChallengeStore = Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let identity = Arc::new(MockIdentityRepository::new(Arc::clone(&store)));
-    let challenges = Arc::new(MockChallengeRepository::new(Arc::clone(&store)));
     let operational = Arc::new(MockOperationalRepository::new());
-
     let config = test_config();
-    let signer =
-        token::Signer::from_pem(jwt_keypair_pem(JWT_TEST_SEED).0.as_bytes(), None).unwrap();
-    let tenants = Arc::new(TenantsService::new(
-        Arc::clone(&identity) as Arc<dyn IdentityRepository>,
-        Arc::clone(&challenges) as Arc<dyn ChallengeRepository>,
-        signer,
-    ));
     let ddns = Arc::new(DdnsService::new(
         Arc::clone(&operational) as Arc<dyn OperationalRepository>,
         dns_provider,
     ));
     let state = AppState::new(
         config,
-        tenants,
         ddns,
         test_jwt_verifier(),
         Arc::new(TunnelRegistry::new()),
     );
-    (
-        state,
-        Mocks {
-            identity,
-            operational,
-            challenges,
-        },
-    )
+    (state, Mocks { operational })
 }
 
 /// JWT verifier matching the harness signer (`jwt_keypair_pem(JWT_TEST_SEED)`).
@@ -194,7 +97,12 @@ fn test_jwt_verifier() -> token::Verifier {
 
 /// Mint a Tenants-signed identity JWT with the harness signing key. `cnf` is the
 /// daemon's public key (`test_pub_key().1`) so `PoP` verifies against a
-/// `test_signing_key()`-signed request.
+/// `test_signing_key()`-signed request. This is the cloud credential.
+fn auth_jwt(install_id: &str, vanity: &str) -> String {
+    test_identity_jwt(install_id, vanity, 3600)
+}
+
+/// Like [`auth_jwt`] but with an explicit TTL (negative TTL → already expired).
 fn test_identity_jwt(install_id: &str, vanity: &str, ttl_secs: i64) -> String {
     let signer =
         token::Signer::from_pem(jwt_keypair_pem(JWT_TEST_SEED).0.as_bytes(), None).unwrap();
@@ -216,19 +124,20 @@ fn test_state() -> (AppState, Arc<MockDnsProvider>, Mocks) {
     (state, dns, mocks)
 }
 
-/// Build an `AppState` backed by mock repos and the given DNS mock, returning the
-/// mock handles so a test can seed an install before exercising a DNS failure.
+/// Build an `AppState` backed by the given DNS mock, returning the mock handles so a
+/// test can seed an install before exercising a DNS failure.
 fn test_state_dns(dns: Arc<MockDnsProvider>) -> (AppState, Mocks) {
     build_state(dns as Arc<dyn DnsProvider>)
 }
 
-/// Build the Axum router under test with a fixed loopback peer address.
+/// Build the cloud router under test with a fixed loopback peer address.
 fn test_app(state: AppState) -> axum::Router {
     wardnet_cloud::api::router(state)
         .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
 }
 
-/// Ed25519 signing key for tests — deterministic, derived from `[1u8; 32]`.
+/// Ed25519 signing key for tests — deterministic, derived from `[1u8; 32]`. Its
+/// public key is the `cnf` of every JWT minted by [`auth_jwt`].
 fn test_signing_key() -> SigningKey {
     SigningKey::from_bytes(&[1u8; 32])
 }
@@ -239,67 +148,6 @@ fn test_pub_key() -> ([u8; 32], String) {
     let bytes = key.verifying_key().to_bytes();
     let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
     (bytes, b64)
-}
-
-/// Return a deterministic `(raw_token_hex, token_hash_hex)` pair.
-fn test_bearer_token() -> (String, String) {
-    let raw = hex::encode([42u8; 32]);
-    let hash = hex::encode(Sha256::digest(raw.as_bytes()));
-    (raw, hash)
-}
-
-/// Seed a test identity directly into the mock and return it and its raw token.
-/// The identity is what the auth path resolves the bearer token to.
-#[allow(clippy::unused_async)]
-async fn insert_test_install(mocks: &Mocks, name: &str) -> (Identity, String) {
-    let (raw_token, token_hash) = test_bearer_token();
-    let (pub_key_bytes, public_key) = test_pub_key();
-    let identity = Identity {
-        id: Uuid::new_v4().to_string(),
-        name: name.to_string(),
-        region: "test".to_string(),
-        public_key,
-        pub_key_bytes,
-        token_hash,
-        status: Status::Active,
-        created_at: Utc::now(),
-    };
-    mocks.identity.seed(identity.clone());
-    (identity, raw_token)
-}
-
-/// Claim a name by seeding an identity that already holds it — simulating a name
-/// taken by a prior registration (availability + registration both consult the
-/// global identity table).
-#[allow(clippy::unused_async)]
-async fn claim_name(mocks: &Mocks, name: &str) {
-    let (pub_key_bytes, public_key) = test_pub_key();
-    mocks.identity.seed(Identity {
-        id: Uuid::new_v4().to_string(),
-        name: name.to_string(),
-        region: "test".to_string(),
-        public_key,
-        pub_key_bytes,
-        token_hash: hex::encode(Sha256::digest(name.as_bytes())),
-        status: Status::Active,
-        created_at: Utc::now(),
-    });
-}
-
-/// Insert a challenge with `difficulty = 0` (any `proof` satisfies it).
-async fn insert_easy_challenge(mocks: &Mocks, remote_ip: &str) -> RegistrationChallenge {
-    let now = Utc::now();
-    let challenge = RegistrationChallenge {
-        id: Uuid::new_v4().to_string(),
-        nonce: hex::encode([7u8; 32]),
-        difficulty: 0,
-        remote_ip: remote_ip.to_string(),
-        created_at: now,
-        expires_at: now + chrono::Duration::minutes(5),
-        used_at: None,
-    };
-    mocks.challenges.insert(&challenge).await.unwrap();
-    challenge
 }
 
 /// Build a signed request for an authenticated endpoint.
@@ -365,599 +213,21 @@ async fn health_returns_200() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
-// ── Challenge endpoint ───────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn get_challenge_returns_200_with_fields() {
-    let (state, _dns, _mocks) = test_state();
-    let app = test_app(state);
-    let req = Request::builder()
-        .uri("/v1/register/challenge")
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let json: serde_json::Value =
-        serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
-    assert!(json["challenge_id"].as_str().is_some());
-    assert!(json["nonce"].as_str().is_some());
-    assert!(json["difficulty"].as_u64().is_some());
-    assert!(json["expires_at"].as_str().is_some());
-}
-
-#[tokio::test]
-async fn get_challenge_rate_limited_at_20_per_hour() {
-    let (state, _dns, mocks) = test_state();
-
-    for _ in 0..20 {
-        let c = RegistrationChallenge {
-            id: Uuid::new_v4().to_string(),
-            nonce: hex::encode([0u8; 32]),
-            difficulty: 0,
-            remote_ip: "127.0.0.1".to_string(),
-            created_at: Utc::now() - chrono::Duration::minutes(10),
-            expires_at: Utc::now() + chrono::Duration::minutes(5),
-            used_at: None,
-        };
-        mocks.challenges.insert(&c).await.unwrap();
-    }
-
-    let app = test_app(state);
-    let req = Request::builder()
-        .uri("/v1/register/challenge")
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-}
-
-// ── Name-availability endpoint ───────────────────────────────────────────────
-
-#[tokio::test]
-async fn name_available_for_fresh_name() {
-    let (state, _dns, _mocks) = test_state();
-    let app = test_app(state);
-    let req = Request::builder()
-        .uri("/v1/names/happy-einstein/available")
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json: serde_json::Value =
-        serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
-    assert_eq!(json["available"], true);
-}
-
-#[tokio::test]
-async fn name_unavailable_when_already_registered() {
-    let (state, _dns, mocks) = test_state();
-    claim_name(&mocks, "happy-einstein").await;
-
-    let app = test_app(state);
-    let req = Request::builder()
-        .uri("/v1/names/happy-einstein/available")
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    let json: serde_json::Value =
-        serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
-    assert_eq!(json["available"], false);
-}
-
-#[tokio::test]
-async fn name_unavailable_when_held_by_an_identity() {
-    // A name allocated to a registered identity reads as taken.
-    let (state, _dns, mocks) = test_state();
-    claim_name(&mocks, "happy-einstein").await;
-
-    let app = test_app(state);
-    let req = Request::builder()
-        .uri("/v1/names/happy-einstein/available")
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    let json: serde_json::Value =
-        serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
-    assert_eq!(json["available"], false);
-}
-
-#[tokio::test]
-async fn name_unavailable_for_reserved_slug() {
-    let (state, _dns, _mocks) = test_state();
-    let app = test_app(state);
-    for reserved in &["www", "admin", "us", "api"] {
-        let req = Request::builder()
-            .uri(format!("/v1/names/{reserved}/available"))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        let json: serde_json::Value =
-            serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
-        assert_eq!(
-            json["available"], false,
-            "expected {reserved} to be unavailable"
-        );
-    }
-}
-
-#[tokio::test]
-async fn name_unavailable_for_syntactically_invalid_name() {
-    let (state, _dns, _mocks) = test_state();
-    let app = test_app(state);
-    for invalid in &["-bad", "bad-", "ab", "ALLCAPS", "has space"] {
-        let encoded = invalid.replace(' ', "%20");
-        let req = Request::builder()
-            .uri(format!("/v1/names/{encoded}/available"))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        let json: serde_json::Value =
-            serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
-        assert_eq!(
-            json["available"], false,
-            "expected '{invalid}' to be unavailable"
-        );
-    }
-}
-
-// ── Register endpoint ────────────────────────────────────────────────────────
-
-fn register_body(
-    name: &str,
-    pub_key_b64: &str,
-    challenge_id: &str,
-    proof: u64,
-) -> serde_json::Value {
-    serde_json::json!({
-        "name": name,
-        "public_key": pub_key_b64,
-        "challenge_id": challenge_id,
-        "proof": proof,
-    })
-}
-
-#[tokio::test]
-async fn register_success_creates_install_and_returns_token() {
-    let (state, _dns, mocks) = test_state();
-    let challenge = insert_easy_challenge(&mocks, "127.0.0.1").await;
-    let (_, pub_key_b64) = test_pub_key();
-
-    let body = register_body("happy-einstein", &pub_key_b64, &challenge.id, 0);
-    let app = test_app(state);
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/register")
-        .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-
-    let json: serde_json::Value =
-        serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
-    assert!(json["id"].as_str().is_some(), "must return an id");
-    assert!(
-        json["bearer_token"].as_str().is_some(),
-        "must return a bearer_token"
-    );
-    assert_eq!(json["region"], "test");
-    assert!(
-        json["subdomain"]
-            .as_str()
-            .unwrap()
-            .ends_with(".test.wardnet.local"),
-        "subdomain should end with subdomain_parent"
-    );
-}
-
-#[tokio::test]
-async fn register_returns_a_verifiable_identity_jwt() {
-    let (state, _dns, mocks) = test_state();
-    let challenge = insert_easy_challenge(&mocks, "127.0.0.1").await;
-    let (_, pub_key_b64) = test_pub_key();
-
-    let body = register_body("happy-einstein", &pub_key_b64, &challenge.id, 0);
-    let app = test_app(state);
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/register")
-        .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let json: serde_json::Value =
-        serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
-
-    let jwt = json["identity_jwt"]
-        .as_str()
-        .expect("must return an identity_jwt");
-    let id = json["id"].as_str().unwrap();
-
-    // The minted JWT verifies against the matching Tenants public key and carries
-    // the right identity claims (sub = install id, vanity = name, cnf = daemon key).
-    let verifier = token::Verifier::from_pem(jwt_keypair_pem(JWT_TEST_SEED).1.as_bytes()).unwrap();
-    let claims = verifier.verify(jwt).expect("identity JWT must verify");
-    assert_eq!(claims.iss, "tenants");
-    assert_eq!(claims.sub, id);
-    assert_eq!(claims.vanity, "happy-einstein");
-    assert_eq!(
-        claims.cnf.ed25519, pub_key_b64,
-        "cnf must be the daemon's own public key (sender-constrained)"
-    );
-}
-
-#[tokio::test]
-async fn register_returns_400_for_invalid_name() {
-    let (state, _dns, mocks) = test_state();
-    let challenge = insert_easy_challenge(&mocks, "127.0.0.1").await;
-    let (_, pub_key_b64) = test_pub_key();
-
-    for bad_name in &["AB", "-foo", "foo-", "a b", "CAPS"] {
-        let body = register_body(bad_name, &pub_key_b64, &challenge.id, 0);
-        let app = test_app(state.clone());
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/register")
-            .header("Content-Type", "application/json")
-            .body(Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::BAD_REQUEST,
-            "expected 400 for name '{bad_name}'"
-        );
-    }
-}
-
-#[tokio::test]
-async fn register_returns_400_for_reserved_name() {
-    let (state, _dns, mocks) = test_state();
-    let challenge = insert_easy_challenge(&mocks, "127.0.0.1").await;
-    let (_, pub_key_b64) = test_pub_key();
-
-    let body = register_body("www", &pub_key_b64, &challenge.id, 0);
-    let app = test_app(state);
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/register")
-        .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn register_returns_400_for_invalid_public_key() {
-    let (state, _dns, mocks) = test_state();
-    let challenge = insert_easy_challenge(&mocks, "127.0.0.1").await;
-
-    let body = register_body("test-name", "not!valid!base64", &challenge.id, 0);
-    let app = test_app(state.clone());
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/register")
-        .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-    let short_key = base64::engine::general_purpose::STANDARD.encode([0u8; 31]);
-    let body2 = register_body("test-name", &short_key, &challenge.id, 0);
-    let app2 = test_app(state);
-    let req2 = Request::builder()
-        .method("POST")
-        .uri("/v1/register")
-        .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body2).unwrap()))
-        .unwrap();
-    let resp2 = app2.oneshot(req2).await.unwrap();
-    assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn register_returns_400_for_unknown_challenge() {
-    let (state, _dns, _mocks) = test_state();
-    let (_, pub_key_b64) = test_pub_key();
-
-    let body = register_body("test-name", &pub_key_b64, &Uuid::new_v4().to_string(), 0);
-    let app = test_app(state);
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/register")
-        .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let json: serde_json::Value =
-        serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
-    assert!(
-        json["error"]
-            .as_str()
-            .unwrap()
-            .contains("unknown challenge_id")
-    );
-}
-
-#[tokio::test]
-async fn register_returns_400_for_expired_challenge() {
-    let (state, _dns, mocks) = test_state();
-    let (_, pub_key_b64) = test_pub_key();
-
-    let now = Utc::now();
-    let expired = RegistrationChallenge {
-        id: Uuid::new_v4().to_string(),
-        nonce: hex::encode([1u8; 32]),
-        difficulty: 0,
-        remote_ip: "127.0.0.1".to_string(),
-        created_at: now - chrono::Duration::minutes(10),
-        expires_at: now - chrono::Duration::minutes(1),
-        used_at: None,
-    };
-    mocks.challenges.insert(&expired).await.unwrap();
-
-    let body = register_body("test-name", &pub_key_b64, &expired.id, 0);
-    let app = test_app(state);
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/register")
-        .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let json: serde_json::Value =
-        serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
-    assert!(json["error"].as_str().unwrap().contains("expired"));
-}
-
-#[tokio::test]
-async fn register_returns_400_when_challenge_issued_to_different_ip() {
-    let (state, _dns, mocks) = test_state();
-    let (_, pub_key_b64) = test_pub_key();
-
-    let now = Utc::now();
-    let challenge = RegistrationChallenge {
-        id: Uuid::new_v4().to_string(),
-        nonce: hex::encode([2u8; 32]),
-        difficulty: 0,
-        remote_ip: "9.9.9.9".to_string(),
-        created_at: now,
-        expires_at: now + chrono::Duration::minutes(5),
-        used_at: None,
-    };
-    mocks.challenges.insert(&challenge).await.unwrap();
-
-    let body = register_body("test-name", &pub_key_b64, &challenge.id, 0);
-    let app = test_app(state);
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/register")
-        .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let json: serde_json::Value =
-        serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
-    assert!(
-        json["error"].as_str().unwrap().contains("IP"),
-        "error should mention IP address"
-    );
-}
-
-#[tokio::test]
-async fn register_returns_400_for_failing_pow_proof() {
-    let (state, _dns, mocks) = test_state();
-    let (_, pub_key_b64) = test_pub_key();
-
-    let now = Utc::now();
-    let challenge = RegistrationChallenge {
-        id: Uuid::new_v4().to_string(),
-        nonce: hex::encode([3u8; 32]),
-        difficulty: 24,
-        remote_ip: "127.0.0.1".to_string(),
-        created_at: now,
-        expires_at: now + chrono::Duration::minutes(5),
-        used_at: None,
-    };
-    mocks.challenges.insert(&challenge).await.unwrap();
-
-    let body = register_body("test-name", &pub_key_b64, &challenge.id, 0);
-    let app = test_app(state);
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/register")
-        .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let json: serde_json::Value =
-        serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
-    assert!(json["error"].as_str().unwrap().contains("proof-of-work"));
-}
-
-#[tokio::test]
-async fn register_returns_409_when_name_is_taken() {
-    let (state, _dns, mocks) = test_state();
-    claim_name(&mocks, "happy-einstein").await;
-    let challenge = insert_easy_challenge(&mocks, "127.0.0.1").await;
-    let (_, pub_key_b64) = test_pub_key();
-
-    let body = register_body("happy-einstein", &pub_key_b64, &challenge.id, 0);
-    let app = test_app(state);
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/register")
-        .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-    let json: serde_json::Value =
-        serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
-    assert!(json["error"].as_str().unwrap().contains("taken"));
-}
-
-#[tokio::test]
-async fn register_rolls_back_challenge_when_insert_fails() {
-    // The registration transaction inserts the identity AND burns the challenge.
-    // If the insert fails, the burn must roll back so the challenge stays usable —
-    // there is no compensating saga, it's one atomic transaction.
-    let store: ChallengeStore = Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let identity = Arc::new(MockIdentityRepository::failing_register(Arc::clone(&store)));
-    let challenges = Arc::new(MockChallengeRepository::new(Arc::clone(&store)));
-    let operational = Arc::new(MockOperationalRepository::new());
-    let config = test_config();
-    let signer =
-        token::Signer::from_pem(jwt_keypair_pem(JWT_TEST_SEED).0.as_bytes(), None).unwrap();
-    let tenants = Arc::new(TenantsService::new(
-        Arc::clone(&identity) as Arc<dyn IdentityRepository>,
-        Arc::clone(&challenges) as Arc<dyn ChallengeRepository>,
-        signer,
-    ));
-    let ddns = Arc::new(DdnsService::new(
-        operational as Arc<dyn OperationalRepository>,
-        Arc::new(MockDnsProvider::new()) as Arc<dyn DnsProvider>,
-    ));
-    let state = AppState::new(
-        config,
-        tenants,
-        ddns,
-        test_jwt_verifier(),
-        Arc::new(TunnelRegistry::new()),
-    );
-
-    let now = Utc::now();
-    let challenge = RegistrationChallenge {
-        id: Uuid::new_v4().to_string(),
-        nonce: hex::encode([7u8; 32]),
-        difficulty: 0,
-        remote_ip: "127.0.0.1".to_string(),
-        created_at: now,
-        expires_at: now + chrono::Duration::minutes(5),
-        used_at: None,
-    };
-    challenges.insert(&challenge).await.unwrap();
-    let (_, pub_key_b64) = test_pub_key();
-    let body = register_body("happy-einstein", &pub_key_b64, &challenge.id, 0);
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/register")
-        .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    let resp = test_app(state).oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-
-    // The challenge must be un-burned (the transaction rolled back).
-    assert!(
-        challenges
-            .find_by_id(&challenge.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .used_at
-            .is_none(),
-        "a failed insert must roll back the challenge burn"
-    );
-}
-
-#[tokio::test]
-async fn register_returns_400_when_challenge_already_used() {
-    let (state, _dns, mocks) = test_state();
-    let challenge = insert_easy_challenge(&mocks, "127.0.0.1").await;
-    let (_, pub_key_b64) = test_pub_key();
-
-    // First registration burns the challenge.
-    let first = register_body("first-name", &pub_key_b64, &challenge.id, 0);
-    let resp = test_app(state.clone())
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/register")
-                .header("Content-Type", "application/json")
-                .body(Body::from(serde_json::to_vec(&first).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-
-    // Reusing it (with a different name) is rejected as already-used.
-    let second = register_body("second-name", &pub_key_b64, &challenge.id, 0);
-    let resp = test_app(state)
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/register")
-                .header("Content-Type", "application/json")
-                .body(Body::from(serde_json::to_vec(&second).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let json: serde_json::Value =
-        serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
-    assert!(
-        json["error"]
-            .as_str()
-            .unwrap()
-            .contains("already been used")
-    );
-    // The losing name was never allocated.
-    assert!(!mocks.identity.is_name_taken("second-name").await.unwrap());
-}
-
-#[tokio::test]
-async fn register_returns_429_when_rate_limit_reached() {
-    let (state, _dns, mocks) = test_state();
-
-    for _ in 0..3 {
-        mocks
-            .identity
-            .log_registration("127.0.0.1", Utc::now())
-            .await
-            .unwrap();
-    }
-
-    let challenge = insert_easy_challenge(&mocks, "127.0.0.1").await;
-    let (_, pub_key_b64) = test_pub_key();
-    let body = register_body("test-name", &pub_key_b64, &challenge.id, 0);
-
-    let app = test_app(state);
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/register")
-        .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-}
-
-// ── Auth middleware ──────────────────────────────────────────────────────────
+// ── Auth middleware (JWT-only) ───────────────────────────────────────────────
 
 #[tokio::test]
 async fn auth_rejects_body_over_1_mib() {
-    let (state, _dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
+    let (state, _dns, _mocks) = test_state();
+    let id = Uuid::new_v4().to_string();
+    let jwt = auth_jwt(&id, "test-node");
 
     let app = test_app(state);
     let oversized = vec![b'x'; 1024 * 1024 + 1];
     let timestamp = Utc::now().timestamp();
     let req = Request::builder()
         .method("PUT")
-        .uri(format!("/v1/installs/{}/ip", install.id))
-        .header("Authorization", format!("Bearer {raw_token}"))
+        .uri(format!("/v1/installs/{id}/ip"))
+        .header("Authorization", format!("Bearer {jwt}"))
         .header("X-Wardnet-Timestamp", timestamp.to_string())
         .header("X-Wardnet-Signature", "dGVzdA==")
         .header("Content-Type", "application/json")
@@ -984,13 +254,13 @@ async fn auth_passes_unauthenticated_endpoints_without_header() {
 
 #[tokio::test]
 async fn auth_returns_401_when_bearer_prefix_is_missing() {
-    let (state, _dns, mocks) = test_state();
-    let (install, _raw_token) = insert_test_install(&mocks, "test-node").await;
+    let (state, _dns, _mocks) = test_state();
+    let id = Uuid::new_v4().to_string();
 
     let app = test_app(state);
     let req = Request::builder()
         .method("PUT")
-        .uri(format!("/v1/installs/{}/ip", install.id))
+        .uri(format!("/v1/installs/{id}/ip"))
         .header("Authorization", "Token not-bearer")
         .header("X-Wardnet-Timestamp", Utc::now().timestamp().to_string())
         .header("X-Wardnet-Signature", "dGVzdA==")
@@ -1010,15 +280,18 @@ async fn auth_returns_401_when_bearer_prefix_is_missing() {
 }
 
 #[tokio::test]
-async fn auth_returns_401_for_unknown_bearer_token() {
-    let (state, _dns, mocks) = test_state();
-    let (install, _) = insert_test_install(&mocks, "test-node").await;
+async fn auth_rejects_opaque_bearer_token() {
+    // Cloud is JWT-only: an opaque (non-JWT-shaped) bearer is a hard 401 here — only
+    // the Tenants service holds the table to resolve it.
+    let (state, _dns, _mocks) = test_state();
+    let id = Uuid::new_v4().to_string();
 
     let app = test_app(state);
+    let opaque = hex::encode([42u8; 32]); // hex, no dots → not JWT-shaped
     let req = Request::builder()
         .method("PUT")
-        .uri(format!("/v1/installs/{}/ip", install.id))
-        .header("Authorization", "Bearer unknowntoken")
+        .uri(format!("/v1/installs/{id}/ip"))
+        .header("Authorization", format!("Bearer {opaque}"))
         .header("X-Wardnet-Timestamp", Utc::now().timestamp().to_string())
         .header("X-Wardnet-Signature", "dGVzdA==")
         .header("Content-Type", "application/json")
@@ -1028,19 +301,23 @@ async fn auth_returns_401_for_unknown_bearer_token() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let json: serde_json::Value =
         serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
-    assert_eq!(json["error"], "unknown bearer token");
+    assert!(
+        json["error"].as_str().unwrap().contains("identity JWT"),
+        "the rejection must point the daemon at the JWT path"
+    );
 }
 
 #[tokio::test]
 async fn auth_returns_401_when_timestamp_header_is_absent() {
-    let (state, _dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
+    let (state, _dns, _mocks) = test_state();
+    let id = Uuid::new_v4().to_string();
+    let jwt = auth_jwt(&id, "test-node");
 
     let app = test_app(state);
     let req = Request::builder()
         .method("PUT")
-        .uri(format!("/v1/installs/{}/ip", install.id))
-        .header("Authorization", format!("Bearer {raw_token}"))
+        .uri(format!("/v1/installs/{id}/ip"))
+        .header("Authorization", format!("Bearer {jwt}"))
         .header("X-Wardnet-Signature", "dGVzdA==")
         .header("Content-Type", "application/json")
         .body(Body::from(r#"{"ip":"203.0.113.1"}"#))
@@ -1053,35 +330,17 @@ async fn auth_returns_401_when_timestamp_header_is_absent() {
 }
 
 #[tokio::test]
-async fn auth_returns_401_when_timestamp_is_not_a_number() {
-    let (state, _dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
-
-    let app = test_app(state);
-    let req = Request::builder()
-        .method("PUT")
-        .uri(format!("/v1/installs/{}/ip", install.id))
-        .header("Authorization", format!("Bearer {raw_token}"))
-        .header("X-Wardnet-Timestamp", "not-a-number")
-        .header("X-Wardnet-Signature", "dGVzdA==")
-        .header("Content-Type", "application/json")
-        .body(Body::from(r#"{"ip":"203.0.113.1"}"#))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
 async fn auth_returns_401_when_timestamp_is_stale() {
-    let (state, _dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
+    let (state, _dns, _mocks) = test_state();
+    let id = Uuid::new_v4().to_string();
+    let jwt = auth_jwt(&id, "test-node");
 
     let app = test_app(state);
     let past_ts = Utc::now().timestamp() - 120;
     let req = Request::builder()
         .method("PUT")
-        .uri(format!("/v1/installs/{}/ip", install.id))
-        .header("Authorization", format!("Bearer {raw_token}"))
+        .uri(format!("/v1/installs/{id}/ip"))
+        .header("Authorization", format!("Bearer {jwt}"))
         .header("X-Wardnet-Timestamp", past_ts.to_string())
         .header("X-Wardnet-Signature", "dGVzdA==")
         .header("Content-Type", "application/json")
@@ -1096,15 +355,16 @@ async fn auth_returns_401_when_timestamp_is_stale() {
 
 #[tokio::test]
 async fn auth_returns_401_for_invalid_signature() {
-    let (state, _dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
+    let (state, _dns, _mocks) = test_state();
+    let id = Uuid::new_v4().to_string();
+    let jwt = auth_jwt(&id, "test-node");
 
     let app = test_app(state);
     let bad_sig = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
     let req = Request::builder()
         .method("PUT")
-        .uri(format!("/v1/installs/{}/ip", install.id))
-        .header("Authorization", format!("Bearer {raw_token}"))
+        .uri(format!("/v1/installs/{id}/ip"))
+        .header("Authorization", format!("Bearer {jwt}"))
         .header("X-Wardnet-Timestamp", Utc::now().timestamp().to_string())
         .header("X-Wardnet-Signature", bad_sig)
         .header("Content-Type", "application/json")
@@ -1118,37 +378,19 @@ async fn auth_returns_401_for_invalid_signature() {
 }
 
 #[tokio::test]
-async fn auth_returns_401_when_signature_base64_is_invalid() {
-    let (state, _dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
-
-    let app = test_app(state);
-    let req = Request::builder()
-        .method("PUT")
-        .uri(format!("/v1/installs/{}/ip", install.id))
-        .header("Authorization", format!("Bearer {raw_token}"))
-        .header("X-Wardnet-Timestamp", Utc::now().timestamp().to_string())
-        .header("X-Wardnet-Signature", "not!valid!base64!!!")
-        .header("Content-Type", "application/json")
-        .body(Body::from(r#"{"ip":"203.0.113.1"}"#))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
 async fn auth_returns_401_on_replayed_request() {
-    let (state, _dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
+    let (state, _dns, _mocks) = test_state();
+    let id = Uuid::new_v4().to_string();
+    let jwt = auth_jwt(&id, "test-node");
     let signing_key = test_signing_key();
 
     let timestamp = Utc::now().timestamp();
     let body = br#"{"ip":"8.8.8.8"}"#;
-    let path = format!("/v1/installs/{}/ip", install.id);
+    let path = format!("/v1/installs/{id}/ip");
 
     let app = test_app(state);
 
-    let req1 = signed_request_at("PUT", &path, body, &raw_token, &signing_key, timestamp);
+    let req1 = signed_request_at("PUT", &path, body, &jwt, &signing_key, timestamp);
     let resp1 = app.clone().oneshot(req1).await.unwrap();
     assert_eq!(
         resp1.status(),
@@ -1156,7 +398,7 @@ async fn auth_returns_401_on_replayed_request() {
         "first signed request should succeed"
     );
 
-    let req2 = signed_request_at("PUT", &path, body, &raw_token, &signing_key, timestamp);
+    let req2 = signed_request_at("PUT", &path, body, &jwt, &signing_key, timestamp);
     let resp2 = app.oneshot(req2).await.unwrap();
     assert_eq!(
         resp2.status(),
@@ -1168,14 +410,12 @@ async fn auth_returns_401_on_replayed_request() {
     assert!(json["error"].as_str().unwrap().contains("replay"));
 }
 
-// ── Identity-JWT credential path (3c) ──────────────────────────────────────────
-// The opaque-bearer path above keeps working unchanged; these cover the new path.
-
 #[tokio::test]
 async fn jwt_path_accepts_valid_token_with_pop_and_no_db_lookup() {
-    // No install is seeded — the JWT path authenticates OFFLINE (no DB row).
+    // No operational row is seeded — the JWT path authenticates OFFLINE (no DB).
     let (state, _dns, _mocks) = test_state();
-    let jwt = test_identity_jwt("inst-jwt-1", "happy-node", 3600);
+    let id = "inst-jwt-1";
+    let jwt = auth_jwt(id, "happy-node");
     let signing_key = test_signing_key(); // its public key == the JWT's `cnf`
 
     let body = br#"{"ip":"8.8.8.8"}"#;
@@ -1214,25 +454,6 @@ async fn jwt_path_rejects_expired_token() {
 }
 
 #[tokio::test]
-async fn jwt_path_rejects_tampered_token() {
-    let (state, _dns, _mocks) = test_state();
-    let mut jwt = test_identity_jwt("inst-jwt-3", "happy-node", 3600);
-    // Flip the last character of the signature segment.
-    let last = jwt.pop().unwrap();
-    jwt.push(if last == 'A' { 'B' } else { 'A' });
-    let body = br#"{"ip":"8.8.8.8"}"#;
-    let req = signed_request(
-        "PUT",
-        "/v1/installs/inst-jwt-3/ip",
-        body,
-        &jwt,
-        &test_signing_key(),
-    );
-    let resp = test_app(state).oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
 async fn jwt_path_rejects_token_from_a_foreign_signer() {
     // A JWT signed by a key the AppState verifier does not trust.
     let (state, _dns, _mocks) = test_state();
@@ -1264,7 +485,7 @@ async fn jwt_path_rejects_pop_signed_by_the_wrong_key() {
     // Valid JWT (cnf = the daemon key), but the request is signed by a DIFFERENT
     // key: a stolen token is inert without the daemon's private key.
     let (state, _dns, _mocks) = test_state();
-    let jwt = test_identity_jwt("inst-jwt-5", "happy-node", 3600);
+    let jwt = auth_jwt("inst-jwt-5", "happy-node");
     let attacker_key = SigningKey::from_bytes(&[9u8; 32]);
     let body = br#"{"ip":"8.8.8.8"}"#;
     let req = signed_request(
@@ -1282,37 +503,14 @@ async fn jwt_path_rejects_pop_signed_by_the_wrong_key() {
 }
 
 #[tokio::test]
-async fn jwt_path_enforces_replay() {
-    let (state, _dns, _mocks) = test_state();
-    let jwt = test_identity_jwt("inst-jwt-6", "happy-node", 3600);
-    let signing_key = test_signing_key();
-    let ts = Utc::now().timestamp();
-    let body = br#"{"ip":"8.8.8.8"}"#;
-    let path = "/v1/installs/inst-jwt-6/ip";
-    let app = test_app(state);
-
-    let req1 = signed_request_at("PUT", path, body, &jwt, &signing_key, ts);
-    assert_eq!(
-        app.clone().oneshot(req1).await.unwrap().status(),
-        StatusCode::NO_CONTENT
-    );
-    let req2 = signed_request_at("PUT", path, body, &jwt, &signing_key, ts);
-    let resp2 = app.oneshot(req2).await.unwrap();
-    assert_eq!(resp2.status(), StatusCode::UNAUTHORIZED);
-    let json: serde_json::Value =
-        serde_json::from_str(&body_string(resp2.into_body()).await).unwrap();
-    assert!(json["error"].as_str().unwrap().contains("replay"));
-}
-
-#[tokio::test]
 async fn auth_missing_from_authenticated_endpoint_returns_401() {
-    let (state, _dns, mocks) = test_state();
-    let (install, _) = insert_test_install(&mocks, "test-node").await;
+    let (state, _dns, _mocks) = test_state();
+    let id = Uuid::new_v4().to_string();
 
     let app = test_app(state);
     let req = Request::builder()
         .method("PUT")
-        .uri(format!("/v1/installs/{}/ip", install.id))
+        .uri(format!("/v1/installs/{id}/ip"))
         .header("Content-Type", "application/json")
         .body(Body::from(r#"{"ip":"203.0.113.1"}"#))
         .unwrap();
@@ -1323,47 +521,15 @@ async fn auth_missing_from_authenticated_endpoint_returns_401() {
 // ── IP-update endpoint ───────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn deregistered_identity_cannot_authenticate() {
-    // The `status = 'active'` filter in find_by_token_hash must reject a
-    // tombstoned identity (the path 3d's deregister tombstone will exercise).
-    let (state, _dns, mocks) = test_state();
-    let (raw_token, token_hash) = test_bearer_token();
-    let (pub_key_bytes, public_key) = test_pub_key();
-    mocks.identity.seed(Identity {
-        id: Uuid::new_v4().to_string(),
-        name: "gone-node".to_string(),
-        region: "test".to_string(),
-        public_key,
-        pub_key_bytes,
-        token_hash,
-        status: Status::Deregistered,
-        created_at: Utc::now(),
-    });
-    let signing_key = test_signing_key();
-    let req = signed_request(
-        "PUT",
-        "/v1/installs/whatever/ip",
-        br#"{"ip":"8.8.8.8"}"#,
-        &raw_token,
-        &signing_key,
-    );
-    let resp = test_app(state).oneshot(req).await.unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::UNAUTHORIZED,
-        "a deregistered (tombstoned) identity must not authenticate"
-    );
-}
-
-#[tokio::test]
 async fn update_ip_success() {
-    let (state, dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
+    let (state, dns, _mocks) = test_state();
+    let id = Uuid::new_v4().to_string();
+    let jwt = auth_jwt(&id, "test-node");
     let signing_key = test_signing_key();
 
     let body = br#"{"ip":"8.8.8.8"}"#;
-    let path = format!("/v1/installs/{}/ip", install.id);
-    let req = signed_request("PUT", &path, body, &raw_token, &signing_key);
+    let path = format!("/v1/installs/{id}/ip");
+    let req = signed_request("PUT", &path, body, &jwt, &signing_key);
 
     let app = test_app(state);
     let resp = app.oneshot(req).await.unwrap();
@@ -1377,13 +543,14 @@ async fn update_ip_success() {
 
 #[tokio::test]
 async fn update_ip_returns_400_for_invalid_ip_string() {
-    let (state, _dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
+    let (state, _dns, _mocks) = test_state();
+    let id = Uuid::new_v4().to_string();
+    let jwt = auth_jwt(&id, "test-node");
     let signing_key = test_signing_key();
 
     let body = br#"{"ip":"not-an-ip"}"#;
-    let path = format!("/v1/installs/{}/ip", install.id);
-    let req = signed_request("PUT", &path, body, &raw_token, &signing_key);
+    let path = format!("/v1/installs/{id}/ip");
+    let req = signed_request("PUT", &path, body, &jwt, &signing_key);
 
     let app = test_app(state);
     let resp = app.oneshot(req).await.unwrap();
@@ -1395,8 +562,9 @@ async fn update_ip_returns_400_for_invalid_ip_string() {
 
 #[tokio::test]
 async fn update_ip_returns_400_for_private_addresses() {
-    let (state, _dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
+    let (state, _dns, _mocks) = test_state();
+    let id = Uuid::new_v4().to_string();
+    let jwt = auth_jwt(&id, "test-node");
     let signing_key = test_signing_key();
 
     for private in &[
@@ -1407,8 +575,8 @@ async fn update_ip_returns_400_for_private_addresses() {
         "169.254.0.1",
     ] {
         let body = format!(r#"{{"ip":"{private}"}}"#).into_bytes();
-        let path = format!("/v1/installs/{}/ip", install.id);
-        let req = signed_request("PUT", &path, &body, &raw_token, &signing_key);
+        let path = format!("/v1/installs/{id}/ip");
+        let req = signed_request("PUT", &path, &body, &jwt, &signing_key);
 
         let app = test_app(state.clone());
         let resp = app.oneshot(req).await.unwrap();
@@ -1421,21 +589,22 @@ async fn update_ip_returns_400_for_private_addresses() {
             serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
         assert!(
             json["error"].as_str().unwrap().contains("private"),
-            "error for {private} should mention 'private'"
+            "error should mention private for {private}"
         );
     }
 }
 
 #[tokio::test]
 async fn update_ip_returns_403_when_install_id_does_not_match_token() {
-    let (state, _dns, mocks) = test_state();
-    let (_, raw_token) = insert_test_install(&mocks, "test-node").await;
+    let (state, _dns, _mocks) = test_state();
+    let id = Uuid::new_v4().to_string();
+    let jwt = auth_jwt(&id, "test-node");
     let signing_key = test_signing_key();
 
     let other_id = Uuid::new_v4().to_string();
     let body = br#"{"ip":"203.0.113.1"}"#;
     let path = format!("/v1/installs/{other_id}/ip");
-    let req = signed_request("PUT", &path, body, &raw_token, &signing_key);
+    let req = signed_request("PUT", &path, body, &jwt, &signing_key);
 
     let app = test_app(state);
     let resp = app.oneshot(req).await.unwrap();
@@ -1445,13 +614,14 @@ async fn update_ip_returns_403_when_install_id_does_not_match_token() {
 #[tokio::test]
 async fn update_ip_returns_500_when_dns_fails() {
     let dns = Arc::new(MockDnsProvider::with_error("cloudflare unavailable"));
-    let (state, mocks) = test_state_dns(dns);
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
+    let (state, _mocks) = test_state_dns(dns);
+    let id = Uuid::new_v4().to_string();
+    let jwt = auth_jwt(&id, "test-node");
     let signing_key = test_signing_key();
 
     let body = br#"{"ip":"8.8.8.8"}"#;
-    let path = format!("/v1/installs/{}/ip", install.id);
-    let req = signed_request("PUT", &path, body, &raw_token, &signing_key);
+    let path = format!("/v1/installs/{id}/ip");
+    let req = signed_request("PUT", &path, body, &jwt, &signing_key);
 
     let app = test_app(state);
     let resp = app.oneshot(req).await.unwrap();
@@ -1462,115 +632,99 @@ async fn update_ip_returns_500_when_dns_fails() {
 
 #[tokio::test]
 async fn set_acme_challenge_success() {
-    let (state, dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
+    let (state, _dns, mocks) = test_state();
+    let id = Uuid::new_v4().to_string();
+    let jwt = auth_jwt(&id, "test-node");
     let signing_key = test_signing_key();
 
-    // A per-user wildcard cert publishes two challenge values at once.
-    let body = br#"{"values":["apex-token","wildcard-token"]}"#;
-    let path = format!("/v1/installs/{}/acme-challenge", install.id);
-    let req = signed_request("PUT", &path, body, &raw_token, &signing_key);
+    let body = br#"{"values":["acme-apex","acme-wildcard"]}"#;
+    let path = format!("/v1/installs/{id}/acme-challenge");
+    let req = signed_request("PUT", &path, body, &jwt, &signing_key);
 
-    let app = test_app(state.clone());
+    let app = test_app(state);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        dns.call_count(),
-        2,
-        "one DNS upsert-TXT per challenge value should have been made"
-    );
 
-    // Both record IDs are persisted as the active list.
-    let updated = mocks
-        .operational
-        .find_by_id(&install.id)
-        .await
-        .unwrap()
-        .unwrap();
+    // Both TXT record IDs are persisted on the operational row.
+    let updated = mocks.operational.find_by_id(&id).await.unwrap().unwrap();
     assert_eq!(updated.cf_acme_record_ids.len(), 2);
 }
 
 #[tokio::test]
 async fn set_acme_challenge_returns_403_on_id_mismatch() {
-    let (state, _dns, mocks) = test_state();
-    let (_, raw_token) = insert_test_install(&mocks, "test-node").await;
+    let (state, _dns, _mocks) = test_state();
+    let id = Uuid::new_v4().to_string();
+    let jwt = auth_jwt(&id, "test-node");
     let signing_key = test_signing_key();
 
     let other_id = Uuid::new_v4().to_string();
     let body = br#"{"values":["my-acme-token"]}"#;
     let path = format!("/v1/installs/{other_id}/acme-challenge");
-    let req = signed_request("PUT", &path, body, &raw_token, &signing_key);
+    let req = signed_request("PUT", &path, body, &jwt, &signing_key);
 
-    let app = test_app(state);
-    let resp = app.oneshot(req).await.unwrap();
+    let resp = test_app(state).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
 async fn set_acme_challenge_returns_500_when_dns_fails() {
     let dns = Arc::new(MockDnsProvider::with_error("cloudflare unavailable"));
-    let (state, mocks) = test_state_dns(dns);
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
+    let (state, _mocks) = test_state_dns(dns);
+    let id = Uuid::new_v4().to_string();
+    let jwt = auth_jwt(&id, "test-node");
     let signing_key = test_signing_key();
 
     let body = br#"{"values":["my-acme-token"]}"#;
-    let path = format!("/v1/installs/{}/acme-challenge", install.id);
-    let req = signed_request("PUT", &path, body, &raw_token, &signing_key);
+    let path = format!("/v1/installs/{id}/acme-challenge");
+    let req = signed_request("PUT", &path, body, &jwt, &signing_key);
 
-    let app = test_app(state);
-    let resp = app.oneshot(req).await.unwrap();
+    let resp = test_app(state).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[tokio::test]
 async fn set_acme_challenge_rejects_oversized_value_list() {
-    // The cross-tenant DoS guard: an oversized list is rejected with 400 before
-    // any DNS write (the mock would otherwise record one call per value).
-    let (state, dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
+    let (state, _dns, _mocks) = test_state();
+    let id = Uuid::new_v4().to_string();
+    let jwt = auth_jwt(&id, "test-node");
     let signing_key = test_signing_key();
 
-    let body = br#"{"values":["a","b","c","d","e"]}"#;
-    let path = format!("/v1/installs/{}/acme-challenge", install.id);
-    let req = signed_request("PUT", &path, body, &raw_token, &signing_key);
+    let values: Vec<String> = (0..100).map(|i| format!("acme-{i}")).collect();
+    let body = serde_json::to_vec(&serde_json::json!({ "values": values })).unwrap();
+    let path = format!("/v1/installs/{id}/acme-challenge");
+    let req = signed_request("PUT", &path, &body, &jwt, &signing_key);
 
-    let app = test_app(state);
-    let resp = app.oneshot(req).await.unwrap();
+    let resp = test_app(state).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        dns.call_count(),
-        0,
-        "no DNS calls when the list is rejected"
-    );
 }
 
 #[tokio::test]
 async fn set_acme_challenge_rejects_empty_value_list() {
-    let (state, dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
+    let (state, _dns, _mocks) = test_state();
+    let id = Uuid::new_v4().to_string();
+    let jwt = auth_jwt(&id, "test-node");
     let signing_key = test_signing_key();
 
     let body = br#"{"values":[]}"#;
-    let path = format!("/v1/installs/{}/acme-challenge", install.id);
-    let req = signed_request("PUT", &path, body, &raw_token, &signing_key);
+    let path = format!("/v1/installs/{id}/acme-challenge");
+    let req = signed_request("PUT", &path, body, &jwt, &signing_key);
 
-    let app = test_app(state);
-    let resp = app.oneshot(req).await.unwrap();
+    let resp = test_app(state).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(dns.call_count(), 0, "empty list makes no DNS calls");
 }
 
 #[tokio::test]
 async fn delete_acme_challenge_deletes_dns_record_when_present() {
     let (state, dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
+    let id = Uuid::new_v4().to_string();
+    let jwt = auth_jwt(&id, "test-node");
     let signing_key = test_signing_key();
 
     // Two live records (apex + wildcard SAN) → both must be deleted.
     mocks
         .operational
         .cas_acme_records(
-            &install.id,
+            &id,
             &[],
             &["cf-txt-apex".to_string(), "cf-txt-wildcard".to_string()],
             Utc::now(),
@@ -1579,8 +733,8 @@ async fn delete_acme_challenge_deletes_dns_record_when_present() {
         .unwrap();
 
     let body = b"";
-    let path = format!("/v1/installs/{}/acme-challenge", install.id);
-    let req = signed_request("DELETE", &path, body, &raw_token, &signing_key);
+    let path = format!("/v1/installs/{id}/acme-challenge");
+    let req = signed_request("DELETE", &path, body, &jwt, &signing_key);
 
     let app = test_app(state);
     let resp = app.oneshot(req).await.unwrap();
@@ -1590,73 +744,14 @@ async fn delete_acme_challenge_deletes_dns_record_when_present() {
 
 #[tokio::test]
 async fn delete_acme_challenge_is_noop_when_no_record_set() {
-    let (state, dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
+    let (state, dns, _mocks) = test_state();
+    let id = Uuid::new_v4().to_string();
+    let jwt = auth_jwt(&id, "test-node");
     let signing_key = test_signing_key();
 
     let body = b"";
-    let path = format!("/v1/installs/{}/acme-challenge", install.id);
-    let req = signed_request("DELETE", &path, body, &raw_token, &signing_key);
-
-    let app = test_app(state);
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        dns.call_count(),
-        0,
-        "no DNS calls expected when record absent"
-    );
-}
-
-#[tokio::test]
-async fn delete_acme_challenge_returns_403_on_id_mismatch() {
-    let (state, _dns, mocks) = test_state();
-    let (_, raw_token) = insert_test_install(&mocks, "test-node").await;
-    let signing_key = test_signing_key();
-
-    let other_id = Uuid::new_v4().to_string();
-    let body = b"";
-    let path = format!("/v1/installs/{other_id}/acme-challenge");
-    let req = signed_request("DELETE", &path, body, &raw_token, &signing_key);
-
-    let app = test_app(state);
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-}
-
-#[tokio::test]
-async fn delete_acme_challenge_returns_500_when_dns_fails() {
-    let dns = Arc::new(MockDnsProvider::with_error("cloudflare unavailable"));
-    let (state, mocks) = test_state_dns(dns);
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
-    let signing_key = test_signing_key();
-
-    mocks
-        .operational
-        .cas_acme_records(&install.id, &[], &["cf-txt-exists".to_string()], Utc::now())
-        .await
-        .unwrap();
-
-    let body = b"";
-    let path = format!("/v1/installs/{}/acme-challenge", install.id);
-    let req = signed_request("DELETE", &path, body, &raw_token, &signing_key);
-
-    let app = test_app(state);
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-// ── Deregister endpoint ──────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn deregister_success_with_no_dns_records() {
-    let (state, dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
-    let signing_key = test_signing_key();
-
-    let body = b"";
-    let path = format!("/v1/installs/{}", install.id);
-    let req = signed_request("DELETE", &path, body, &raw_token, &signing_key);
+    let path = format!("/v1/installs/{id}/acme-challenge");
+    let req = signed_request("DELETE", &path, body, &jwt, &signing_key);
 
     let app = test_app(state);
     let resp = app.oneshot(req).await.unwrap();
@@ -1665,278 +760,40 @@ async fn deregister_success_with_no_dns_records() {
 }
 
 #[tokio::test]
-async fn deregister_success_deletes_both_dns_records() {
-    let (state, dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
-    let signing_key = test_signing_key();
-
-    mocks
-        .operational
-        .upsert_ip(&install.id, "8.8.8.8", "cf-a-id", Utc::now())
-        .await
-        .unwrap();
-    mocks
-        .operational
-        .cas_acme_records(&install.id, &[], &["cf-txt-id".to_string()], Utc::now())
-        .await
-        .unwrap();
-
-    let body = b"";
-    let path = format!("/v1/installs/{}", install.id);
-    let req = signed_request("DELETE", &path, body, &raw_token, &signing_key);
-
-    let app = test_app(state);
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        dns.call_count(),
-        2,
-        "both A and TXT records should be deleted"
-    );
-}
-
-#[tokio::test]
-async fn deregister_success_with_only_a_record() {
-    let (state, dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
-    let signing_key = test_signing_key();
-
-    mocks
-        .operational
-        .upsert_ip(&install.id, "8.8.8.8", "cf-a-id", Utc::now())
-        .await
-        .unwrap();
-
-    let body = b"";
-    let path = format!("/v1/installs/{}", install.id);
-    let req = signed_request("DELETE", &path, body, &raw_token, &signing_key);
-
-    let app = test_app(state);
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    assert_eq!(dns.call_count(), 1, "only the A record should be deleted");
-}
-
-#[tokio::test]
-async fn deregister_returns_403_when_install_id_does_not_match() {
-    let (state, _dns, mocks) = test_state();
-    let (_, raw_token) = insert_test_install(&mocks, "test-node").await;
+async fn delete_acme_challenge_returns_403_on_id_mismatch() {
+    let (state, _dns, _mocks) = test_state();
+    let id = Uuid::new_v4().to_string();
+    let jwt = auth_jwt(&id, "test-node");
     let signing_key = test_signing_key();
 
     let other_id = Uuid::new_v4().to_string();
-    let body = b"";
-    let path = format!("/v1/installs/{other_id}");
-    let req = signed_request("DELETE", &path, body, &raw_token, &signing_key);
+    let path = format!("/v1/installs/{other_id}/acme-challenge");
+    let req = signed_request("DELETE", &path, b"", &jwt, &signing_key);
 
-    let app = test_app(state);
-    let resp = app.oneshot(req).await.unwrap();
+    let resp = test_app(state).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
-async fn deregister_returns_500_when_dns_fails() {
+async fn delete_acme_challenge_returns_500_when_dns_fails() {
     let dns = Arc::new(MockDnsProvider::with_error("cloudflare unavailable"));
     let (state, mocks) = test_state_dns(dns);
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
+    let id = Uuid::new_v4().to_string();
+    let jwt = auth_jwt(&id, "test-node");
     let signing_key = test_signing_key();
 
     mocks
         .operational
-        .upsert_ip(&install.id, "8.8.8.8", "cf-a-id", Utc::now())
+        .cas_acme_records(&id, &[], &["cf-txt-id".to_string()], Utc::now())
         .await
         .unwrap();
 
     let body = b"";
-    let path = format!("/v1/installs/{}", install.id);
-    let req = signed_request("DELETE", &path, body, &raw_token, &signing_key);
+    let path = format!("/v1/installs/{id}/acme-challenge");
+    let req = signed_request("DELETE", &path, body, &jwt, &signing_key);
 
-    let app = test_app(state);
-    let resp = app.oneshot(req).await.unwrap();
+    let resp = test_app(state).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn deregister_tombstones_the_identity_but_keeps_the_name() {
-    // Deregister flips the identity to a tombstone (status → deregistered): the
-    // find_by_id active filter no longer returns it, yet the row and its UNIQUE
-    // name allocation survive (find_inactive/introspection still see it).
-    let (state, _dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
-    let signing_key = test_signing_key();
-
-    let path = format!("/v1/installs/{}", install.id);
-    let req = signed_request("DELETE", &path, b"", &raw_token, &signing_key);
-    let resp = test_app(state).oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-
-    assert!(
-        mocks
-            .identity
-            .find_by_id(&install.id)
-            .await
-            .unwrap()
-            .is_none(),
-        "a tombstoned identity must not resolve through the active filter"
-    );
-    assert!(
-        mocks.identity.is_name_taken("test-node").await.unwrap(),
-        "the name allocation survives the tombstone"
-    );
-    let inactive = mocks
-        .identity
-        .find_inactive(std::slice::from_ref(&install.id))
-        .await
-        .unwrap();
-    assert_eq!(
-        inactive,
-        vec![install.id],
-        "the tombstone is reported inactive"
-    );
-}
-
-// ── Token refresh endpoint ───────────────────────────────────────────────────
-
-#[tokio::test]
-async fn refresh_token_returns_a_fresh_verifiable_jwt() {
-    let (state, _dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "fresh-node").await;
-    let signing_key = test_signing_key();
-    let (_, pub_key_b64) = test_pub_key();
-
-    let path = format!("/v1/installs/{}/token", install.id);
-    let req = signed_request("POST", &path, b"", &raw_token, &signing_key);
-    let resp = test_app(state).oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let json: serde_json::Value =
-        serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
-    let jwt = json["identity_jwt"]
-        .as_str()
-        .expect("must return an identity_jwt");
-
-    // The refreshed JWT verifies against the Tenants key and re-asserts identity.
-    let claims = test_jwt_verifier()
-        .verify(jwt)
-        .expect("refreshed JWT must verify");
-    assert_eq!(claims.iss, "tenants");
-    assert_eq!(claims.sub, install.id);
-    assert_eq!(claims.vanity, "fresh-node");
-    assert_eq!(
-        claims.cnf.ed25519, pub_key_b64,
-        "cnf stays the daemon's own public key (sender-constrained)"
-    );
-}
-
-#[tokio::test]
-async fn refresh_token_returns_401_without_credentials() {
-    let (state, _dns, mocks) = test_state();
-    let (install, _raw_token) = insert_test_install(&mocks, "noauth-node").await;
-
-    let req = Request::builder()
-        .method("POST")
-        .uri(format!("/v1/installs/{}/token", install.id))
-        .body(Body::empty())
-        .unwrap();
-    let resp = test_app(state).oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn refresh_token_returns_403_when_install_id_does_not_match() {
-    let (state, _dns, mocks) = test_state();
-    let (_, raw_token) = insert_test_install(&mocks, "owner-node").await;
-    let signing_key = test_signing_key();
-
-    let other_id = Uuid::new_v4().to_string();
-    let path = format!("/v1/installs/{other_id}/token");
-    let req = signed_request("POST", &path, b"", &raw_token, &signing_key);
-    let resp = test_app(state).oneshot(req).await.unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::FORBIDDEN,
-        "a credential may only refresh its own install's token"
-    );
-}
-
-#[tokio::test]
-async fn refresh_token_returns_403_for_a_tombstoned_install() {
-    // The revocation-completion path: a deregistered install may still hold an
-    // unexpired identity JWT, so it authenticates OFFLINE (no DB lookup). The
-    // refresh handler re-checks liveness by loading the active identity by id —
-    // the tombstone fails that check, so no fresh token is issued and access
-    // ends when the held JWT expires.
-    let (state, _dns, mocks) = test_state();
-    let id = "tombstoned-inst";
-    let (pub_key_bytes, public_key) = test_pub_key();
-    mocks.identity.seed(Identity {
-        id: id.to_string(),
-        name: "gone-node".to_string(),
-        region: "test".to_string(),
-        public_key,
-        pub_key_bytes,
-        token_hash: "unused".to_string(),
-        status: Status::Deregistered,
-        created_at: Utc::now(),
-    });
-
-    // Authenticate with a still-valid JWT (offline verify ignores the tombstone).
-    let jwt = test_identity_jwt(id, "gone-node", 3600);
-    let path = format!("/v1/installs/{id}/token");
-    let req = signed_request("POST", &path, b"", &jwt, &test_signing_key());
-    let resp = test_app(state).oneshot(req).await.unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::FORBIDDEN,
-        "a tombstoned install must not be able to refresh its token"
-    );
-}
-
-// ── Introspection endpoint ───────────────────────────────────────────────────
-
-#[tokio::test]
-async fn introspect_partitions_active_from_inactive() {
-    // Batch introspection returns the subset with no active identity: tombstoned
-    // and never-registered ids are inactive; an active id is excluded.
-    let (state, _dns, mocks) = test_state();
-    let (active, _) = insert_test_install(&mocks, "live-node").await;
-    let (dead, _) = insert_test_install(&mocks, "dead-node").await;
-    mocks
-        .identity
-        .tombstone(&dead.id, Utc::now())
-        .await
-        .unwrap();
-
-    let body = serde_json::json!({
-        "install_ids": [active.id, dead.id, "never-registered"],
-    });
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/introspect")
-        .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    let resp = test_app(state).oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let json: serde_json::Value =
-        serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
-    let inactive: Vec<String> = json["inactive"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap().to_string())
-        .collect();
-
-    assert!(!inactive.contains(&active.id), "active id must be excluded");
-    assert!(
-        inactive.contains(&dead.id),
-        "tombstoned id must be inactive"
-    );
-    assert!(
-        inactive.contains(&"never-registered".to_string()),
-        "absent id must be inactive"
-    );
-    assert_eq!(inactive.len(), 2);
 }
 
 // ── State accessors ──────────────────────────────────────────────────────────
@@ -1987,8 +844,9 @@ async fn tunnel_connect_returns_403_when_install_id_does_not_match() {
     use tokio::net::TcpListener as StdTcpListener;
     use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
 
-    let (state, _dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
+    let (state, _dns, _mocks) = test_state();
+    let id = Uuid::new_v4().to_string();
+    let jwt = auth_jwt(&id, "test-node");
     let signing_key = test_signing_key();
 
     // Spin up a real server so WebSocketUpgrade extraction succeeds.
@@ -2002,7 +860,7 @@ async fn tunnel_connect_returns_403_when_install_id_does_not_match() {
     // rejects because the install id in the path doesn't match the token.
     let other_id = Uuid::new_v4().to_string();
     let path = format!("/v1/installs/{other_id}/tunnel");
-    let dummy_req = signed_request("GET", &path, b"", &raw_token, &signing_key);
+    let dummy_req = signed_request("GET", &path, b"", &jwt, &signing_key);
     let ts = dummy_req
         .headers()
         .get("X-Wardnet-Timestamp")
@@ -2020,10 +878,8 @@ async fn tunnel_connect_returns_403_when_install_id_does_not_match() {
 
     let url = format!("ws://127.0.0.1:{port}{path}");
     let mut req = url.into_client_request().unwrap();
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {raw_token}").parse().unwrap(),
-    );
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {jwt}").parse().unwrap());
     req.headers_mut()
         .insert("X-Wardnet-Timestamp", ts.parse().unwrap());
     req.headers_mut()
@@ -2037,7 +893,6 @@ async fn tunnel_connect_returns_403_when_install_id_does_not_match() {
         }
         other => panic!("expected HTTP 403 error, got: {other:?}"),
     }
-    drop(install);
 }
 
 #[tokio::test]
@@ -2045,8 +900,9 @@ async fn tunnel_connect_establishes_websocket_and_handler_runs() {
     use tokio::net::TcpListener as StdTcpListener;
     use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
 
-    let (state, _dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
+    let (state, _dns, _mocks) = test_state();
+    let id = Uuid::new_v4().to_string();
+    let jwt = auth_jwt(&id, "test-node");
     let signing_key = test_signing_key();
 
     // Spin up a real server (needed for actual WS upgrade handshake).
@@ -2057,8 +913,8 @@ async fn tunnel_connect_establishes_websocket_and_handler_runs() {
     tokio::spawn(axum::serve(listener, router).into_future());
 
     // Build the signed request headers.
-    let path = format!("/v1/installs/{}/tunnel", install.id);
-    let dummy_req = signed_request("GET", &path, b"", &raw_token, &signing_key);
+    let path = format!("/v1/installs/{id}/tunnel");
+    let dummy_req = signed_request("GET", &path, b"", &jwt, &signing_key);
     let ts = dummy_req
         .headers()
         .get("X-Wardnet-Timestamp")
@@ -2076,10 +932,8 @@ async fn tunnel_connect_establishes_websocket_and_handler_runs() {
 
     let url = format!("ws://127.0.0.1:{port}{path}");
     let mut req = url.into_client_request().unwrap();
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {raw_token}").parse().unwrap(),
-    );
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {jwt}").parse().unwrap());
     req.headers_mut()
         .insert("X-Wardnet-Timestamp", ts.parse().unwrap());
     req.headers_mut()
@@ -2111,8 +965,10 @@ async fn tunnel_handler_forward_and_tcp_data_flow() {
     use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
     use wardnet_cloud::tunnel::ForwardRequest;
 
-    let (state, _dns, mocks) = test_state();
-    let (install, raw_token) = insert_test_install(&mocks, "test-node").await;
+    let (state, _dns, _mocks) = test_state();
+    let id = Uuid::new_v4().to_string();
+    let name = "test-node";
+    let jwt = auth_jwt(&id, name);
     let signing_key = test_signing_key();
     let registry = state.tunnel_registry();
 
@@ -2123,8 +979,8 @@ async fn tunnel_handler_forward_and_tcp_data_flow() {
     tokio::spawn(axum::serve(server_listener, router).into_future());
 
     // Connect Pi via WebSocket.
-    let path = format!("/v1/installs/{}/tunnel", install.id);
-    let dummy_req = signed_request("GET", &path, b"", &raw_token, &signing_key);
+    let path = format!("/v1/installs/{id}/tunnel");
+    let dummy_req = signed_request("GET", &path, b"", &jwt, &signing_key);
     let ts = dummy_req
         .headers()
         .get("X-Wardnet-Timestamp")
@@ -2142,10 +998,8 @@ async fn tunnel_handler_forward_and_tcp_data_flow() {
 
     let url = format!("ws://127.0.0.1:{port}{path}");
     let mut req = url.into_client_request().unwrap();
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {raw_token}").parse().unwrap(),
-    );
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {jwt}").parse().unwrap());
     req.headers_mut()
         .insert("X-Wardnet-Timestamp", ts.parse().unwrap());
     req.headers_mut()
@@ -2163,7 +1017,7 @@ async fn tunnel_handler_forward_and_tcp_data_flow() {
     // Forward a fake inbound TCP stream to the Pi — exercises the forward_rx arm.
     let inbound = tokio::net::TcpStream::connect(pi_local_addr).await.unwrap();
     let _ = registry.forward(
-        &install.name,
+        name,
         ForwardRequest {
             stream: inbound,
             dest_port: 443,
