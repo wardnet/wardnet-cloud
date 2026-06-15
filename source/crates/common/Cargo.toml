@@ -1,0 +1,43 @@
+[package]
+name = "wardnet_common"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared primitives for the wardnet cloud services (token, mTLS, validation, auth, …)"
+
+[lib]
+name = "wardnet_common"
+path = "src/lib.rs"
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+async-trait = { workspace = true }
+arc-swap = { workspace = true }
+
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rcgen = { workspace = true }
+jsonwebtoken = { workspace = true }
+
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
+
+[lints]
+workspace = true

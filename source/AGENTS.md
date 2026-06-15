@@ -32,6 +32,15 @@ Conventions and invariants for agents working inside `source/`.
 
 12. **The tunnel registry is in-memory and per-node.** `[#444]` It is not persisted; after a node restart all Pis reconnect. The inter-node forward listener is **private-network-only and authenticated** (it bypasses SNI, so it must be). Treat `conn_id` as wrapping (`u32`).
 
+> ⚠️ **Superseded by WS-A (invariants #13–#17):** the in-app TLS-termination + ACME
+> subsystem has been removed. Public TLS is now fronted by an inforge-injected **nginx
+> sidecar** (which also runs ACME); the control-plane API is served as **plain HTTP**
+> behind it, and the tenant data plane is pure **L4 SNI passthrough** (Tunneller never
+> terminates). Treat the TLS/ACME/sealing details below as historical until the full
+> rewrite in WS-J — in particular #14 ("never served in plaintext") no longer holds, and
+> #15–#17 describe deleted machinery. The PROXY-protocol + real-client-IP rule in #13 still
+> applies (now to the plain-HTTP API listener and the passthrough listeners).
+
 13. **Strip the PROXY v1 header first, consuming exactly the line.** Every public listener (`:8080`/`:8443`/`:8853`) is fronted by nginx with PROXY protocol v1. Read the header byte-by-byte up to its CRLF and **no further** (`proxy_protocol::read_required`/`read_optional`) — never a `BufReader`, which would swallow the `ClientHello` and break the SNI peek. The recovered client IP must be threaded into the API as `ConnectInfo` so the per-IP rate limiter and IP-bound PoW keep working; on `:8080` the header is *optional* (a direct health probe carries none).
 
 14. **The control-plane API is never served in plaintext.** It is served **only** over the TLS-terminated `:8443` path (SNI == the bridge FQDN). `:8080` serves only the HTTP-01 challenge responder and `/health`. Do not mount API routes on `:8080`.

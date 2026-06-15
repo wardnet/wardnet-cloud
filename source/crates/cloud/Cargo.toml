@@ -1,0 +1,55 @@
+[package]
+name = "wardnet-cloud"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Wardnet cloud services — temporary single bin (pre per-service carve)"
+
+[lib]
+name = "wardnet_cloud"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wardnet-cloud"
+path = "src/main.rs"
+
+[dependencies]
+wardnet_common = { workspace = true }
+
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+arc-swap = { workspace = true }
+futures-util = { workspace = true }
+
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
+
+[dev-dependencies]
+http-body-util = { workspace = true }
+wiremock = { workspace = true }
+tokio-tungstenite = { workspace = true }
+ed25519-dalek = { workspace = true }
+
+[lints]
+workspace = true
