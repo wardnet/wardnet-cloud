@@ -8,20 +8,31 @@ Conventions and invariants for agents working inside `source/`.
 
 ## Workspace layout
 
-`source/` is a Cargo workspace (`source/Cargo.toml`, `resolver = "3"`, edition 2024) with two members:
+`source/` is a Cargo workspace (`source/Cargo.toml`, `resolver = "3"`, edition 2024) with three members:
 
 - **`crates/common`** (lib `wardnet_common`) — everything genuinely cross-service: `token`, `mtls`,
   `proxy_protocol` (incl. `client_ip`), `replay_cache`, `dns_provider`, `db` (`DbPools` / `connect`),
-  `error` (`ApiError` / `ErrorBody`), `validation`, the generic `auth` primitives, `serve` (hyper
-  connection server), generic `health::register`, the env-`config` helpers, and — transiently, until
-  enrollment is redesigned — `pow`.
-- **`crates/cloud`** (bin) — the temporary holding pen for all remaining service code (`api`, `auth`,
-  `cloudflare`, `repository`, `service`, `sni`, `state`, `tunnel`, plus its own `config`/`db`/`error`
-  shims over common). Depends on `wardnet_common`. The per-service carve into `tenants`/`ddns`/`tunneller`
-  is WS-B/C/D.
+  `error` (`ApiError` / `ErrorBody`), `validation`, the generic `auth` core (`auth_layer<S: AuthContext>`
+  — body guard, timestamp window, canonical payload, Ed25519 PoP, replay cache — each bin implements
+  `AuthContext::resolve_credential`), `serve` (`run_api`, the PROXY-required plain-HTTP listener, plus a
+  stream-generic `connection`), `mtls` (incl. `server_config_from_pem`), generic `health::register`, the
+  env-`config` helpers, and — transiently, until enrollment is redesigned — `pow`.
+- **`crates/tenants`** (bin `wardnet-tenants`, lib `wardnet_tenants`) — the global identity/naming
+  service, carved out of `cloud` in WS-B. Owns the identity + challenge repos, the JWT `Signer`,
+  `TenantsService`, and the **global naming DB** (its `migrations/` — moved from cloud's
+  `migrations-global/` — and its own `db::init` with a crate-relative `sqlx::migrate!`), plus its own
+  `config`/`state`/`error`. Serves a **public** nginx-fronted router (`register`/`challenge`/`names`/
+  `token`/`deregister`/`health`) with dual-path auth, **plus** a separate **internal mesh-mTLS**
+  introspect listener (`src/mesh.rs`, `POST /v1/introspect`) with no JWT layer. `deregister` is
+  tombstone-only (the DDNS reaper does DNS teardown in WS-C). Depends on `wardnet_common`.
+- **`crates/cloud`** (bin `wardnet-cloud`) — the temporary holding pen for the remaining service code,
+  now shrunk to **DDNS + Tunneller** (`api`, `auth`, `cloudflare`, `repository`, `service`, `sni`,
+  `state`, `tunnel`, plus its own `config`/`db`/`error` shims over common). Auth here is **JWT-only**
+  (no identity DB lives here). Depends on `wardnet_common`. The remaining carve into `ddns`/`tunneller`
+  is WS-C/D.
 
 **Where code goes:** if a primitive is (or will be) used by more than one service, it belongs in
-`common`; service-specific logic stays in `cloud`. Shared dependencies and lints are declared once at the
+`common`; service-specific logic stays in its service crate (`tenants`/`cloud`). Shared dependencies and lints are declared once at the
 workspace root — add deps via `workspace.dependencies` and reference them with `<dep>.workspace = true`;
 do not pin versions per-crate. Lints come from `[workspace.lints.clippy]` (pedantic) via
 `[lints] workspace = true` in each member.
@@ -30,7 +41,7 @@ do not pin versions per-crate. Lints come from `[workspace.lints.clippy]` (pedan
 
 1. **Bearer token never stored raw.** `register.rs` returns `hex(random_32_bytes)` to the caller once and stores only `hex(SHA-256(token))`. Never persist, log, or echo the raw token.
 
-2. **DB token lookup is path-gated.** `auth_layer` only queries the DB when the request path starts with `/v1/installs/`. Adding a new public endpoint under that prefix would silently require auth — use a different path prefix.
+2. **Credential resolution is path-gated and per-service.** `auth_layer` only resolves a credential when the request path starts with `/v1/installs/`. Adding a new public endpoint under that prefix would silently require auth — use a different path prefix. The **DB token lookup** (opaque-bearer path) is **Tenants-only**: only `crates/tenants` holds the identity table, so only its `AuthContext::resolve_credential` accepts a non-JWT bearer; `crates/cloud` is **JWT-only** and rejects an opaque bearer with `401` (see #18).
 
 3. **Uniqueness before challenge burn.** In `register.rs`, the global `names().reserve()` (the atomic slug allocation — its unique violation is the name-clash guard) always runs _before_ `challenges().consume()`. Reversing the order would consume the user's PoW proof on a name-conflict error. Registration is a **two-database saga** (global `names` + regional `installs`); any failure after `reserve` must `release` both rows.
 
@@ -71,6 +82,10 @@ do not pin versions per-crate. Lints come from `[workspace.lints.clippy]` (pedan
 16. *(superseded — deleted machinery)* ACME issuance was coordinated by the `bridge_tls_lease` winner with version-based hot-swap. nginx now owns ACME; the lease/sweep/`acme_http_challenge` machinery is gone.
 
 17. *(superseded — deleted machinery)* The public `GET /.well-known/acme-challenge/{token}` responder has been removed; nginx answers HTTP-01.
+
+18. **Two auth planes: JWT for external daemons, mTLS for the mesh.** External daemon requests (via nginx) authenticate with an identity JWT (Tenants-signed, verified offline) plus the Ed25519 PoP in `auth_layer`; in Tenants a non-JWT bearer additionally resolves via the identity-table lookup. **Inter-service / mesh-plane calls do not carry a JWT** — they authenticate by mutual TLS (a client cert chained to the mesh CA). `cloud` is JWT-only and returns `401` for an opaque bearer (its `resolve_credential` is the JWT-only path). The `aud` claim was deliberately **not** added — grant scoping is deferred to WS-F.
+
+19. **The mesh introspect endpoint is mTLS-only and off the public router.** `POST /v1/introspect` (Tenants ↔ DDNS reaper) is served by a separate internal listener on `config.introspect_listen_addr` (`crates/tenants/src/mesh.rs`), **not** mounted on the public nginx-fronted router. Its router has **no** `auth_layer` — the mutual-TLS handshake (server presents the mesh leaf cert, requires a client cert chained to the mesh CA via `mtls::server_config_from_pem`) **is** the authentication. Never expose this route on the public router or add a JWT/bearer layer to it.
 
 ## Test placement
 
@@ -127,7 +142,7 @@ Add new integration test files here when a feature requires two or more real inf
 - Return `ApiError` from handlers — it maps to `(StatusCode, Json<ErrorBody>)` via `IntoResponse`.
 - Wrap database errors with `map_err(ApiError::Internal)`.
 - Use `ApiError::BadRequest`, `ApiError::Conflict`, `ApiError::TooManyRequests`, `ApiError::Unauthorized`, `ApiError::Forbidden` for client errors.
-- Service-layer domain errors (`TenantsError`, `DdnsError`) stay HTTP-agnostic; their `From<..> for ApiError` mappings live in `crates/cloud/src/error.rs` (the orphan rule permits them there).
+- Service-layer domain errors stay HTTP-agnostic; their `From<..> for ApiError` mappings live in each service crate's `error.rs` (the orphan rule permits them there). Since WS-B, `TenantsError` maps in `crates/tenants/src/error.rs` and `DdnsError` maps in `crates/cloud/src/error.rs` — cloud no longer carries a `From<TenantsError>`.
 
 ## DNS provider
 
