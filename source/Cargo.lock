@@ -3079,8 +3079,6 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "http-body-util",
- "hyper",
- "hyper-util",
  "rand 0.10.1",
  "rcgen",
  "reqwest",

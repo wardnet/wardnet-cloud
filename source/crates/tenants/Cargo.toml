@@ -41,11 +41,9 @@ rand = { workspace = true }
 utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 
-# Internal mesh-mTLS introspect listener
+# Internal mesh-mTLS introspect listener (hyper plumbing lives in wardnet_common::serve)
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
-hyper = { workspace = true }
-hyper-util = { workspace = true }
 
 [dev-dependencies]
 http-body-util = { workspace = true }

@@ -7,9 +7,12 @@
 //! there is no JWT/bearer layer. JWT is for external daemon requests; inter-service
 //! mesh calls authenticate by certificate.
 
+use std::sync::Arc;
+
 use axum::Router;
 use axum::routing::post;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
 use wardnet_common::{mtls, serve};
@@ -17,6 +20,10 @@ use wardnet_common::{mtls, serve};
 use crate::api;
 use crate::config::Config;
 use crate::state::AppState;
+
+/// Maximum concurrent in-flight introspect connections (accept-storm guard,
+/// mirrors the public API + SNI listeners).
+const MAX_CONCURRENT_INTROSPECT: usize = 1024;
 
 /// Serve `POST /v1/introspect` over a mesh-mTLS listener bound to
 /// `config.introspect_listen_addr`. The server presents its mesh leaf cert and
@@ -43,6 +50,8 @@ pub async fn serve_introspect(config: &Config, state: AppState) -> anyhow::Resul
         "mesh introspect listener (mTLS) listening"
     );
 
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_INTROSPECT));
+
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -53,7 +62,12 @@ pub async fn serve_introspect(config: &Config, state: AppState) -> anyhow::Resul
         };
         let acceptor = acceptor.clone();
         let router = router.clone();
+        let permit = Arc::clone(&semaphore)
+            .acquire_owned()
+            .await
+            .expect("semaphore closed");
         tokio::spawn(async move {
+            let _permit = permit;
             match acceptor.accept(stream).await {
                 Ok(tls) => {
                     if let Err(e) = serve::connection(tls, router, peer).await {
