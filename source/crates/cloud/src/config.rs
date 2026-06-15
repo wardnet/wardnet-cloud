@@ -18,7 +18,7 @@ use wardnet_common::config::required;
 ///
 /// | Public | Process | Purpose |
 /// |---|---|---|
-/// | `:80`  | [`Self::api_listen_addr`] `127.0.0.1:8080` | plain-HTTP control-plane API + `/health` |
+/// | `:80`  | [`Self::api_listen_addr`] `127.0.0.1:8080` | plain-HTTP control-plane API + `/v1/health` |
 /// | `:443` | `127.0.0.1:8443` | SNI passthrough to tenant tunnels (port 443) |
 /// | `:853` | [`Self::dot_listen_addr`] `127.0.0.1:8853` | `DoT` passthrough to tenant tunnels (port 853) |
 ///

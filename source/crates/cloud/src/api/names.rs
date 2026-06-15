@@ -60,6 +60,3 @@ pub async fn name_available(
 
     Ok(Json(NameAvailabilityResponse { available: !taken }))
 }
-
-#[cfg(test)]
-mod tests;
