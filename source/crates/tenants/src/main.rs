@@ -8,7 +8,8 @@ use wardnet_tenants::{
     config::Config,
     db, mesh,
     repository::{
-        ChallengeRepository, IdentityRepository, PgChallengeRepository, PgIdentityRepository,
+        DaemonRepository, EnrollmentRepository, NetworkRepository, PgDaemonRepository,
+        PgEnrollmentRepository, PgNetworkRepository, PgTenantRepository, TenantRepository,
     },
     service::TenantsService,
     state::AppState,
@@ -22,48 +23,50 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // rustls 0.23 needs a process-default crypto provider before any TLS work —
-    // the internal mesh-mTLS introspect listener relies on it.
+    // the internal mesh-mTLS work-queue listener relies on it.
     mtls::install_crypto_provider();
 
     let config = Config::from_env()?;
-
     tracing::info!(
         region = %config.region,
         api_listen_addr = %config.api_listen_addr,
-        introspect_listen_addr = %config.introspect_listen_addr,
+        mesh_listen_addr = %config.mesh_listen_addr,
         "wardnet-tenants starting"
     );
 
     let pools = db::init(&config.global_database_url).await?;
 
-    let identities = Arc::new(PgIdentityRepository::new_pools(pools.clone()));
-    let challenges = Arc::new(PgChallengeRepository::new_pools(pools));
+    let tenants_repo = Arc::new(PgTenantRepository::new_pools(pools.clone()));
+    let networks_repo = Arc::new(PgNetworkRepository::new_pools(pools.clone()));
+    let daemons_repo = Arc::new(PgDaemonRepository::new_pools(pools.clone()));
+    let enrollment_repo = Arc::new(PgEnrollmentRepository::new_pools(pools));
 
-    // Tenants signs identity JWTs. The private key is read here and consumed into
-    // the signer — it is never seated in the shared `Config`/`AppState`.
-    let jwt_signing_key_pem = common_config::load_jwt_signing_key_pem()?;
-    let jwt_signer = token::Signer::from_pem(jwt_signing_key_pem.as_bytes(), None)?;
-    drop(jwt_signing_key_pem);
+    // Tenants signs identity JWTs; the private key is consumed into the signer and
+    // never seated in the shared state.
+    let signing_key_pem = common_config::load_jwt_signing_key_pem()?;
+    let signer = token::Signer::from_pem(signing_key_pem.as_bytes(), None)?;
+    drop(signing_key_pem);
 
-    // The auth middleware verifies identity JWTs offline with the matching public key.
-    let jwt_verifier =
-        token::Verifier::from_pem(common_config::load_jwt_verify_key_pem()?.as_bytes())?;
+    // The auth layer verifies identity JWTs offline with the matching public key.
+    let verifier = token::Verifier::from_pem(common_config::load_jwt_verify_key_pem()?.as_bytes())?;
 
-    let tenants = Arc::new(TenantsService::new(
-        identities as Arc<dyn IdentityRepository>,
-        challenges as Arc<dyn ChallengeRepository>,
-        jwt_signer,
+    let service = Arc::new(TenantsService::new(
+        tenants_repo as Arc<dyn TenantRepository>,
+        networks_repo as Arc<dyn NetworkRepository>,
+        daemons_repo as Arc<dyn DaemonRepository>,
+        enrollment_repo as Arc<dyn EnrollmentRepository>,
+        signer,
     ));
 
-    let state = AppState::new(config.clone(), tenants, jwt_verifier);
+    let state = AppState::new(config.clone(), service, verifier);
     let api_router = api::router(state.clone());
 
     tokio::select! {
-        // Public, nginx-fronted control-plane API (daemon JWT / bearer auth).
+        // Public, nginx-fronted control-plane API (daemon + user JWT, bootstrap).
         res = serve::run_api(&config.api_listen_addr, api_router) => res?,
 
-        // Internal mesh-mTLS introspect listener (DDNS reaper ↔ Tenants).
-        res = mesh::serve_introspect(&config, state) => res?,
+        // Internal mesh-mTLS work-queue listener (DDNS provisioner/reaper ↔ Tenants).
+        res = mesh::serve_mesh(&config, state) => res?,
     }
 
     Ok(())

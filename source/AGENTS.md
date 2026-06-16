@@ -2,6 +2,17 @@
 
 Conventions and invariants for agents working inside `source/`.
 
+> **WS-C re-scope (2026-06-16):** the Tenants service was rebuilt to the end-state
+> **tenant → network → daemon** model with a `provisioning_state` lifecycle, and auth
+> was unified into `common::auth::authenticate(CallerType)` (`SERVICE` via mTLS /
+> `DAEMON`/`USER` via JWT). PoW self-registration and the `introspect` endpoint are
+> gone; DNS is now reconciled from desired state via a mesh work-queue
+> (`GET/PATCH /v1/networks`). See `CONTEXT.md` (glossary) and `docs/adr/0001`,
+> `docs/adr/0002`. `crates/cloud` is temporarily excluded from the workspace until it
+> is reworked onto the new `common` auth in its own slice. Several invariants below
+> still describe the *previous* identity/bearer model and are superseded pending the
+> WS-J docs pass.
+
 > **Status:** invariants tagged `[#444]`/`[#445]` describe the agreed target architecture (SNI/tunnel
 > data plane, PostgreSQL/Neon, runtime `SecretsProvider`, multi-node `TunnelRouter`) and land with those
 > issues. Everything untagged is live on `main` today.

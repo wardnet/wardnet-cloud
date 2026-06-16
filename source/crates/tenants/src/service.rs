@@ -1,363 +1,471 @@
-//! The Tenants service — global identity and naming.
-//!
-//! Owns the identity and challenge repositories (both in the global Tenants DB)
-//! and encloses every business rule of registration: the per-IP rate limits, the
-//! `PoW` challenge lifecycle, and the **single-transaction registration** (insert
-//! identity + burn challenge atomically — the vanity-name UNIQUE constraint is the
-//! allocation lock). Also owns install authentication and deregistration.
+//! `TenantsService` — the global authority's business rules over the
+//! tenant/network/daemon model: signup-code issuance, the daemon enroll saga,
+//! JWT minting (key-`PoP` authenticated in the handler), network registration with
+//! entitlement enforcement, the subscription-cancel cascade, and the mesh
+//! reconcile transitions consumed by the regional DDNS provisioner/reaper.
 
 use std::sync::Arc;
 
-use base64::Engine as _;
-use chrono::Utc;
+use chrono::{Duration, Utc};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use wardnet_common::token::{ClaimsSpec, PrincipalType, Signer};
+use wardnet_common::validation::{is_valid_name, validate_public_key};
+
+use crate::error::TenantsError;
+use crate::repository::tenant::{CreateTenantOutcome, Entitlement};
 use crate::repository::{
-    ChallengeRepository, Identity, IdentityRepository, RegisterOutcome, RegistrationChallenge,
-    Status,
+    Daemon, DaemonRepository, EnrollOutcome, EnrollmentRepository, Network, NetworkRepository,
+    ProvisioningState, RegisterNetworkOutcome, SubscriptionStatus, Tenant, TenantRepository,
 };
-use wardnet_common::pow::{POW_DIFFICULTY, verify_pow};
-use wardnet_common::token::Signer;
 
-/// Domain error for [`TenantsService`]. Transport-neutral — it carries no HTTP
-/// status; the API layer maps it to an `ApiError` (`From` in `crate::error`), so
-/// when the service later becomes a separate process this vocabulary survives the
-/// split unchanged.
-#[derive(Debug, thiserror::Error)]
-pub enum TenantsError {
-    /// A per-IP rate limit was exceeded.
-    #[error("{0}")]
-    RateLimited(String),
-    /// The requested name is already allocated.
-    #[error("{0}")]
-    NameTaken(String),
-    /// The `PoW` challenge was unknown, expired, IP-mismatched, replayed, or its
-    /// proof failed.
-    #[error("{0}")]
-    BadChallenge(String),
-    /// The operation is not permitted for this install — e.g. refreshing the JWT
-    /// of an install that has been deregistered (tombstoned).
-    #[error("{0}")]
-    Forbidden(String),
-    /// An unexpected repository/infrastructure failure.
-    #[error(transparent)]
-    Internal(#[from] anyhow::Error),
+/// Identity JWT lifetime (seconds). Offline revocation is bounded by this.
+const IDENTITY_JWT_TTL_SECS: i64 = 3600;
+/// One-time enrollment code lifetime (seconds).
+const CODE_TTL_SECS: i64 = 300;
+/// Pending pubkey↔tenant binding lifetime (seconds) — long enough for the wizard
+/// to enroll → getJwt → register-network, short enough to self-clean if abandoned.
+const PENDING_TTL_SECS: i64 = 900;
+/// Per-IP signup-code requests allowed per hour.
+const CODE_REQUESTS_PER_IP_PER_HOUR: i64 = 10;
+
+/// Result of a successful enroll — the tenant the daemon is now (pending-)bound to.
+#[derive(Debug)]
+pub struct EnrollResult {
+    pub tenant_id: String,
 }
 
-/// Maximum registrations from the same remote IP per 24 hours. A legitimate Pi
-/// registers exactly once; 3 covers a name-clash retry plus one transient error.
-const REGISTRATIONS_PER_IP_PER_DAY: i64 = 3;
-
-/// Challenge lifetime before the nonce expires and a new one must be fetched.
-const CHALLENGE_EXPIRY_SECS: i64 = 300; // 5 minutes
-
-/// Maximum challenges issued per remote IP per hour.
-const CHALLENGES_PER_IP_PER_HOUR: i64 = 20;
-
-/// Lifetime of a minted identity JWT. Short by design — the daemon refreshes it at
-/// `POST /v1/token` (3d) by re-authenticating with its Ed25519 key. The JWT is not
-/// yet verified by any service (that cutover is 3c), so this is the operational
-/// value once the lifecycle is wired, not a load-bearing constant today.
-const IDENTITY_JWT_TTL_SECS: i64 = 3600; // 1 hour
-
-/// Inputs to [`TenantsService::register`] (the request has already been validated
-/// and the public key decoded by the handler).
-pub struct RegisterParams<'a> {
-    /// Desired subdomain slug (already validated).
-    pub name: &'a str,
-    /// Base64 Ed25519 public key (already validated).
-    pub public_key: &'a str,
-    /// Raw Ed25519 public-key bytes, decoded from `public_key`.
-    pub pub_key_bytes: [u8; 32],
-    /// Challenge UUID from `GET /v1/register/challenge`.
-    pub challenge_id: &'a str,
-    /// `PoW` proof.
-    pub proof: u64,
-    /// The caller's remote IP (for challenge binding + rate-limit accounting).
-    pub remote_ip: &'a str,
-    /// Region this instance serves.
-    pub region: &'a str,
-}
-
-/// Result of a successful registration. The handler shapes the HTTP response
-/// (subdomain FQDN, region) from this plus config.
-pub struct RegisterResult {
-    /// Server-assigned install UUID.
-    pub id: String,
-    /// Opaque bearer token — returned to the caller exactly once.
-    pub bearer_token: String,
-    /// Tenants-signed identity JWT (sender-constrained via the daemon's `cnf` key).
-    /// The daemon stores and carries this; verification by DDNS/Tunneller is 3c.
-    pub identity_jwt: String,
-}
-
-/// Global identity + naming service. Holds the JWT [`Signer`] (a Tenants concern —
-/// only Tenants mints tokens).
+/// The Tenants business-rule layer.
 pub struct TenantsService {
-    identities: Arc<dyn IdentityRepository>,
-    challenges: Arc<dyn ChallengeRepository>,
+    tenants: Arc<dyn TenantRepository>,
+    networks: Arc<dyn NetworkRepository>,
+    daemons: Arc<dyn DaemonRepository>,
+    enrollment: Arc<dyn EnrollmentRepository>,
     signer: Signer,
 }
 
 impl TenantsService {
-    /// Wire the service over its repositories and the JWT signing key.
     #[must_use]
     pub fn new(
-        identities: Arc<dyn IdentityRepository>,
-        challenges: Arc<dyn ChallengeRepository>,
+        tenants: Arc<dyn TenantRepository>,
+        networks: Arc<dyn NetworkRepository>,
+        daemons: Arc<dyn DaemonRepository>,
+        enrollment: Arc<dyn EnrollmentRepository>,
         signer: Signer,
     ) -> Self {
         Self {
-            identities,
-            challenges,
+            tenants,
+            networks,
+            daemons,
+            enrollment,
             signer,
         }
     }
 
-    /// Issue a single-use `PoW` challenge, enforcing the per-IP hourly rate limit.
+    // ── Account plane ────────────────────────────────────────────────────────────
+
+    /// Create a tenant (management plane). Entitlement defaults to
+    /// [`Entitlement::DEFAULT`] when not supplied.
     ///
     /// # Errors
-    /// [`TenantsError::RateLimited`] past the hourly cap; `Internal` on a
-    /// repository error.
-    pub async fn issue_challenge(
+    /// [`TenantsError::BadRequest`] on a malformed email; [`TenantsError::Conflict`]
+    /// if the email is already taken.
+    pub async fn register_tenant(
         &self,
-        remote_ip: String,
-    ) -> Result<RegistrationChallenge, TenantsError> {
-        let since = Utc::now() - chrono::Duration::hours(1);
-        let count = self.challenges.count_from_ip(&remote_ip, since).await?;
-        if count >= CHALLENGES_PER_IP_PER_HOUR {
+        email: &str,
+        entitlement: Option<Entitlement>,
+    ) -> Result<Tenant, TenantsError> {
+        let email = normalize_email(email)?;
+        let tenant = Tenant {
+            id: Uuid::new_v4().to_string(),
+            email,
+            entitlement: entitlement.unwrap_or(Entitlement::DEFAULT),
+            subscription_status: SubscriptionStatus::Active,
+            subscription_id: None,
+            created_at: Utc::now(),
+        };
+        match self.tenants.create(&tenant).await? {
+            CreateTenantOutcome::Created => Ok(tenant),
+            CreateTenantOutcome::EmailTaken => Err(TenantsError::Conflict(
+                "a tenant already exists for that email".to_string(),
+            )),
+        }
+    }
+
+    /// Cancel a tenant's subscription and cascade its `{active, provisioning}`
+    /// networks to `deprovisioning` (the reaper then tears down DNS).
+    ///
+    /// # Errors
+    /// [`TenantsError::NotFound`] if no such tenant.
+    pub async fn cancel_subscription(&self, tenant_id: &str) -> Result<(), TenantsError> {
+        if !self
+            .tenants
+            .set_subscription_status(tenant_id, SubscriptionStatus::Canceled)
+            .await?
+        {
+            return Err(TenantsError::NotFound("no such tenant".to_string()));
+        }
+        let n = self
+            .networks
+            .set_deprovisioning_for_tenant(tenant_id)
+            .await?;
+        tracing::info!(
+            tenant_id,
+            networks = n,
+            "subscription canceled; networks deprovisioning"
+        );
+        Ok(())
+    }
+
+    /// List a tenant's networks.
+    ///
+    /// # Errors
+    /// [`TenantsError::Internal`] on a repository failure.
+    pub async fn list_networks(&self, tenant_id: &str) -> Result<Vec<Network>, TenantsError> {
+        Ok(self.networks.list_by_tenant(tenant_id).await?)
+    }
+
+    /// List a tenant's daemons.
+    ///
+    /// # Errors
+    /// [`TenantsError::Internal`] on a repository failure.
+    pub async fn list_tenant_daemons(&self, tenant_id: &str) -> Result<Vec<Daemon>, TenantsError> {
+        Ok(self.daemons.list_by_tenant(tenant_id).await?)
+    }
+
+    /// List a network's daemons, scoped to `tenant_id` (a network belonging to a
+    /// different tenant reads as not found).
+    ///
+    /// # Errors
+    /// [`TenantsError::NotFound`] if the network is absent or another tenant's.
+    pub async fn list_network_daemons(
+        &self,
+        tenant_id: &str,
+        network_id: &str,
+    ) -> Result<Vec<Daemon>, TenantsError> {
+        let network = self
+            .networks
+            .find_by_id(network_id)
+            .await?
+            .filter(|n| n.tenant_id == tenant_id)
+            .ok_or_else(|| TenantsError::NotFound("no such network".to_string()))?;
+        Ok(self.daemons.list_by_network(&network.id).await?)
+    }
+
+    /// Mark a tenant's network for deprovisioning (management "delete network").
+    /// Idempotent — already-deprovisioning is a no-op success.
+    ///
+    /// # Errors
+    /// [`TenantsError::NotFound`] if the network is absent or another tenant's.
+    pub async fn delete_network(&self, tenant_id: &str, slug: &str) -> Result<(), TenantsError> {
+        let network = self
+            .networks
+            .find_by_slug(slug)
+            .await?
+            .filter(|n| n.tenant_id == tenant_id)
+            .ok_or_else(|| TenantsError::NotFound("no such network".to_string()))?;
+        if network.provisioning_state != ProvisioningState::Deprovisioning {
+            self.networks.set_deprovisioning(&network.id).await?;
+        }
+        Ok(())
+    }
+
+    // ── Enrollment plane (codes + enroll + JWT) ──────────────────────────────────
+
+    /// Issue a new-signup one-time code for `email` (public, rate-limited). Returns
+    /// the raw code (emailed in production; returned to the caller for now).
+    ///
+    /// # Errors
+    /// [`TenantsError::RateLimited`] past the per-IP hourly cap.
+    pub async fn issue_signup_code(
+        &self,
+        email: &str,
+        remote_ip: &str,
+    ) -> Result<String, TenantsError> {
+        let email = normalize_email(email)?;
+        let since = Utc::now() - Duration::hours(1);
+        if self
+            .enrollment
+            .count_code_requests_from_ip(remote_ip, since)
+            .await?
+            >= CODE_REQUESTS_PER_IP_PER_HOUR
+        {
             return Err(TenantsError::RateLimited(
-                "challenge rate limit exceeded (20 per IP per hour)".to_string(),
+                "too many code requests; try again later".to_string(),
             ));
         }
+        self.enrollment
+            .log_code_request(remote_ip, Utc::now())
+            .await?;
+        let (code, code_hash) = generate_code();
+        self.enrollment
+            .issue_code(
+                &code_hash,
+                &email,
+                None,
+                Utc::now() + Duration::seconds(CODE_TTL_SECS),
+            )
+            .await?;
+        Ok(code)
+    }
 
-        let mut nonce_bytes = [0u8; 32];
-        rand::fill(&mut nonce_bytes);
+    /// Issue an add-daemon one-time code for an existing tenant. Returns the raw code.
+    ///
+    /// # Errors
+    /// [`TenantsError::NotFound`] if the tenant does not exist.
+    pub async fn issue_tenant_code(&self, tenant_id: &str) -> Result<String, TenantsError> {
+        let tenant = self
+            .tenants
+            .find_by_id(tenant_id)
+            .await?
+            .ok_or_else(|| TenantsError::NotFound("no such tenant".to_string()))?;
+        let (code, code_hash) = generate_code();
+        self.enrollment
+            .issue_code(
+                &code_hash,
+                &tenant.email,
+                Some(tenant_id),
+                Utc::now() + Duration::seconds(CODE_TTL_SECS),
+            )
+            .await?;
+        Ok(code)
+    }
+
+    /// Enroll a daemon: validate + burn the code, create/resolve the tenant, write
+    /// the TTL'd pending binding. Returns the tenant the daemon is bound to.
+    ///
+    /// # Errors
+    /// [`TenantsError::BadRequest`] on a malformed key; [`TenantsError::BadCode`] on
+    /// a bad code; [`TenantsError::EntitlementExceeded`] at the daemon limit.
+    pub async fn enroll(&self, code: &str, public_key: &str) -> Result<EnrollResult, TenantsError> {
+        // Validate the key shape up front (the enroll saga stores the string form).
+        validate_public_key(public_key)
+            .map_err(|_| TenantsError::BadRequest("invalid public_key".to_string()))?;
+        let code_hash = hash_code(code);
+        match self
+            .enrollment
+            .enroll(
+                &code_hash,
+                public_key,
+                &Uuid::new_v4().to_string(),
+                Entitlement::DEFAULT,
+                Utc::now(),
+                PENDING_TTL_SECS,
+            )
+            .await?
+        {
+            EnrollOutcome::Enrolled { tenant_id } => Ok(EnrollResult { tenant_id }),
+            EnrollOutcome::BadCode => Err(TenantsError::BadCode(
+                "enrollment code is invalid, expired, or already used".to_string(),
+            )),
+            EnrollOutcome::DaemonLimit => Err(TenantsError::EntitlementExceeded(
+                "tenant has reached its daemon limit".to_string(),
+            )),
+        }
+    }
+
+    /// Mint an identity JWT for the daemon owning `public_key`. The caller has
+    /// already verified the key-`PoP` signature. The token is **network-scoped** if
+    /// the daemon has registered a network, else **tenant-scoped** (still in
+    /// enrollment). `sub` is the public key — the daemon's stable identity.
+    ///
+    /// # Errors
+    /// [`TenantsError::BadCode`] if the key is neither a registered daemon nor a
+    /// live pending binding (unknown/expired enrollment).
+    pub async fn mint_jwt(&self, public_key: &str) -> Result<String, TenantsError> {
         let now = Utc::now();
-        let challenge = RegistrationChallenge {
+
+        // A registered daemon gets a network-scoped token.
+        if let Some(daemon) = self.daemons.find_by_public_key(public_key).await? {
+            let spec = ClaimsSpec {
+                tenant_id: &daemon.tenant_id,
+                principal_type: PrincipalType::Daemon,
+                subject: public_key,
+                network: Some(&daemon.network_id),
+                cnf_ed25519_b64: Some(public_key),
+            };
+            return self
+                .signer
+                .sign(&spec, now.timestamp(), IDENTITY_JWT_TTL_SECS)
+                .map_err(TenantsError::Internal);
+        }
+
+        // A still-pending daemon gets a tenant-scoped token (no network yet).
+        if let Some(tenant_id) = self.enrollment.find_pending_tenant(public_key, now).await? {
+            let spec = ClaimsSpec {
+                tenant_id: &tenant_id,
+                principal_type: PrincipalType::Daemon,
+                subject: public_key,
+                network: None,
+                cnf_ed25519_b64: Some(public_key),
+            };
+            return self
+                .signer
+                .sign(&spec, now.timestamp(), IDENTITY_JWT_TTL_SECS)
+                .map_err(TenantsError::Internal);
+        }
+
+        Err(TenantsError::BadCode(
+            "no registered daemon or live enrollment for this key".to_string(),
+        ))
+    }
+
+    // ── Daemon plane (availability + register-network) ───────────────────────────
+
+    /// Whether a vanity slug is available: well-formed, not reserved, and not held
+    /// by any existing network (in any state).
+    ///
+    /// # Errors
+    /// [`TenantsError::Internal`] on a repository failure.
+    pub async fn check_availability(&self, slug: &str) -> Result<bool, TenantsError> {
+        if !is_valid_name(slug) {
+            return Ok(false);
+        }
+        Ok(self.networks.find_by_slug(slug).await?.is_none())
+    }
+
+    /// Register a network for `tenant_id` and bind the calling daemon
+    /// (`public_key`) to it — atomic, with `max_networks` / `max_daemons` enforced.
+    /// `display_name` defaults to the slug when empty.
+    ///
+    /// # Errors
+    /// [`TenantsError::BadRequest`] on a bad slug/region; [`TenantsError::Conflict`]
+    /// on a taken slug or already-registered daemon;
+    /// [`TenantsError::EntitlementExceeded`] at a limit;
+    /// [`TenantsError::NotFound`] if the tenant has vanished.
+    pub async fn register_network(
+        &self,
+        tenant_id: &str,
+        public_key: &str,
+        slug: &str,
+        display_name: Option<&str>,
+        region: &str,
+    ) -> Result<Network, TenantsError> {
+        if !is_valid_name(slug) {
+            return Err(TenantsError::BadRequest(
+                "slug must be 3-32 chars of [a-z0-9-], not reserved".to_string(),
+            ));
+        }
+        let region = region.trim();
+        if region.is_empty() {
+            return Err(TenantsError::BadRequest("region is required".to_string()));
+        }
+
+        let tenant = self
+            .tenants
+            .find_by_id(tenant_id)
+            .await?
+            .ok_or_else(|| TenantsError::NotFound("no such tenant".to_string()))?;
+
+        let now = Utc::now();
+        let display_name = display_name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(slug)
+            .to_string();
+        let network = Network {
             id: Uuid::new_v4().to_string(),
-            nonce: hex::encode(nonce_bytes),
-            difficulty: POW_DIFFICULTY,
-            remote_ip,
+            tenant_id: tenant_id.to_string(),
+            slug: slug.to_string(),
+            display_name,
+            region: region.to_string(),
+            provisioning_state: ProvisioningState::Provisioning,
             created_at: now,
-            expires_at: now + chrono::Duration::seconds(CHALLENGE_EXPIRY_SECS),
-            used_at: None,
+            updated_at: now,
         };
-
-        self.challenges.insert(&challenge).await?;
-        Ok(challenge)
-    }
-
-    /// Whether `name` is already allocated in the global identity table.
-    ///
-    /// # Errors
-    /// Propagates a repository error.
-    pub async fn is_name_taken(&self, name: &str) -> anyhow::Result<bool> {
-        self.identities.is_name_taken(name).await
-    }
-
-    /// Register a new installation in a single global-DB transaction.
-    ///
-    /// Rate-limit → validate the challenge (unexpired, IP-bound, `PoW`) →
-    /// [`IdentityRepository::register`], which atomically burns the challenge and
-    /// inserts the identity (the vanity-name UNIQUE constraint is the allocation
-    /// lock). The transaction means a name clash never burns the challenge
-    /// (invariant #3) and a reused challenge never leaves a half-registered
-    /// identity — there is no compensating saga.
-    ///
-    /// # Errors
-    /// [`TenantsError::RateLimited`], [`TenantsError::BadChallenge`]
-    /// (unknown/expired/foreign/used challenge or failed `PoW`),
-    /// [`TenantsError::NameTaken`], or `Internal`.
-    pub async fn register(&self, p: RegisterParams<'_>) -> Result<RegisterResult, TenantsError> {
-        self.check_registration_rate_limit(p.remote_ip).await?;
-        self.validate_challenge(&p).await?;
-
-        let id = Uuid::new_v4().to_string();
-        let (bearer_token, token_hash) = generate_token();
-        let now = Utc::now();
-
-        // Mint the identity JWT BEFORE the DB transaction: a signing failure must
-        // not leave a committed identity behind.
-        let identity_jwt = self.mint_identity_jwt(&id, p.name, p.pub_key_bytes)?;
-
-        let identity = Identity {
-            id: id.clone(),
-            name: p.name.to_owned(),
-            region: p.region.to_owned(),
-            public_key: p.public_key.to_owned(),
-            pub_key_bytes: p.pub_key_bytes,
-            token_hash,
-            status: Status::Active,
+        let daemon = Daemon {
+            id: Uuid::new_v4().to_string(),
+            tenant_id: tenant_id.to_string(),
+            network_id: network.id.clone(),
+            public_key: public_key.to_string(),
             created_at: now,
         };
 
         match self
-            .identities
-            .register(&identity, p.challenge_id, now)
+            .networks
+            .register_network(
+                &network,
+                &daemon,
+                tenant.entitlement.max_networks,
+                tenant.entitlement.max_daemons,
+            )
             .await?
         {
-            RegisterOutcome::Registered => {}
-            RegisterOutcome::NameTaken => {
-                return Err(TenantsError::NameTaken(format!(
-                    "name '{}' is already taken",
-                    p.name
-                )));
+            RegisterNetworkOutcome::Created => Ok(network),
+            RegisterNetworkOutcome::SlugTaken => {
+                Err(TenantsError::Conflict(format!("'{slug}' is already taken")))
             }
-            RegisterOutcome::ChallengeAlreadyUsed => {
-                return Err(TenantsError::BadChallenge(
-                    "challenge has already been used".to_string(),
-                ));
-            }
+            RegisterNetworkOutcome::NetworkLimit => Err(TenantsError::EntitlementExceeded(
+                "tenant has reached its network limit".to_string(),
+            )),
+            RegisterNetworkOutcome::DaemonLimit => Err(TenantsError::EntitlementExceeded(
+                "tenant has reached its daemon limit".to_string(),
+            )),
+            RegisterNetworkOutcome::DaemonExists => Err(TenantsError::Conflict(
+                "this daemon is already registered".to_string(),
+            )),
         }
-
-        // Best-effort rate-limit accounting: the registration is already committed,
-        // so a failure here (an advisory counter) must not fail the request.
-        if let Err(e) = self.identities.log_registration(p.remote_ip, now).await {
-            tracing::error!(install_id = %id, error = %e, "failed to log registration for rate-limiting");
-        }
-
-        tracing::info!(install_id = %id, name = %p.name, region = %p.region, "new installation registered");
-        Ok(RegisterResult {
-            id,
-            bearer_token,
-            identity_jwt,
-        })
     }
 
-    /// Authenticate an install by the hex SHA-256 of its bearer token.
-    ///
-    /// Used by the auth middleware. Returns the verified [`Identity`] (public key
-    /// pre-decoded) or `None` for an unknown token or a deregistered install.
+    // ── Mesh plane (DDNS provisioner / reaper) ───────────────────────────────────
+
+    /// A cursor page of networks in `state` for `region` (ids after `after_id`).
     ///
     /// # Errors
-    /// Propagates a repository error.
-    pub async fn authenticate(&self, token_hash: &str) -> anyhow::Result<Option<Identity>> {
-        self.identities.find_by_token_hash(token_hash).await
-    }
-
-    /// Deregister an install: **tombstone** its identity (`status` →
-    /// `deregistered`). The row and its name allocation survive (for
-    /// introspection and audit), and a tombstoned install can neither
-    /// authenticate (the `find_by_*` `status='active'` filter) nor refresh its
-    /// JWT — so access ends within the JWT TTL. The regional operational row is
-    /// torn down separately by `DdnsService`.
-    ///
-    /// # Errors
-    /// Propagates a repository error.
-    pub async fn deregister_identity(&self, id: &str) -> anyhow::Result<()> {
-        self.identities.tombstone(id, Utc::now()).await
-    }
-
-    /// Issue a fresh identity JWT for an already-authenticated install
-    /// (`POST /v1/installs/{id}/token`). Re-checks liveness: the active identity is
-    /// loaded by `id`, so a tombstoned install (which may still hold a valid JWT)
-    /// cannot refresh — its access ends at the current token's expiry. The new
-    /// token's `cnf` is the install's registered key.
-    ///
-    /// # Errors
-    /// [`TenantsError::Forbidden`] if the install has no active identity
-    /// (deregistered or unknown); `Internal` on a repository or signing error.
-    pub async fn refresh_token(&self, id: &str) -> Result<String, TenantsError> {
-        let identity = self
-            .identities
-            .find_by_id(id)
-            .await?
-            .ok_or_else(|| TenantsError::Forbidden("installation is not active".to_string()))?;
-        self.mint_identity_jwt(&identity.id, &identity.name, identity.pub_key_bytes)
-    }
-
-    /// Of the given install IDs, return those that have **no active identity**
-    /// (tombstoned or never-registered). The DDNS reconcile reaper polls this to
-    /// tear down DNS state for deregistered installs.
-    ///
-    /// # Errors
-    /// Propagates a repository error.
-    pub async fn introspect_inactive(&self, ids: &[String]) -> anyhow::Result<Vec<String>> {
-        self.identities.find_inactive(ids).await
-    }
-
-    // ── private ────────────────────────────────────────────────────────────────
-
-    /// Mint a Tenants-signed identity JWT. `cnf` is re-encoded from the validated
-    /// 32 public-key bytes so it is always canonical base64, making the token
-    /// sender-constrained against a byte-exact key.
-    fn mint_identity_jwt(
+    /// [`TenantsError::Internal`] on a repository failure.
+    pub async fn reconcile_page(
         &self,
-        id: &str,
-        vanity: &str,
-        pub_key_bytes: [u8; 32],
-    ) -> Result<String, TenantsError> {
-        let cnf_ed25519 = base64::engine::general_purpose::STANDARD.encode(pub_key_bytes);
-        self.signer
-            .sign(
-                id,
-                vanity,
-                &cnf_ed25519,
-                Utc::now().timestamp(),
-                IDENTITY_JWT_TTL_SECS,
-            )
-            .map_err(TenantsError::Internal)
+        state: ProvisioningState,
+        region: &str,
+        after_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<Network>, TenantsError> {
+        Ok(self
+            .networks
+            .list_for_reconcile(state, region, after_id, limit)
+            .await?)
     }
 
-    /// Enforce the per-IP registration rate limit (3 per IP per 24 h).
-    async fn check_registration_rate_limit(&self, remote_ip: &str) -> Result<(), TenantsError> {
-        let since_24h = Utc::now() - chrono::Duration::days(1);
-        let reg_count = self
-            .identities
-            .count_registrations_from_ip(remote_ip, since_24h)
-            .await?;
-        if reg_count >= REGISTRATIONS_PER_IP_PER_DAY {
-            return Err(TenantsError::RateLimited(
-                "registration rate limit exceeded (3 per IP per 24 h)".to_string(),
-            ));
-        }
-        Ok(())
+    /// `provisioning → active` (provisioner). Returns whether it applied.
+    ///
+    /// # Errors
+    /// [`TenantsError::Internal`] on a repository failure.
+    pub async fn mark_network_active(&self, network_id: &str) -> Result<bool, TenantsError> {
+        Ok(self.networks.mark_active(network_id).await?)
     }
 
-    /// Resolve the `PoW` challenge and verify expiry, IP binding, and proof. The
-    /// authoritative single-use burn happens inside the registration transaction;
-    /// this is the fail-fast advisory pre-check.
-    async fn validate_challenge(&self, p: &RegisterParams<'_>) -> Result<(), TenantsError> {
-        let challenge = self
-            .challenges
-            .find_by_id(p.challenge_id)
-            .await?
-            .ok_or_else(|| TenantsError::BadChallenge("unknown challenge_id".to_string()))?;
-
-        if Utc::now() > challenge.expires_at {
-            return Err(TenantsError::BadChallenge(
-                "challenge has expired — fetch a new one from GET /v1/register/challenge"
-                    .to_string(),
-            ));
-        }
-        if challenge.remote_ip != p.remote_ip {
-            return Err(TenantsError::BadChallenge(
-                "challenge was issued to a different IP address".to_string(),
-            ));
-        }
-        if !verify_pow(
-            &challenge.nonce,
-            p.name,
-            p.public_key,
-            p.proof,
-            challenge.difficulty,
-        ) {
-            return Err(TenantsError::BadChallenge(
-                "proof-of-work verification failed".to_string(),
-            ));
-        }
-        Ok(())
+    /// `deprovisioning →` delete row (reaper). Returns whether it applied.
+    ///
+    /// # Errors
+    /// [`TenantsError::Internal`] on a repository failure.
+    pub async fn finish_deprovision(&self, network_id: &str) -> Result<bool, TenantsError> {
+        Ok(self.networks.delete_if_deprovisioning(network_id).await?)
     }
 }
 
-/// Generate a random 32-byte bearer token, returning `(raw_token_hex,
-/// sha256_hex)`. Only the hash is stored; the raw token is returned once.
-fn generate_token() -> (String, String) {
-    use sha2::{Digest, Sha256};
-    let mut bytes = [0u8; 32];
-    rand::fill(&mut bytes);
-    let token = hex::encode(bytes);
-    let hash = hex::encode(Sha256::digest(token.as_bytes()));
-    (token, hash)
+/// Lowercase + trim an email and apply a minimal shape check.
+fn normalize_email(email: &str) -> Result<String, TenantsError> {
+    let e = email.trim().to_lowercase();
+    if e.len() < 3 || !e.contains('@') {
+        return Err(TenantsError::BadRequest("invalid email".to_string()));
+    }
+    Ok(e)
 }
+
+/// Generate a random one-time code, returning `(raw_code_hex, sha256_hex)`. Only
+/// the hash is persisted; the raw code is shown once.
+fn generate_code() -> (String, String) {
+    let bytes: [u8; 32] = rand::random();
+    let code = hex::encode(bytes);
+    let hash = hash_code(&code);
+    (code, hash)
+}
+
+/// SHA-256 hex of a raw code (the at-rest form).
+fn hash_code(code: &str) -> String {
+    hex::encode(Sha256::digest(code.as_bytes()))
+}
+
+#[cfg(test)]
+mod tests;

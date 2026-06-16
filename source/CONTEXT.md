@@ -1,0 +1,56 @@
+# wardnet-cloud — domain glossary
+
+The shared vocabulary for the cloud platform. Definitions only — no implementation
+details. (See `docs/adr/` for the decisions behind these.)
+
+## Identity & accounts
+
+- **Tenant** — an account: an email, an [entitlement](#entitlement), and a
+  subscription. The root of ownership. Lives in the global Tenants DB.
+- **Network** — one wardnet network owned by a tenant. Holds a globally-unique
+  **vanity slug** and a [provisioning state](#provisioning-state). The DNS record
+  belongs to the network, not to any single device. A tenant may own several.
+- **Daemon** — a device bound to a network, holding its own Ed25519 keypair. A
+  network may have many daemons (active/active); each authenticates and is issued
+  tokens independently.
+- **Vanity / slug** — the network's public name (`<slug>.<zone>`); globally unique.
+- **Entitlement** — the per-tenant limits a subscription grants: at minimum
+  `max_networks` and `max_daemons`. Default for a self-service tenant: 1 / 1.
+
+## Enrollment credentials
+
+- **One-time code** — a short-lived, single-use, email-proving credential. A
+  *new-signup* code (no tenant yet) or an *add-daemon* code (existing tenant).
+  Consumed once, at enroll.
+- **Pending enrollment** — a TTL'd binding of a daemon's public key to a tenant,
+  written at enroll. Lets a not-yet-registered daemon authenticate (mint a
+  tenant-scoped token) before it has a network. Self-expires.
+- **Enroll** — the act of consuming a code: create/resolve the tenant and write the
+  pending binding. Mints no token.
+
+## Auth planes (who may call an endpoint)
+
+- **Caller type** — `SERVICE`, `DAEMON`, or `USER`; an endpoint declares the set it
+  accepts. `SERVICE` authenticates by mesh **mTLS**; `DAEMON`/`USER` by **JWT**
+  (a daemon additionally proves possession of its key — see PoP).
+- **PoP (proof-of-possession)** — a daemon signs each request with its Ed25519 key;
+  the signature is checked against the token's `cnf` key. Users are bearer-only.
+- **Mesh plane** — the private, mTLS-only service-to-service boundary
+  (DDNS ↔ Tenants). Not reachable by daemons or users.
+- **Bootstrap endpoints** — the credential-minting endpoints (signup-code, enroll,
+  token issue) that necessarily precede holding a JWT; each carries its own
+  one-time-code / key-PoP check instead of the JWT layer.
+
+## DNS reconciliation
+
+- **Desired state** — what Tenants records a network *should* be (its
+  provisioning state). Tenants is the single source of truth.
+- **Provisioning state** — a network's lifecycle: `provisioning → active →
+  deprovisioning`. (`deprovisioned` is not stored — it is the terminal transition
+  that deletes the row.)
+- **Provisioner** — the regional DDNS loop that drives `provisioning → active` by
+  publishing the DNS record.
+- **Reaper** — the regional DDNS loop that drives `deprovisioning →` row-deletion by
+  tearing the DNS record down.
+- **Work queue** — the mesh endpoints (`GET/PATCH /v1/networks`) the
+  provisioner/reaper pull from and report back to.

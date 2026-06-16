@@ -1,28 +1,26 @@
+//! Shared application state injected into every handler via [`axum::extract::State`].
+//!
+//! Holds the [`TenantsService`] (which owns the repositories + JWT signer), the
+//! offline JWT [`Verifier`] and [`ReplayCache`] (the [`AuthContext`] the auth layer
+//! needs), and the [`Config`]. Cloning is cheap — everything is behind an [`Arc`].
+
 use std::sync::Arc;
 
+use wardnet_common::auth::AuthContext;
 use wardnet_common::replay_cache::ReplayCache;
 use wardnet_common::token::Verifier;
 
 use crate::config::Config;
 use crate::service::TenantsService;
 
-/// Shared application state injected into every Tenants handler via
-/// [`axum::extract::State`].
-///
-/// Holds the [`TenantsService`] (which owns its identity + challenge repos), the
-/// offline JWT [`Verifier`], and the replay cache the auth middleware uses. Cloning
-/// is cheap — the inner data lives behind an [`Arc`].
+/// Cloneable handle to the service's shared state.
 #[derive(Clone)]
 pub struct AppState(Arc<Inner>);
 
 struct Inner {
     config: Config,
-    /// Global identity + naming service (registration, challenges, auth, refresh,
-    /// deregistration, introspection).
     tenants: Arc<TenantsService>,
-    /// Offline verifier for Tenants-signed identity JWTs (the JWT path of auth).
     verifier: Verifier,
-    /// In-memory replay-prevention cache (keyed `{install_id}:{timestamp}:{body_hash}`).
     replay_cache: Arc<ReplayCache>,
 }
 
@@ -42,20 +40,25 @@ impl AppState {
         &self.0.config
     }
 
-    /// The global identity + naming service.
+    /// The business-rule service.
     #[must_use]
     pub fn tenants(&self) -> &TenantsService {
         &self.0.tenants
     }
 
-    /// The offline verifier for Tenants-signed identity JWTs.
+    /// The replay cache (used by the bootstrap token endpoint's `PoP` check).
     #[must_use]
-    pub fn jwt_verifier(&self) -> &Verifier {
+    pub fn replay_cache(&self) -> &ReplayCache {
+        &self.0.replay_cache
+    }
+}
+
+impl AuthContext for AppState {
+    fn verifier(&self) -> &Verifier {
         &self.0.verifier
     }
 
-    #[must_use]
-    pub fn replay_cache(&self) -> &ReplayCache {
+    fn replay_cache(&self) -> &ReplayCache {
         &self.0.replay_cache
     }
 }

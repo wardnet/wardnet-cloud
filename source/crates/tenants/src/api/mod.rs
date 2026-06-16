@@ -1,62 +1,78 @@
-pub mod challenge;
-pub mod deregister;
-pub mod introspect;
-pub mod names;
-pub mod register;
-pub mod token;
+//! Public, nginx-fronted Tenants API.
+//!
+//! Routes are grouped by the caller kind they accept and each group gets the
+//! [`authenticate`](wardnet_common::auth::authenticate) middleware for its
+//! [`CallerType`] set. The **bootstrap** group (health + the credential-minting
+//! enroll/token/signup endpoints) carries no middleware — those endpoints verify
+//! their own one-time-code / key-`PoP` credentials.
+
+mod availability;
+mod codes;
+mod enroll;
+pub mod networks;
+pub mod tenants;
+mod token;
 
 use axum::Router;
-use axum::middleware;
+use axum::extract::State;
+use axum::middleware::from_fn_with_state;
 use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 
+use wardnet_common::auth::{CallerType, authenticate};
 use wardnet_common::error::ErrorBody;
+use wardnet_common::health;
 
 use crate::state::AppState;
 
-/// `OpenAPI` document metadata for the Tenants public API.
+/// `OpenAPI` metadata for the Tenants public API.
 #[derive(OpenApi)]
 #[openapi(
-    info(
-        title = "Wardnet Tenants API",
-        description = "Global identity & naming authority: registration, name availability, \
-                       token refresh, and deregistration.",
-        version = "0.1.0",
-    ),
+    info(title = "Wardnet Tenants API", version = "0.1.0"),
     tags(
-        (name = "health",   description = "Liveness probes"),
-        (name = "installs", description = "Registration and identity lifecycle"),
+        (name = "health", description = "Liveness"),
+        (name = "enrollment", description = "Daemon enrollment + JWT issuance"),
+        (name = "networks", description = "Network registration + availability"),
+        (name = "tenants", description = "Account-plane tenant management"),
     ),
     components(schemas(ErrorBody)),
 )]
 struct ApiDoc;
 
-/// Build the public, nginx-fronted Tenants router.
-///
-/// The mesh-only `introspect` endpoint is **not** registered here — it is served
-/// on the internal mTLS listener (see [`crate::mesh`]).
-fn build_openapi_router() -> OpenApiRouter<AppState> {
-    let mut r = OpenApiRouter::<AppState>::with_openapi(ApiDoc::openapi());
-    r = wardnet_common::health::register(r);
-    r = challenge::register(r);
-    r = register::register(r);
-    r = names::register(r);
-    r = token::register(r);
-    r = deregister::register(r);
-    r
-}
-
-/// Build the complete public Axum [`Router`] with the shared signed-request auth
-/// middleware applied.
+/// Build the public API router.
 pub fn router(state: AppState) -> Router {
-    let (api_router, _openapi) = build_openapi_router().split_for_parts();
+    // Bootstrap: health + credential-minting endpoints. No auth middleware — each
+    // verifies its own one-time code / key PoP.
+    let bootstrap = codes::register(token::register(enroll::register(health::register(
+        OpenApiRouter::new(),
+    ))));
 
-    api_router
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            wardnet_common::auth::auth_layer::<AppState>,
-        ))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
+    // Availability accepts a daemon (wizard) or a user (account plane).
+    let daemon_or_user = availability::register(OpenApiRouter::new()).route_layer(
+        from_fn_with_state(state.clone(), |st: State<AppState>, r, n| {
+            authenticate(CallerType::DAEMON | CallerType::USER, st, r, n)
+        }),
+    );
+
+    // Register-network is daemon-only.
+    let daemon = networks::register(OpenApiRouter::new()).route_layer(from_fn_with_state(
+        state.clone(),
+        |st: State<AppState>, r, n| authenticate(CallerType::DAEMON, st, r, n),
+    ));
+
+    // The account plane is user-only.
+    let user = tenants::register(OpenApiRouter::new()).route_layer(from_fn_with_state(
+        state.clone(),
+        |st: State<AppState>, r, n| authenticate(CallerType::USER, st, r, n),
+    ));
+
+    let (router, _openapi) = OpenApiRouter::with_openapi(ApiDoc::openapi())
+        .merge(bootstrap)
+        .merge(daemon_or_user)
+        .merge(daemon)
+        .merge(user)
+        .split_for_parts();
+
+    router.layer(TraceLayer::new_for_http()).with_state(state)
 }

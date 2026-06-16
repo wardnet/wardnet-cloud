@@ -23,6 +23,7 @@ anyhow = { workspace = true }
 reqwest = { workspace = true }
 async-trait = { workspace = true }
 arc-swap = { workspace = true }
+bitflags = { workspace = true }
 
 ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
@@ -38,6 +39,9 @@ hyper-util = { workspace = true }
 
 utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }
 
 [lints]
 workspace = true

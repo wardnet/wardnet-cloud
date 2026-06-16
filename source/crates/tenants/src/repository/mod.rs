@@ -1,8 +1,21 @@
-pub mod challenge;
-pub mod identity;
+//! Data-access layer for the Tenants global DB.
+//!
+//! One repository per aggregate (`tenant` / `network` / `daemon` / `enrollment`),
+//! each a trait + a `Pg*` implementation. The two multi-table sagas live on the
+//! repository that owns their primary aggregate: enroll on
+//! [`EnrollmentRepository`], network+daemon creation on [`NetworkRepository`].
 
-pub use challenge::{ChallengeRepository, PgChallengeRepository, RegistrationChallenge};
-pub use identity::{Identity, IdentityRepository, PgIdentityRepository, RegisterOutcome, Status};
+pub mod daemon;
+pub mod enrollment;
+pub mod network;
+pub mod tenant;
 
-#[cfg(test)]
-mod tests;
+pub use daemon::{Daemon, DaemonRepository, PgDaemonRepository};
+pub use enrollment::{EnrollOutcome, EnrollmentRepository, PgEnrollmentRepository};
+pub use network::{
+    Network, NetworkRepository, PgNetworkRepository, ProvisioningState, RegisterNetworkOutcome,
+};
+pub use tenant::{
+    CreateTenantOutcome, Entitlement, PgTenantRepository, SubscriptionStatus, Tenant,
+    TenantRepository,
+};

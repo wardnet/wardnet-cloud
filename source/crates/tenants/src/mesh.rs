@@ -1,38 +1,49 @@
-//! Internal mesh-mTLS introspect listener.
+//! Internal mesh-mTLS **work-queue** listener (Tenants ↔ DDNS provisioner/reaper).
 //!
-//! `POST /v1/introspect` is a **mesh-plane** endpoint (Tenants ↔ DDNS reaper): it
-//! is served here over mutual TLS on a private internal address, **not** on the
-//! public nginx-fronted router. mTLS *is* the authentication — only a peer
-//! presenting a client certificate chained to the mesh CA completes the handshake;
-//! there is no JWT/bearer layer. JWT is for external daemon requests; inter-service
-//! mesh calls authenticate by certificate.
+//! Served over mutual TLS on a private address — a peer must present a client
+//! certificate chained to the mesh CA to complete the handshake. That handshake is
+//! the `SERVICE` authentication: each accepted connection is stamped with a
+//! [`ServiceIdentity`], and the routes are guarded by `authenticate(SERVICE)`.
+//!
+//! Endpoints (the reconciler contract the regional DDNS service drives):
+//! - `GET /v1/networks?provisioningState=&region=&afterId=&limit=` — a cursor page
+//!   of desired-state networks to act on.
+//! - `PATCH /v1/networks/{id}` — record the result: `active` (provisioner published
+//!   DNS) or `deprovisioned` (reaper tore DNS down → delete the row).
 
 use std::sync::Arc;
 
-use axum::Router;
-use axum::routing::post;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::middleware::from_fn_with_state;
+use axum::routing::{get, patch};
+use axum::{Extension, Json, Router};
+use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
+use wardnet_common::auth::{CallerType, ServiceIdentity, authenticate};
 use wardnet_common::{mtls, serve};
 
-use crate::api;
+use crate::api::networks::NetworkView;
 use crate::config::Config;
+use crate::error::ApiError;
+use crate::repository::ProvisioningState;
 use crate::state::AppState;
 
-/// Maximum concurrent in-flight introspect connections (accept-storm guard,
-/// mirrors the public API + SNI listeners).
-const MAX_CONCURRENT_INTROSPECT: usize = 1024;
+/// Max concurrent in-flight mesh connections (accept-storm guard).
+const MAX_CONCURRENT_MESH: usize = 1024;
+/// Default / max page size for a reconcile scan.
+const DEFAULT_LIMIT: i64 = 100;
+const MAX_LIMIT: i64 = 500;
 
-/// Serve `POST /v1/introspect` over a mesh-mTLS listener bound to
-/// `config.introspect_listen_addr`. The server presents its mesh leaf cert and
-/// requires a client cert chained to the mesh CA (all from `config`'s PEM paths).
+/// Serve the mesh work-queue over mutual TLS on `config.mesh_listen_addr`.
 ///
 /// # Errors
 /// Returns an error if the mesh PEM material cannot be read/parsed or the listener
 /// cannot be bound.
-pub async fn serve_introspect(config: &Config, state: AppState) -> anyhow::Result<()> {
+pub async fn serve_mesh(config: &Config, state: AppState) -> anyhow::Result<()> {
     let ca = std::fs::read(&config.mesh_ca_path)
         .map_err(|e| anyhow::anyhow!("read mesh CA at {}: {e}", config.mesh_ca_path))?;
     let cert = std::fs::read(&config.mesh_cert_path)
@@ -42,21 +53,18 @@ pub async fn serve_introspect(config: &Config, state: AppState) -> anyhow::Resul
 
     let server_config = mtls::server_config_from_pem(&cert, &key, &ca)?;
     let acceptor = TlsAcceptor::from(server_config);
-    let router = introspect_router(state);
+    let router = mesh_router(state);
 
-    let listener = TcpListener::bind(&config.introspect_listen_addr).await?;
-    tracing::info!(
-        addr = %config.introspect_listen_addr,
-        "mesh introspect listener (mTLS) listening"
-    );
+    let listener = TcpListener::bind(&config.mesh_listen_addr).await?;
+    tracing::info!(addr = %config.mesh_listen_addr, "mesh work-queue listener (mTLS) listening");
 
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_INTROSPECT));
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_MESH));
 
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(e) => {
-                tracing::warn!(error = %e, "introspect listener accept error");
+                tracing::warn!(error = %e, "mesh listener accept error");
                 continue;
             }
         };
@@ -70,22 +78,90 @@ pub async fn serve_introspect(config: &Config, state: AppState) -> anyhow::Resul
             let _permit = permit;
             match acceptor.accept(stream).await {
                 Ok(tls) => {
-                    if let Err(e) = serve::connection(tls, router, peer).await {
-                        tracing::debug!(error = %e, %peer, "introspect connection error");
+                    // The handshake validated a mesh-CA client cert; stamp the
+                    // service identity so `authenticate(SERVICE)` accepts the route.
+                    let conn_router = router.layer(Extension(ServiceIdentity {
+                        subject: String::new(),
+                    }));
+                    if let Err(e) = serve::connection(tls, conn_router, peer).await {
+                        tracing::debug!(error = %e, %peer, "mesh connection error");
                     }
                 }
-                // A peer with no client cert, or one from a foreign CA, is rejected
-                // here at the handshake — that is the mesh authentication boundary.
-                Err(e) => tracing::debug!(error = %e, %peer, "introspect mTLS handshake rejected"),
+                Err(e) => tracing::debug!(error = %e, %peer, "mesh mTLS handshake rejected"),
             }
         });
     }
 }
 
-/// Build the single-route introspect [`Router`]. There is **no** `auth_layer`:
-/// mutual TLS on the listener is the authentication.
-pub fn introspect_router(state: AppState) -> Router {
+/// Build the mesh work-queue router, guarded by `authenticate(SERVICE)`.
+pub fn mesh_router(state: AppState) -> Router {
     Router::new()
-        .route("/v1/introspect", post(api::introspect::introspect))
+        .route("/v1/networks", get(list_for_reconcile))
+        .route("/v1/networks/{id}", patch(transition_network))
+        .route_layer(from_fn_with_state(
+            state.clone(),
+            |st: State<AppState>, r, n| authenticate(CallerType::SERVICE, st, r, n),
+        ))
         .with_state(state)
+}
+
+/// Query for the reconcile scan.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReconcileQuery {
+    provisioning_state: String,
+    region: String,
+    after_id: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn list_for_reconcile(
+    State(state): State<AppState>,
+    Query(query): Query<ReconcileQuery>,
+) -> Result<Json<Vec<NetworkView>>, ApiError> {
+    let state_filter = ProvisioningState::from_db(&query.provisioning_state)
+        .map_err(|_| ApiError::BadRequest("invalid provisioningState".to_string()))?;
+    let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let networks = state
+        .tenants()
+        .reconcile_page(
+            state_filter,
+            &query.region,
+            query.after_id.as_deref(),
+            limit,
+        )
+        .await?;
+    Ok(Json(networks.into_iter().map(Into::into).collect()))
+}
+
+/// Body for a network state transition.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TransitionRequest {
+    provisioning_state: String,
+}
+
+async fn transition_network(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<TransitionRequest>,
+) -> Result<StatusCode, ApiError> {
+    let applied = match body.provisioning_state.as_str() {
+        // Provisioner published the DNS record.
+        "active" => state.tenants().mark_network_active(&id).await?,
+        // Reaper tore the DNS record down — delete the row, freeing the slug.
+        "deprovisioned" => state.tenants().finish_deprovision(&id).await?,
+        other => {
+            return Err(ApiError::BadRequest(format!(
+                "unsupported transition target {other:?}"
+            )));
+        }
+    };
+    if applied {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::Conflict(
+            "network not in the expected state for this transition".to_string(),
+        ))
+    }
 }
