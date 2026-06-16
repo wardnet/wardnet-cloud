@@ -35,8 +35,9 @@ Conventions and invariants for agents working inside `source/`.
   `migrations-global/` — and its own `db::init` with a crate-relative `sqlx::migrate!`), plus its own
   `config`/`state`/`error`. Serves a **public** nginx-fronted router (`register`/`challenge`/`names`/
   `token`/`deregister`/`health`) with dual-path auth, **plus** a separate **internal mesh-mTLS**
-  introspect listener (`src/mesh.rs`, `POST /v1/introspect`) with no JWT layer. `deregister` is
-  tombstone-only (the DDNS reaper does DNS teardown in WS-C). Depends on `wardnet_common`.
+  reconcile listener (`src/mesh.rs` — mTLS transport only; handlers in `src/api/reconcile.rs`,
+  `GET/PATCH /v1/networks`) with no JWT layer. `deregister` is tombstone-only (the DDNS reaper
+  does DNS teardown — see invariant #19). Depends on `wardnet_common`.
 - **`crates/ddns`** (bin `wardnet-ddns`, lib `wardnet_ddns`) — the regional DNS reconciler, carved out
   of `cloud` in WS-C. A stateless controller that drives Cloudflare toward the desired state Tenants owns
   (ADR-0001): a short-interval **provisioner** + long-interval **reaper** (`src/reconcile.rs`) that drain
@@ -115,7 +116,7 @@ do not pin versions per-crate. Lints come from `[workspace.lints.clippy]` (pedan
 
 Tests **must not** be inline (`mod tests { ... }` inside the source file).
 
-Paths below are relative to the owning crate (`crates/common/` or `crates/cloud/`).
+Paths below are relative to the owning crate (`crates/common/`, `crates/tenants/`, `crates/ddns/`, or `crates/cloud/`).
 
 ### Unit tests (`src/`)
 
@@ -131,6 +132,8 @@ Declare them with `#[cfg(test)] mod tests;` at the bottom of the source file.
 Tests that exercise the public API end-to-end belong in the owning crate's `tests/` dir. They are compiled as a separate crate so they can only call `pub` items — this is intentional. Shared helpers live in `tests/common/mod.rs`.
 
 - `crates/cloud/tests/api.rs` — full HTTP API surface via mock repos
+- `crates/ddns/tests/api.rs` — DDNS HTTP API surface via mock repos
+- `crates/ddns/tests/work_queue_mtls.rs` — mTLS work-queue client integration test
 
 Add new integration test files here when a feature requires two or more real infrastructure components to test correctly. (The former pebble-based `tests/acme.rs` / `tests/tls_renewal.rs` were removed with the in-app TLS/ACME subsystem.)
 
