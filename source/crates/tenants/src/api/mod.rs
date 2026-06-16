@@ -10,6 +10,7 @@ mod availability;
 mod codes;
 mod enroll;
 pub mod networks;
+pub mod reconcile;
 pub mod tenants;
 mod token;
 

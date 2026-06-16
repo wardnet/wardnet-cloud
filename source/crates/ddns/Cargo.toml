@@ -1,0 +1,59 @@
+[package]
+name = "wardnet-ddns"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Wardnet DDNS service — regional DNS reconciler (provisioner + reaper) + report-IP/ACME"
+
+[lib]
+name = "wardnet_ddns"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wardnet-ddns"
+path = "src/main.rs"
+
+[dependencies]
+wardnet_common = { workspace = true }
+
+axum = { workspace = true }
+tokio = { workspace = true }
+tower-http = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+
+# Cloudflare DNS REST client + mesh work-queue client
+reqwest = { workspace = true }
+# Loop jitter (reaper) without pulling rand into the hot path elsewhere
+rand = { workspace = true }
+
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
+
+# Used by the doc-hidden (non-cfg-test) `test_helpers` module, so they are regular
+# deps: base64 (daemon `cnf` encoding) + ed25519-dalek (test signing keypairs).
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+http-body-util = { workspace = true }
+wiremock = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tower = { workspace = true }
+# mTLS round-trip test for TenantsWorkQueue (#[ignore]'d)
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+
+[lints]
+workspace = true

@@ -3,7 +3,7 @@ resolver = "3"
 # `crates/cloud` is temporarily excluded: WS-C reworks `common`'s auth/token surface
 # to the new caller-type model, which cloud has not yet been migrated onto. It is
 # re-added and reworked (Tunneller-only) in its own slice. See PLAN-INITIATIVE.md.
-members = ["crates/common", "crates/tenants"]
+members = ["crates/common", "crates/tenants", "crates/ddns"]
 exclude = ["crates/cloud"]
 
 [workspace.package]

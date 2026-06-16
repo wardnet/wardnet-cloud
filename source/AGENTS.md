@@ -19,7 +19,8 @@ Conventions and invariants for agents working inside `source/`.
 
 ## Workspace layout
 
-`source/` is a Cargo workspace (`source/Cargo.toml`, `resolver = "3"`, edition 2024) with three members:
+`source/` is a Cargo workspace (`source/Cargo.toml`, `resolver = "3"`, edition 2024) with three members
+(`common`, `tenants`, `ddns`); `crates/cloud` is kept `exclude`d until its own slice:
 
 - **`crates/common`** (lib `wardnet_common`) — everything genuinely cross-service: `token`, `mtls`,
   `proxy_protocol` (incl. `client_ip`), `replay_cache`, `dns_provider`, `db` (`DbPools` / `connect`),
@@ -36,11 +37,21 @@ Conventions and invariants for agents working inside `source/`.
   `token`/`deregister`/`health`) with dual-path auth, **plus** a separate **internal mesh-mTLS**
   introspect listener (`src/mesh.rs`, `POST /v1/introspect`) with no JWT layer. `deregister` is
   tombstone-only (the DDNS reaper does DNS teardown in WS-C). Depends on `wardnet_common`.
+- **`crates/ddns`** (bin `wardnet-ddns`, lib `wardnet_ddns`) — the regional DNS reconciler, carved out
+  of `cloud` in WS-C. A stateless controller that drives Cloudflare toward the desired state Tenants owns
+  (ADR-0001): a short-interval **provisioner** + long-interval **reaper** (`src/reconcile.rs`) that drain
+  the Tenants mesh **work-queue** (`src/work_queue.rs` — `WorkQueue` trait + the mTLS-backed
+  `TenantsWorkQueue`), plus daemon-facing **report-IP** and **ACME** endpoints (`src/api/`). Owns the
+  regional `operational` DB (its `migrations/` + crate-relative `db::init`), the `DdnsService`, and the
+  ported `CloudflareDnsProvider` (`src/cloudflare/`). Its write model is hybrid (ADR-0003). Auth is
+  **route-layer** `authenticate(CallerType::DAEMON)`, **not** the `/v1/installs/` path-gate (#2): the
+  target network is the JWT `net` claim, so a daemon can only ever touch its own network. Depends on
+  `wardnet_common`.
 - **`crates/cloud`** (bin `wardnet-cloud`) — the temporary holding pen for the remaining service code,
-  now shrunk to **DDNS + Tunneller** (`api`, `auth`, `cloudflare`, `repository`, `service`, `sni`,
-  `state`, `tunnel`, plus its own `config`/`db`/`error` shims over common). Auth here is **JWT-only**
-  (no identity DB lives here). Depends on `wardnet_common`. The remaining carve into `ddns`/`tunneller`
-  is WS-C/D.
+  now shrunk to **Tunneller** after the DDNS carve (`api`, `auth`, `cloudflare`, `repository`, `service`,
+  `sni`, `state`, `tunnel`, plus its own `config`/`db`/`error` shims over common). Auth here is
+  **JWT-only** (no identity DB lives here). Still `exclude`d from the workspace until reworked onto the
+  new `common` auth. Depends on `wardnet_common`. The remaining carve into `tunneller` is WS-D.
 
 **Where code goes:** if a primitive is (or will be) used by more than one service, it belongs in
 `common`; service-specific logic stays in its service crate (`tenants`/`cloud`). Shared dependencies and lints are declared once at the
@@ -96,7 +107,9 @@ do not pin versions per-crate. Lints come from `[workspace.lints.clippy]` (pedan
 
 18. **Two auth planes: JWT for external daemons, mTLS for the mesh.** External daemon requests (via nginx) authenticate with an identity JWT (Tenants-signed, verified offline) plus the Ed25519 PoP in `auth_layer`; in Tenants a non-JWT bearer additionally resolves via the identity-table lookup. **Inter-service / mesh-plane calls do not carry a JWT** — they authenticate by mutual TLS (a client cert chained to the mesh CA). `cloud` is JWT-only and returns `401` for an opaque bearer (its `resolve_credential` is the JWT-only path). The `aud` claim was deliberately **not** added — grant scoping is deferred to WS-F.
 
-19. **The mesh introspect endpoint is mTLS-only and off the public router.** `POST /v1/introspect` (Tenants ↔ DDNS reaper) is served by a separate internal listener on `config.introspect_listen_addr` (`crates/tenants/src/mesh.rs`), **not** mounted on the public nginx-fronted router. Its router has **no** `auth_layer` — the mutual-TLS handshake (server presents the mesh leaf cert, requires a client cert chained to the mesh CA via `mtls::server_config_from_pem`) **is** the authentication. Never expose this route on the public router or add a JWT/bearer layer to it.
+19. **The mesh work-queue is mTLS-only and off the public router.** The reconcile work-queue (`GET/PATCH /v1/networks`, Tenants ↔ DDNS provisioner/reaper) is served by a separate internal listener on `config.mesh_listen_addr`. **Transport vs API are split:** the mTLS listener lives in `crates/tenants/src/mesh.rs` (`serve_mesh` — TLS acceptor + accept loop + semaphore), and the SERVICE-plane handlers + DTOs live in `crates/tenants/src/api/reconcile.rs` (`pub fn router`). "mesh" names the mTLS *transport*, never a route group. The reconcile router is **not** mounted on the public nginx-fronted router and carries `authenticate(SERVICE)` — the mutual-TLS handshake (server presents the mesh leaf cert, requires a client cert chained to the mesh CA via `mtls::server_config_from_pem`, which stamps a `ServiceIdentity`) is what `SERVICE` resolves against. Never expose the reconcile routes on the public router or add a JWT/bearer layer to them. (`POST /v1/introspect` is gone — DNS teardown is the DDNS reaper draining this work-queue, per ADR-0001.)
+
+20. **DDNS A-record creation is the provisioner's alone, and is adopt-or-create + CAS.** Only `DdnsService::provision` (the provisioner) creates a Cloudflare A record; **report-IP only ever updates in place** (`OperationalRepository::record_ip` writes the `ip` column only — never `fqdn`/`cf_a_record_id`), so a daemon's IP report can never resurrect a record the reaper just deleted. To tolerate N regional replicas, `provision` adopts an existing record for the FQDN or creates one, then CAS-claims the id (`WHERE cf_a_record_id IS NULL`); on a lost CAS it deletes its record **only if** that record is not the one the winner stored. Do not add a create path to report-IP, and do not drop the `cf_a_record_id IS NULL` guard on the claim. See ADR-0003.
 
 ## Test placement
 
@@ -153,11 +166,11 @@ Add new integration test files here when a feature requires two or more real inf
 - Return `ApiError` from handlers — it maps to `(StatusCode, Json<ErrorBody>)` via `IntoResponse`.
 - Wrap database errors with `map_err(ApiError::Internal)`.
 - Use `ApiError::BadRequest`, `ApiError::Conflict`, `ApiError::TooManyRequests`, `ApiError::Unauthorized`, `ApiError::Forbidden` for client errors.
-- Service-layer domain errors stay HTTP-agnostic; their `From<..> for ApiError` mappings live in each service crate's `error.rs` (the orphan rule permits them there). Since WS-B, `TenantsError` maps in `crates/tenants/src/error.rs` and `DdnsError` maps in `crates/cloud/src/error.rs` — cloud no longer carries a `From<TenantsError>`.
+- Service-layer domain errors stay HTTP-agnostic; their `From<..> for ApiError` mappings live in each service crate's `error.rs` (the orphan rule permits them there). `TenantsError` maps in `crates/tenants/src/error.rs` and `DdnsError` maps in `crates/ddns/src/error.rs` (each crate owns the `From` for its own domain error, per the orphan rule).
 
 ## DNS provider
 
-`DnsProvider` is a trait in `wardnet_common::dns_provider`. Production uses `CloudflareDnsProvider` (`crates/cloud/src/cloudflare/`). In tests, implement a `MockDnsProvider` or use the existing mock in `crates/cloud/tests/api.rs`. Never call the Cloudflare REST API in unit tests.
+`DnsProvider` is a trait in `wardnet_common::dns_provider` (`upsert_a_record` / `upsert_txt_record` / `delete_record` / `find_a_record`). Production uses `CloudflareDnsProvider` (`crates/ddns/src/cloudflare/`). In tests, use the `MockDnsProvider` in `crates/ddns/src/test_helpers.rs` (it simulates a Cloudflare zone). Never call the Cloudflare REST API in unit tests.
 
 ## Validation
 

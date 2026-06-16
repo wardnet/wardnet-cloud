@@ -2,8 +2,9 @@
 //!
 //! `GET/PATCH /v1/networks` are served over mutual TLS and carry no JWT — the
 //! handshake + the stamped `ServiceIdentity` are the `SERVICE` authentication. These
-//! tests mint a throwaway mesh CA with `rcgen`, wrap [`wardnet_tenants::mesh`]'s
-//! router in a `tokio_rustls::TlsAcceptor`, and drive it with a `reqwest` client
+//! tests mint a throwaway mesh CA with `rcgen`, wrap the
+//! [`wardnet_tenants::api::reconcile`] router in a `tokio_rustls::TlsAcceptor`, and
+//! drive it with a `reqwest` client
 //! configured for client-certificate auth.
 
 use std::net::SocketAddr;
@@ -18,7 +19,7 @@ use tokio_rustls::TlsAcceptor;
 
 use wardnet_common::auth::ServiceIdentity;
 use wardnet_common::{mtls, serve};
-use wardnet_tenants::mesh::mesh_router;
+use wardnet_tenants::api::reconcile;
 use wardnet_tenants::repository::tenant::{Entitlement, SubscriptionStatus, Tenant};
 use wardnet_tenants::state::AppState;
 use wardnet_tenants::test_helpers::{build_state, daemon_keypair};
@@ -108,7 +109,7 @@ async fn spawn_mesh(state: AppState, server: &Leaf, ca_pem: &str) -> SocketAddr 
     )
     .expect("build mesh server config");
     let acceptor = TlsAcceptor::from(server_config);
-    let router = mesh_router(state).layer(Extension(ServiceIdentity {
+    let router = reconcile::router(state).layer(Extension(ServiceIdentity {
         subject: String::new(),
     }));
 

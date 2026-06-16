@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Wardnet Tenants service — global identity/naming authority + mesh introspect"
+description = "Wardnet Tenants service — global identity/naming authority + mesh work-queue"
 
 [lib]
 name = "wardnet_tenants"
@@ -41,7 +41,7 @@ rand = { workspace = true }
 utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 
-# Internal mesh-mTLS introspect listener (hyper plumbing lives in wardnet_common::serve)
+# Internal mesh-mTLS work-queue listener (hyper plumbing lives in wardnet_common::serve)
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 

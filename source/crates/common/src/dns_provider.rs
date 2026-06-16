@@ -59,4 +59,14 @@ pub trait DnsProvider: Send + Sync {
     /// The caller is responsible for passing the ID that was returned by a
     /// previous `upsert_*` call and stored in the database.
     async fn delete_record(&self, record_id: &str) -> anyhow::Result<()>;
+
+    /// Look up the provider-assigned ID of an existing **A record** by its FQDN,
+    /// or `None` if no A record exists for that name.
+    ///
+    /// Used by the DDNS provisioner's adopt-or-create path: when more than one
+    /// regional replica races to publish the same record, the loser of the
+    /// local CAS adopts the record the winner already created instead of leaving
+    /// a duplicate. If several A records share the name (it should not happen),
+    /// the first one returned is used.
+    async fn find_a_record(&self, fqdn: &str) -> anyhow::Result<Option<String>>;
 }

@@ -48,9 +48,21 @@ details. (See `docs/adr/` for the decisions behind these.)
 - **Provisioning state** — a network's lifecycle: `provisioning → active →
   deprovisioning`. (`deprovisioned` is not stored — it is the terminal transition
   that deletes the row.)
-- **Provisioner** — the regional DDNS loop that drives `provisioning → active` by
-  publishing the DNS record.
+- **Provisioner** — the regional DDNS loop that drives `provisioning → active`. It
+  is the **sole creator** of a network's DNS record: it publishes the record once
+  an IP has been reported (a network with no IP yet is skipped until later), then
+  reports `active`. To tolerate several regional replicas it **adopts-or-creates**
+  the record and claims it with a compare-and-set (see `docs/adr/0003`).
 - **Reaper** — the regional DDNS loop that drives `deprovisioning →` row-deletion by
   tearing the DNS record down.
+- **Operational state** — the regional DDNS service's local record of what it has
+  actually published for a network: its reported IP, the FQDN the provisioner
+  published under, the Cloudflare A-record id, and any live ACME TXT-record ids.
+  Keyed by network id, created lazily on the first IP report. It is an
+  eventually-consistent cache — Tenants remains the single source of truth for
+  desired state.
+- **Report-IP** — the daemon's only contact with DDNS: it pushes its current public
+  IP, which DDNS uses to **update the A record in place** (never to create one — see
+  Provisioner). This is what keeps the record pointed at a daemon whose IP changes.
 - **Work queue** — the mesh endpoints (`GET/PATCH /v1/networks`) the
   provisioner/reaper pull from and report back to.
