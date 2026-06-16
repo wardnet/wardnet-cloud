@@ -54,6 +54,7 @@ fn service(pools: DbPools) -> TenantsService {
         Arc::new(PgDaemonRepository::new_pools(pools.clone())) as Arc<dyn DaemonRepository>,
         Arc::new(PgEnrollmentRepository::new_pools(pools)) as Arc<dyn EnrollmentRepository>,
         test_signer(SEED),
+        ["use1".to_string(), "eu1".to_string()],
     )
 }
 

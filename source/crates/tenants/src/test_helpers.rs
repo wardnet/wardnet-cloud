@@ -400,14 +400,15 @@ impl EnrollmentRepository for MockStore {
     ) -> anyhow::Result<EnrollOutcome> {
         let mut d = self.0.lock().unwrap();
 
-        // Validate + burn the code.
-        let Some(code) = d.codes.get_mut(code_hash) else {
+        // Validate the code WITHOUT burning yet — mirror the Pg impl, which burns
+        // inside the tx and rolls back on DaemonLimit, so a limit rejection leaves
+        // the code reusable.
+        let Some(code) = d.codes.get(code_hash) else {
             return Ok(EnrollOutcome::BadCode);
         };
         if code.used_at.is_some() || code.expires_at <= now {
             return Ok(EnrollOutcome::BadCode);
         }
-        code.used_at = Some(now);
         let email = code.email.clone();
         let code_tenant_id = code.tenant_id.clone();
 
@@ -429,7 +430,8 @@ impl EnrollmentRepository for MockStore {
             new_tenant_id.to_string()
         };
 
-        // Enforce the daemon limit.
+        // Enforce the daemon limit over registered daemons + live pending bindings
+        // (excluding this key), before burning — matches the Pg query.
         let max_daemons = d
             .tenants
             .get(&tenant_id)
@@ -439,10 +441,21 @@ impl EnrollmentRepository for MockStore {
             .values()
             .filter(|x| x.tenant_id == tenant_id)
             .count();
-        if daemon_count >= max_daemons as usize {
+        let pending_count = d
+            .pending
+            .iter()
+            .filter(|(pk, p)| {
+                p.tenant_id == tenant_id && pk.as_str() != public_key && p.expires_at > now
+            })
+            .count();
+        if daemon_count + pending_count >= max_daemons as usize {
             return Ok(EnrollOutcome::DaemonLimit);
         }
 
+        // Limit passed — now burn the code and write the pending binding.
+        if let Some(code) = d.codes.get_mut(code_hash) {
+            code.used_at = Some(now);
+        }
         d.pending.insert(
             public_key.to_string(),
             PendingRow {
@@ -506,6 +519,7 @@ pub fn test_config() -> Config {
     Config {
         global_database_url: "postgres://ignored".to_string(),
         region: "test".to_string(),
+        known_regions: vec!["use1".to_string(), "eu1".to_string()],
         api_listen_addr: "127.0.0.1:0".to_string(),
         mesh_listen_addr: "127.0.0.1:0".to_string(),
         mesh_ca_path: "/dev/null".to_string(),
@@ -534,6 +548,7 @@ pub fn build_state(seed: u8) -> (AppState, MockStore) {
         Arc::new(store.clone()),
         Arc::new(store.clone()),
         signer,
+        ["use1".to_string(), "eu1".to_string()],
     ));
     let state = AppState::new(test_config(), service, verifier);
     (state, store)

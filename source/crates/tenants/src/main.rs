@@ -56,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
         daemons_repo as Arc<dyn DaemonRepository>,
         enrollment_repo as Arc<dyn EnrollmentRepository>,
         signer,
+        config.known_regions.clone(),
     ));
 
     let state = AppState::new(config.clone(), service, verifier);

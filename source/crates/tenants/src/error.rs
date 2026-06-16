@@ -19,6 +19,10 @@ pub enum TenantsError {
     /// An entitlement limit (max networks / daemons) is exhausted.
     #[error("{0}")]
     EntitlementExceeded(String),
+    /// Authenticated but not permitted (e.g. a token request for a tenant whose
+    /// subscription is not active).
+    #[error("{0}")]
+    Forbidden(String),
     /// Malformed input (invalid slug, bad public key, …).
     #[error("{0}")]
     BadRequest(String),
@@ -40,6 +44,7 @@ impl From<TenantsError> for ApiError {
             TenantsError::Conflict(m) | TenantsError::EntitlementExceeded(m) => {
                 ApiError::Conflict(m)
             }
+            TenantsError::Forbidden(m) => ApiError::Forbidden(m),
             TenantsError::BadRequest(m) => ApiError::BadRequest(m),
             TenantsError::BadCode(m) => ApiError::Unauthorized(m),
             TenantsError::RateLimited(m) => ApiError::TooManyRequests(m),

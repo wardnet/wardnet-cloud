@@ -180,6 +180,30 @@ async fn reconcile_get_then_patch_over_mtls() {
 }
 
 #[tokio::test]
+async fn reaper_deprovisioned_patch_is_idempotent() {
+    mtls::install_crypto_provider();
+    let ca = MeshCa::new();
+    let server = ca.leaf(SERVER_NAME, ExtendedKeyUsagePurpose::ServerAuth);
+    let client = ca.leaf("ddns.mesh.local", ExtendedKeyUsagePurpose::ClientAuth);
+
+    let (state, network_id) = state_with_network().await;
+    // Move the network to `deprovisioning` (subscription cancel cascade).
+    state.tenants().cancel_subscription("t1").await.unwrap();
+
+    let addr = spawn_mesh(state, &server, ca.root_pem()).await;
+    let http = mesh_client(&client, ca.root_pem(), addr);
+    let url = format!("https://{SERVER_NAME}/v1/networks/{network_id}");
+    let body = serde_json::json!({ "provisioningState": "deprovisioned" });
+
+    // First PATCH deletes the row.
+    let resp = http.patch(&url).json(&body).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    // A retried reaper tick (row already gone) is still success, not 409.
+    let resp = http.patch(&url).json(&body).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn mesh_rejects_client_cert_from_a_foreign_ca() {
     mtls::install_crypto_provider();
     let server_ca = MeshCa::new();

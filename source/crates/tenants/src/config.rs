@@ -20,6 +20,10 @@ pub struct Config {
     /// Deployment region slug (for logging / deployment identity).
     pub region: String,
 
+    /// The fleet's real regions (from `KNOWN_REGIONS`, comma-separated). A network
+    /// may only be created in one of these — others would never be reconciled.
+    pub known_regions: Vec<String>,
+
     /// Loopback address for the public control-plane API (public `:80` via nginx).
     pub api_listen_addr: String,
 
@@ -40,6 +44,7 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("global_database_url", &"<redacted>")
             .field("region", &self.region)
+            .field("known_regions", &self.known_regions)
             .field("api_listen_addr", &self.api_listen_addr)
             .field("mesh_listen_addr", &self.mesh_listen_addr)
             .field("mesh_ca_path", &self.mesh_ca_path)
@@ -58,6 +63,11 @@ impl Config {
         Ok(Self {
             global_database_url: required("GLOBAL_DATABASE_URL")?,
             region: required("INFORGE_DEPLOYMENT_REGION_SLUG")?,
+            known_regions: required("KNOWN_REGIONS")?
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
             api_listen_addr: std::env::var("API_LISTEN_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:8080".to_string()),
             mesh_listen_addr: std::env::var("MESH_LISTEN_ADDR")

@@ -73,8 +73,10 @@ pub struct ServiceIdentity {
 pub struct DaemonCaller {
     /// Tenant the daemon acts for.
     pub tenant_id: String,
-    /// The daemon's id (token `sub`).
-    pub daemon_id: String,
+    /// The daemon's stable identity: the standard-base64 of its Ed25519 public key
+    /// (the token `sub`, which equals its `cnf`). This — not the `daemons.id` row —
+    /// is what every plane keys a daemon on.
+    pub public_key: String,
     /// Network scope, if the token is network-scoped.
     pub network: Option<String>,
 }
@@ -235,7 +237,7 @@ pub async fn authenticate<S: AuthContext>(
             }
             Caller::Daemon(DaemonCaller {
                 tenant_id: claims.tid,
-                daemon_id: claims.sub,
+                public_key: claims.sub,
                 network: claims.net,
             })
         }
@@ -292,7 +294,9 @@ pub fn verify_pop(
     pub_key_bytes: &[u8; 32],
 ) -> anyhow::Result<String> {
     let now = chrono::Utc::now().timestamp();
-    if (now - timestamp).abs() > TIMESTAMP_WINDOW_SECS {
+    // Widen to i128 so an attacker-controlled extreme timestamp (e.g. i64::MIN)
+    // cannot overflow the subtraction (a panic in debug, a wrap in release).
+    if (i128::from(now) - i128::from(timestamp)).abs() > i128::from(TIMESTAMP_WINDOW_SECS) {
         anyhow::bail!("timestamp outside ±{TIMESTAMP_WINDOW_SECS}s window");
     }
     let body_hash = hex::encode(Sha256::digest(body));
@@ -301,9 +305,50 @@ pub fn verify_pop(
     Ok(body_hash)
 }
 
-/// The middleware's daemon signed-request check: pull the timestamp/signature
-/// headers, run [`verify_pop`], then record the replay key
-/// `{subject}:{timestamp}:{body_hash}`. Returns the rejection on any failure.
+/// The full daemon signed-request check, in one place: parse the timestamp /
+/// signature headers, run [`verify_pop`], then record the replay key
+/// `{replay_subject}:{timestamp}:{body_hash}`. On any failure returns a short
+/// reason string (the caller maps it to its transport's rejection).
+///
+/// Used by the [`authenticate`] middleware **and** by the bootstrap JWT-issue
+/// endpoint, so the header contract and replay-key format live in exactly one
+/// place.
+///
+/// # Errors
+/// Returns the failure reason if the timestamp is missing/invalid, the signature
+/// does not verify, or the request is a replay.
+pub fn verify_pop_request(
+    method: &str,
+    path_and_query: &str,
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+    pub_key_bytes: &[u8; 32],
+    replay_subject: &str,
+    replay: &ReplayCache,
+) -> Result<(), &'static str> {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let timestamp: i64 = header("X-Wardnet-Timestamp")
+        .and_then(|v| v.parse().ok())
+        .ok_or("missing or invalid X-Wardnet-Timestamp")?;
+    let body_hash = verify_pop(
+        method,
+        path_and_query,
+        timestamp,
+        header("X-Wardnet-Signature").unwrap_or(""),
+        body,
+        pub_key_bytes,
+    )
+    .map_err(|_| "invalid request signature")?;
+
+    let replay_key = format!("{replay_subject}:{timestamp}:{body_hash}");
+    if replay.contains_or_insert(&replay_key, chrono::Utc::now().timestamp()) {
+        return Err("replayed request");
+    }
+    Ok(())
+}
+
+/// Middleware adapter over [`verify_pop_request`]: pulls the pieces from `parts`
+/// and maps a failure reason to a ready `401` [`Response`].
 // The `Err` is a deliberately-constructed HTTP `Response`, not a large error enum.
 #[allow(clippy::result_large_err)]
 fn verify_signed_request<S: AuthContext>(
@@ -313,48 +358,24 @@ fn verify_signed_request<S: AuthContext>(
     pub_key_bytes: &[u8; 32],
     state: &S,
 ) -> Result<(), Response> {
-    let timestamp: i64 = parts
-        .headers
-        .get("X-Wardnet-Timestamp")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .parse()
-        .map_err(|_| unauthorized("missing or invalid X-Wardnet-Timestamp"))?;
-
-    let sig_b64 = parts
-        .headers
-        .get("X-Wardnet-Signature")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let method = parts.method.as_str();
     let path_and_query = parts
         .uri
         .path_and_query()
         .map_or(parts.uri.path(), axum::http::uri::PathAndQuery::as_str);
 
-    let body_hash = verify_pop(
-        method,
+    verify_pop_request(
+        parts.method.as_str(),
         path_and_query,
-        timestamp,
-        sig_b64,
+        &parts.headers,
         body_bytes,
         pub_key_bytes,
+        subject,
+        state.replay_cache(),
     )
-    .map_err(|e| {
-        tracing::warn!(daemon_id = %subject, error = %e, "request signature verification failed");
-        unauthorized("invalid request signature")
-    })?;
-
-    let replay_key = format!("{subject}:{timestamp}:{body_hash}");
-    if state
-        .replay_cache()
-        .contains_or_insert(&replay_key, chrono::Utc::now().timestamp())
-    {
-        tracing::warn!(daemon_id = %subject, "replayed signed request rejected");
-        return Err(unauthorized("replayed request"));
-    }
-
-    Ok(())
+    .map_err(|reason| {
+        tracing::warn!(daemon = %subject, reason, "signed-request verification failed");
+        unauthorized(reason)
+    })
 }
 
 // ── Signature verification ──────────────────────────────────────────────────────

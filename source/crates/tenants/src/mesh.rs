@@ -146,22 +146,35 @@ async fn transition_network(
     Path(id): Path<String>,
     Json(body): Json<TransitionRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let applied = match body.provisioning_state.as_str() {
-        // Provisioner published the DNS record.
-        "active" => state.tenants().mark_network_active(&id).await?,
-        // Reaper tore the DNS record down — delete the row, freeing the slug.
-        "deprovisioned" => state.tenants().finish_deprovision(&id).await?,
-        other => {
-            return Err(ApiError::BadRequest(format!(
-                "unsupported transition target {other:?}"
-            )));
+    use wardnet_common::error::ApiError as E;
+
+    match body.provisioning_state.as_str() {
+        // Provisioner published the DNS record. Idempotent: already-active is success.
+        "active" => {
+            if state.tenants().mark_network_active(&id).await? {
+                return Ok(StatusCode::NO_CONTENT);
+            }
+            match state.tenants().network_state(&id).await? {
+                Some(ProvisioningState::Active) => Ok(StatusCode::NO_CONTENT),
+                None => Err(E::NotFound("no such network".to_string())),
+                Some(_) => Err(E::Conflict("network is not in 'provisioning'".to_string())),
+            }
         }
-    };
-    if applied {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(ApiError::Conflict(
-            "network not in the expected state for this transition".to_string(),
-        ))
+        // Reaper tore the DNS record down — delete the row, freeing the slug.
+        // Idempotent: an already-deleted row (a retried reaper tick) is success.
+        "deprovisioned" => {
+            if state.tenants().finish_deprovision(&id).await? {
+                return Ok(StatusCode::NO_CONTENT);
+            }
+            match state.tenants().network_state(&id).await? {
+                None => Ok(StatusCode::NO_CONTENT),
+                Some(_) => Err(E::Conflict(
+                    "network is not in 'deprovisioning'".to_string(),
+                )),
+            }
+        }
+        other => Err(E::BadRequest(format!(
+            "unsupported transition target {other:?}"
+        ))),
     }
 }

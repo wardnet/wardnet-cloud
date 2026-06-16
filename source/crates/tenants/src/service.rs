@@ -43,6 +43,9 @@ pub struct TenantsService {
     daemons: Arc<dyn DaemonRepository>,
     enrollment: Arc<dyn EnrollmentRepository>,
     signer: Signer,
+    /// The fleet's real regions; a network may only be created in one of these
+    /// (otherwise no DDNS provisioner would ever pick it up).
+    regions: std::collections::HashSet<String>,
 }
 
 impl TenantsService {
@@ -53,6 +56,7 @@ impl TenantsService {
         daemons: Arc<dyn DaemonRepository>,
         enrollment: Arc<dyn EnrollmentRepository>,
         signer: Signer,
+        regions: impl IntoIterator<Item = String>,
     ) -> Self {
         Self {
             tenants,
@@ -60,6 +64,7 @@ impl TenantsService {
             daemons,
             enrollment,
             signer,
+            regions: regions.into_iter().collect(),
         }
     }
 
@@ -276,39 +281,43 @@ impl TenantsService {
     pub async fn mint_jwt(&self, public_key: &str) -> Result<String, TenantsError> {
         let now = Utc::now();
 
-        // A registered daemon gets a network-scoped token.
-        if let Some(daemon) = self.daemons.find_by_public_key(public_key).await? {
-            let spec = ClaimsSpec {
-                tenant_id: &daemon.tenant_id,
-                principal_type: PrincipalType::Daemon,
-                subject: public_key,
-                network: Some(&daemon.network_id),
-                cnf_ed25519_b64: Some(public_key),
+        // Resolve scope: a registered daemon is network-scoped; a still-pending
+        // daemon is tenant-scoped (no network yet).
+        let (tenant_id, network): (String, Option<String>) =
+            if let Some(daemon) = self.daemons.find_by_public_key(public_key).await? {
+                (daemon.tenant_id, Some(daemon.network_id))
+            } else if let Some(tid) = self.enrollment.find_pending_tenant(public_key, now).await? {
+                (tid, None)
+            } else {
+                return Err(TenantsError::BadCode(
+                    "no registered daemon or live enrollment for this key".to_string(),
+                ));
             };
-            return self
-                .signer
-                .sign(&spec, now.timestamp(), IDENTITY_JWT_TTL_SECS)
-                .map_err(TenantsError::Internal);
+
+        // Revocation at refresh: a token is never minted for a tenant whose
+        // subscription is not active (a canceled tenant's daemons stop getting
+        // fresh credentials immediately, not just once the reaper deletes rows).
+        let tenant = self
+            .tenants
+            .find_by_id(&tenant_id)
+            .await?
+            .ok_or_else(|| TenantsError::NotFound("tenant not found".to_string()))?;
+        if tenant.subscription_status != SubscriptionStatus::Active {
+            return Err(TenantsError::Forbidden(
+                "tenant subscription is not active".to_string(),
+            ));
         }
 
-        // A still-pending daemon gets a tenant-scoped token (no network yet).
-        if let Some(tenant_id) = self.enrollment.find_pending_tenant(public_key, now).await? {
-            let spec = ClaimsSpec {
-                tenant_id: &tenant_id,
-                principal_type: PrincipalType::Daemon,
-                subject: public_key,
-                network: None,
-                cnf_ed25519_b64: Some(public_key),
-            };
-            return self
-                .signer
-                .sign(&spec, now.timestamp(), IDENTITY_JWT_TTL_SECS)
-                .map_err(TenantsError::Internal);
-        }
-
-        Err(TenantsError::BadCode(
-            "no registered daemon or live enrollment for this key".to_string(),
-        ))
+        let spec = ClaimsSpec {
+            tenant_id: &tenant_id,
+            principal_type: PrincipalType::Daemon,
+            subject: public_key,
+            network: network.as_deref(),
+            cnf_ed25519_b64: Some(public_key),
+        };
+        self.signer
+            .sign(&spec, now.timestamp(), IDENTITY_JWT_TTL_SECS)
+            .map_err(TenantsError::Internal)
     }
 
     // ── Daemon plane (availability + register-network) ───────────────────────────
@@ -348,8 +357,12 @@ impl TenantsService {
             ));
         }
         let region = region.trim();
-        if region.is_empty() {
-            return Err(TenantsError::BadRequest("region is required".to_string()));
+        // Reject unknown regions: a network in a region no DDNS provisioner serves
+        // would be stuck `provisioning` forever while consuming a slug + a slot.
+        if !self.regions.contains(region) {
+            return Err(TenantsError::BadRequest(format!(
+                "unknown region '{region}'"
+            )));
         }
 
         let tenant = self
@@ -425,6 +438,22 @@ impl TenantsService {
             .networks
             .list_for_reconcile(state, region, after_id, limit)
             .await?)
+    }
+
+    /// The current [`ProvisioningState`] of a network, or `None` if it does not
+    /// exist. Lets the mesh transition handler give idempotent answers.
+    ///
+    /// # Errors
+    /// [`TenantsError::Internal`] on a repository failure.
+    pub async fn network_state(
+        &self,
+        network_id: &str,
+    ) -> Result<Option<ProvisioningState>, TenantsError> {
+        Ok(self
+            .networks
+            .find_by_id(network_id)
+            .await?
+            .map(|n| n.provisioning_state))
     }
 
     /// `provisioning → active` (provisioner). Returns whether it applied.

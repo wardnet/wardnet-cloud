@@ -10,12 +10,11 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, Uri};
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use wardnet_common::auth::verify_pop;
+use wardnet_common::auth::verify_pop_request;
 use wardnet_common::validation::validate_public_key;
 
 use crate::error::ApiError;
@@ -67,43 +66,26 @@ async fn issue_token(
         .map_err(|_| ApiError::BadRequest("invalid JSON body".to_string()))?;
     let pub_key_bytes = validate_public_key(&req.public_key)?;
 
-    let timestamp: i64 = header(&headers, "X-Wardnet-Timestamp")
-        .and_then(|v| v.parse().ok())
-        .ok_or_else(|| {
-            ApiError::Unauthorized("missing or invalid X-Wardnet-Timestamp".to_string())
-        })?;
-    let signature = header(&headers, "X-Wardnet-Signature").unwrap_or("");
     let path_and_query = uri
         .path_and_query()
         .map_or(uri.path(), axum::http::uri::PathAndQuery::as_str);
 
-    let body_hash = verify_pop(
+    // Same PoP + replay core the auth middleware uses (the key is its own subject
+    // here, since no JWT exists yet).
+    verify_pop_request(
         method.as_str(),
         path_and_query,
-        timestamp,
-        signature,
+        &headers,
         &body,
         &pub_key_bytes,
+        &req.public_key,
+        state.replay_cache(),
     )
-    .map_err(|e| {
-        tracing::warn!(error = %e, "token PoP verification failed");
-        ApiError::Unauthorized("invalid request signature".to_string())
+    .map_err(|reason| {
+        tracing::warn!(reason, "token PoP verification failed");
+        ApiError::Unauthorized(reason.to_string())
     })?;
-
-    // Replay guard, keyed by the presenting key (its identity for this purpose).
-    let replay_key = format!("{}:{timestamp}:{body_hash}", req.public_key);
-    if state
-        .replay_cache()
-        .contains_or_insert(&replay_key, Utc::now().timestamp())
-    {
-        return Err(ApiError::Unauthorized("replayed request".to_string()));
-    }
 
     let token = state.tenants().mint_jwt(&req.public_key).await?;
     Ok(Json(TokenResponse { token }))
-}
-
-/// Read a header as `&str`.
-fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name).and_then(|v| v.to_str().ok())
 }

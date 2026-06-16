@@ -53,7 +53,9 @@ pub struct Claims {
     pub tid: String,
     /// Principal kind.
     pub pt: PrincipalType,
-    /// Principal id — a daemon id or a user id.
+    /// Principal id. For a daemon this is its **public key** (standard-base64,
+    /// equal to `cnf`) — the daemon's stable identity, not the `daemons.id` row.
+    /// For a user, the user id.
     pub sub: String,
     /// Optional network scope (a network id); absent on the enrollment-time
     /// tenant-scoped token.
@@ -94,7 +96,8 @@ pub struct ClaimsSpec<'a> {
     pub tenant_id: &'a str,
     /// Principal kind.
     pub principal_type: PrincipalType,
-    /// Principal id (daemon id or user id).
+    /// Principal id — for a daemon, its base64 public key (== `cnf`); for a user,
+    /// the user id.
     pub subject: &'a str,
     /// Optional network scope (network id).
     pub network: Option<&'a str>,

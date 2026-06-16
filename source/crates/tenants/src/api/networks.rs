@@ -82,11 +82,13 @@ async fn register_network(
             "daemon credential required".to_string(),
         ));
     };
+    // `public_key` is the daemon's identity (token `sub` == its `cnf`); it becomes
+    // the `daemons.public_key` row.
     let network = state
         .tenants()
         .register_network(
             &daemon.tenant_id,
-            &daemon.daemon_id,
+            &daemon.public_key,
             &body.slug,
             body.display_name.as_deref(),
             &body.region,

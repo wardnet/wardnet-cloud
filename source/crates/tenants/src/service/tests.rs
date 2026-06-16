@@ -190,6 +190,68 @@ async fn register_network_rejects_taken_slug() {
 }
 
 #[tokio::test]
+async fn mint_jwt_denied_after_subscription_canceled() {
+    let (state, _store, tenant_id, cnf, _slug) = enrolled_and_registered().await;
+    // Active tenant mints fine.
+    assert!(state.tenants().mint_jwt(&cnf).await.is_ok());
+    // After cancel, the daemon's key can no longer mint a token (revocation at refresh).
+    state
+        .tenants()
+        .cancel_subscription(&tenant_id)
+        .await
+        .unwrap();
+    assert!(matches!(
+        state.tenants().mint_jwt(&cnf).await,
+        Err(TenantsError::Forbidden(_))
+    ));
+}
+
+#[tokio::test]
+async fn register_network_rejects_unknown_region() {
+    let (state, store) = build_state(SEED);
+    store.seed_tenant(Tenant {
+        id: "t1".to_string(),
+        email: "t1@b.com".to_string(),
+        entitlement: Entitlement {
+            max_networks: 5,
+            max_daemons: 5,
+        },
+        subscription_status: SubscriptionStatus::Active,
+        subscription_id: None,
+        created_at: chrono::Utc::now(),
+    });
+    let (_k, c) = daemon_keypair(51);
+    assert!(matches!(
+        state
+            .tenants()
+            .register_network("t1", &c, "net-x", None, "mars")
+            .await,
+        Err(TenantsError::BadRequest(_))
+    ));
+}
+
+#[tokio::test]
+async fn enroll_pending_bindings_count_against_daemon_limit() {
+    // Default entitlement 1 daemon: a first key may enroll (pending), but a second
+    // key for the same tenant is rejected even before either registers a network.
+    let (state, _store) = build_state(SEED);
+    let (_k1, c1) = daemon_keypair(11);
+    let code = state
+        .tenants()
+        .issue_signup_code("p@b.com", "1.2.3.4")
+        .await
+        .unwrap();
+    let tenant_id = state.tenants().enroll(&code, &c1).await.unwrap().tenant_id;
+
+    let (_k2, c2) = daemon_keypair(12);
+    let code2 = state.tenants().issue_tenant_code(&tenant_id).await.unwrap();
+    assert!(matches!(
+        state.tenants().enroll(&code2, &c2).await,
+        Err(TenantsError::EntitlementExceeded(_))
+    ));
+}
+
+#[tokio::test]
 async fn availability_reflects_validity_and_use() {
     let (state, _store, _tid, _cnf, slug) = enrolled_and_registered().await;
     assert!(!state.tenants().check_availability(&slug).await.unwrap()); // taken

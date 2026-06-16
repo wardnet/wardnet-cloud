@@ -178,12 +178,21 @@ impl EnrollmentRepository for PgEnrollmentRepository {
                 .bind(&tenant_id)
                 .fetch_one(&mut *tx)
                 .await?;
-        let daemon_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM daemons WHERE tenant_id = $1")
-                .bind(&tenant_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        if daemon_count >= i64::from(entitlement.0.max_daemons) {
+        // Count both registered daemons AND live pending bindings (other keys) so a
+        // burst of enrolls cannot over-subscribe `max_daemons` before any of them
+        // reaches register-network. The current key is excluded so a re-enroll
+        // (refresh) of an already-pending key does not count itself.
+        let used: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM daemons WHERE tenant_id = $1) \
+                  + (SELECT COUNT(*) FROM pending_enrollments \
+                     WHERE tenant_id = $1 AND public_key <> $2 AND expires_at > $3)",
+        )
+        .bind(&tenant_id)
+        .bind(public_key)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        if used >= i64::from(entitlement.0.max_daemons) {
             tx.rollback().await?;
             return Ok(EnrollOutcome::DaemonLimit);
         }
