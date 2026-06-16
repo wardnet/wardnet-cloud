@@ -23,7 +23,9 @@ pub fn register(router: OpenApiRouter<AppState>) -> OpenApiRouter<AppState> {
 /// Request body for `PUT /v1/ip`.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ReportIpRequest {
-    /// The daemon's current public IPv4 address, e.g. `"203.0.113.42"`.
+    /// The daemon's current public IPv4 address, e.g. `"93.184.216.34"`.
+    /// Must be a globally routable unicast address (private/reserved/multicast
+    /// addresses are rejected with `400`).
     pub ip: String,
 }
 

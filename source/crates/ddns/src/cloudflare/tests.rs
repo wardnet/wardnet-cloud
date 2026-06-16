@@ -146,10 +146,12 @@ async fn find_a_record_errors_when_success_is_false() {
 
     Mock::given(method("GET"))
         .and(path(format!("/zones/{ZONE}/dns_records")))
+        // Cloudflare returns `result: null` (not []) on error bodies; the parser
+        // must still deserialize it and surface the error message.
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "success": false,
             "errors": [ { "message": "Invalid zone" } ],
-            "result": []
+            "result": null
         })))
         .mount(&server)
         .await;

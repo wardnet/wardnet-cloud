@@ -283,12 +283,17 @@ struct CfResponse {
 }
 
 /// List response shape (`result` is an array for GET `/dns_records`).
+///
+/// `result` is `Option` because Cloudflare returns `"result": null` on error
+/// bodies — `#[serde(default)]` only covers an *absent* key, not an explicit
+/// `null`, so a non-optional `Vec` would fail to deserialize the error response
+/// and mask the real Cloudflare error message.
 #[derive(Deserialize)]
 struct CfListResponse {
     success: bool,
     errors: Vec<CfError>,
     #[serde(default)]
-    result: Vec<DnsRecordResult>,
+    result: Option<Vec<DnsRecordResult>>,
 }
 
 async fn parse_cf_response(resp: reqwest::Response) -> anyhow::Result<String> {
@@ -318,5 +323,10 @@ async fn parse_cf_list_response(resp: reqwest::Response) -> anyhow::Result<Optio
         anyhow::bail!("Cloudflare API error: {}", msgs.join("; "));
     }
 
-    Ok(body.result.into_iter().next().map(|r| r.id))
+    Ok(body
+        .result
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+        .map(|r| r.id))
 }
