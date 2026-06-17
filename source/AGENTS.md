@@ -55,7 +55,12 @@ Conventions and invariants for agents working inside `source/`.
   new `common` auth. Depends on `wardnet_common`. The remaining carve into `tunneller` is WS-D.
 
 **Where code goes:** if a primitive is (or will be) used by more than one service, it belongs in
-`common`; service-specific logic stays in its service crate (`tenants`/`cloud`). Shared dependencies and lints are declared once at the
+`common`; service-specific logic stays in its service crate (`tenants`/`cloud`). **Every API
+request/response DTO lives in `wardnet_common::contract`** (the whole wire surface — bootstrap, daemon,
+account, mesh, all of it), shared by the producer and the consumer so a producer-side change is a compile
+error on the consumer; `ErrorBody` is the precedent (see invariant #21). The producer keeps its
+`impl From<DomainType> for ContractDTO` mapping locally (the orphan rule allows it — the domain type is
+local). Shared dependencies and lints are declared once at the
 workspace root — add deps via `workspace.dependencies` and reference them with `<dep>.workspace = true`;
 do not pin versions per-crate. Lints come from `[workspace.lints.clippy]` (pedantic) via
 `[lints] workspace = true` in each member.
@@ -111,6 +116,8 @@ do not pin versions per-crate. Lints come from `[workspace.lints.clippy]` (pedan
 19. **The mesh work-queue is mTLS-only and off the public router.** The reconcile work-queue (`GET/PATCH /v1/networks`, Tenants ↔ DDNS provisioner/reaper) is served by a separate internal listener on `config.mesh_listen_addr`. **Transport vs API are split:** the mTLS listener lives in `crates/tenants/src/mesh.rs` (`serve_mesh` — TLS acceptor + accept loop + semaphore), and the SERVICE-plane handlers + DTOs live in `crates/tenants/src/api/reconcile.rs` (`pub fn router`). "mesh" names the mTLS *transport*, never a route group. The reconcile router is **not** mounted on the public nginx-fronted router and carries `authenticate(SERVICE)` — the mutual-TLS handshake (server presents the mesh leaf cert, requires a client cert chained to the mesh CA via `mtls::server_config_from_pem`, which stamps a `ServiceIdentity`) is what `SERVICE` resolves against. Never expose the reconcile routes on the public router or add a JWT/bearer layer to them. (`POST /v1/introspect` is gone — DNS teardown is the DDNS reaper draining this work-queue, per ADR-0001.)
 
 20. **DDNS A-record creation is the provisioner's alone, and is adopt-or-create + CAS.** Only `DdnsService::provision` (the provisioner) creates a Cloudflare A record; **report-IP only ever updates in place** (`OperationalRepository::record_ip` writes the `ip` column only — never `fqdn`/`cf_a_record_id`), so a daemon's IP report can never resurrect a record the reaper just deleted. To tolerate N regional replicas, `provision` adopts an existing record for the FQDN or creates one, then CAS-claims the id (`WHERE cf_a_record_id IS NULL`); on a lost CAS it deletes its record **only if** that record is not the one the winner stored. Do not add a create path to report-IP, and do not drop the `cf_a_record_id IS NULL` guard on the claim. See ADR-0003.
+
+21. **Every API request/response DTO lives in `wardnet_common::contract`, shared by producer and consumer.** A DTO defined in the producing service and re-declared (a "deserialize twin") in the consumer drifts silently; instead both crates depend on the one type in `common::contract`, so a producer change is a compile error on the consumer (`ErrorBody` is the original precedent). This covers the whole wire surface — bootstrap/daemon/account/mesh DTOs alike — including the embedded value objects (`ProvisioningState`, `SubscriptionStatus`, `Entitlement`), which also double as Tenants' DB-domain enums (their `as_str`/`from_db` helpers live on the contract type). A resource view (`NetworkView`/`TenantView`/`DaemonView`) is the **full** resource, never trimmed to one caller's current needs; tolerant consumers read only the fields they use. The `impl From<DomainType> for ContractDTO` conversion stays in the owning service crate (orphan-rule-legal, since the domain type is local). Do **not** add a second copy of a DTO in a service crate, and do not narrow a view to a caller.
 
 ## Test placement
 

@@ -8,16 +8,16 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use wardnet_common::auth::{AuthCaller, Caller};
+use wardnet_common::contract::{
+    CodeResponse, DaemonView, NetworkView, RegisterTenantRequest, TenantView, UpdateTenantRequest,
+};
 
-use crate::api::networks::NetworkView;
 use crate::error::ApiError;
-use crate::repository::{Daemon, Entitlement, Tenant};
+use crate::repository::{Daemon, Tenant};
 use crate::state::AppState;
 
 /// Register all account-plane routes.
@@ -32,16 +32,7 @@ pub fn register(router: OpenApiRouter<AppState>) -> OpenApiRouter<AppState> {
         .routes(routes!(delete_network))
 }
 
-// ── DTOs ─────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct TenantView {
-    pub id: String,
-    pub email: String,
-    pub entitlement: Entitlement,
-    pub subscription_status: String,
-    pub created_at: DateTime<Utc>,
-}
+// ── Domain → contract conversions (orphan rule OK: the domain type is local) ───
 
 impl From<Tenant> for TenantView {
     fn from(t: Tenant) -> Self {
@@ -49,18 +40,11 @@ impl From<Tenant> for TenantView {
             id: t.id,
             email: t.email,
             entitlement: t.entitlement,
-            subscription_status: t.subscription_status.as_str().to_string(),
+            subscription_status: t.subscription_status,
+            subscription_id: t.subscription_id,
             created_at: t.created_at,
         }
     }
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct DaemonView {
-    pub id: String,
-    pub network_id: String,
-    pub public_key: String,
-    pub created_at: DateTime<Utc>,
 }
 
 impl From<Daemon> for DaemonView {
@@ -72,26 +56,6 @@ impl From<Daemon> for DaemonView {
             created_at: d.created_at,
         }
     }
-}
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct RegisterTenantRequest {
-    pub email: String,
-    /// Optional entitlement; defaults to 1 network / 1 daemon.
-    #[serde(default)]
-    pub entitlement: Option<Entitlement>,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct CodeResponse {
-    /// The one-time code (transitional — emailed in production).
-    pub code: String,
-}
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct UpdateTenantRequest {
-    /// Only `"canceled"` is accepted (cancels the subscription + cascades networks).
-    pub subscription_status: String,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

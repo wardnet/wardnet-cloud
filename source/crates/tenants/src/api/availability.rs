@@ -3,11 +3,11 @@
 
 use axum::Json;
 use axum::extract::{Query, State};
-use serde::{Deserialize, Serialize};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use wardnet_common::auth::AuthCaller;
+use wardnet_common::contract::{AvailabilityQuery, AvailabilityResponse};
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -15,20 +15,6 @@ use crate::state::AppState;
 /// Register the availability route.
 pub fn register(router: OpenApiRouter<AppState>) -> OpenApiRouter<AppState> {
     router.routes(routes!(availability))
-}
-
-/// Query for `GET /v1/availability`.
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-pub struct AvailabilityQuery {
-    /// The vanity slug to check.
-    pub slug: String,
-}
-
-/// Response body.
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct AvailabilityResponse {
-    /// `true` if the slug is well-formed, not reserved, and unused.
-    pub available: bool,
 }
 
 #[utoipa::path(

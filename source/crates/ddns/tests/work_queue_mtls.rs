@@ -77,11 +77,13 @@ async fn spawn_mesh(server: &Leaf, ca_pem: &str) -> SocketAddr {
             get(|| async {
                 Json(serde_json::json!([{
                     "id": "n1",
+                    "tenant_id": "t1",
                     "slug": "happy",
                     "display_name": "Happy",
                     "region": REGION,
                     "provisioning_state": "provisioning",
-                    "created_at": "2026-06-16T00:00:00Z"
+                    "created_at": "2026-06-16T00:00:00Z",
+                    "updated_at": "2026-06-16T00:00:00Z"
                 }]))
             }),
         )

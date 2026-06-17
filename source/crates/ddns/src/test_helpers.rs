@@ -370,7 +370,7 @@ impl WorkQueue for MockWorkQueue {
         let mut matching: Vec<NetworkView> = st
             .networks
             .iter()
-            .filter(|n| n.provisioning_state == state && n.region == region)
+            .filter(|n| n.provisioning_state.as_str() == state && n.region == region)
             .filter(|n| after_id.is_none_or(|a| n.id.as_str() > a))
             .cloned()
             .collect();

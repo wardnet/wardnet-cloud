@@ -9,10 +9,10 @@ use std::net::SocketAddr;
 use axum::Json;
 use axum::extract::{ConnectInfo, State};
 use axum::http::HeaderMap;
-use serde::{Deserialize, Serialize};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use wardnet_common::contract::{SignupCodeRequest, SignupCodeResponse};
 use wardnet_common::proxy_protocol::client_ip;
 
 use crate::error::ApiError;
@@ -21,21 +21,6 @@ use crate::state::AppState;
 /// Register the signup-code route.
 pub fn register(router: OpenApiRouter<AppState>) -> OpenApiRouter<AppState> {
     router.routes(routes!(request_signup_code))
-}
-
-/// Request body for `POST /v1/enrollment-codes`.
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct SignupCodeRequest {
-    /// The account email a code should be issued for.
-    pub email: String,
-}
-
-/// Response body for `POST /v1/enrollment-codes`.
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct SignupCodeResponse {
-    /// The one-time code. **Transitional:** returned here until email delivery
-    /// (Resend) lands; thereafter it is emailed, not returned.
-    pub code: String,
 }
 
 #[utoipa::path(

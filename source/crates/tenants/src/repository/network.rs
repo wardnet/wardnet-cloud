@@ -4,49 +4,13 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+
+// The lifecycle enum is part of the shared API contract; it doubles as the
+// DB-domain enum here (its `as_str` / `from_db` helpers travel with it).
+pub use wardnet_common::contract::ProvisioningState;
 
 use crate::db::DbPools;
 use crate::repository::daemon::Daemon;
-
-/// Network lifecycle. `deprovisioned` is intentionally absent — the reaper's final
-/// transition deletes the row (freeing the slug).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum ProvisioningState {
-    /// Created; the DDNS provisioner has not yet published its DNS record.
-    Provisioning,
-    /// DNS record published; live.
-    Active,
-    /// Slated for teardown; the reaper deletes its DNS record then the row.
-    Deprovisioning,
-}
-
-impl ProvisioningState {
-    /// The DB/text form.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ProvisioningState::Provisioning => "provisioning",
-            ProvisioningState::Active => "active",
-            ProvisioningState::Deprovisioning => "deprovisioning",
-        }
-    }
-
-    /// Parse from the DB/text form.
-    ///
-    /// # Errors
-    /// Returns an error on an unrecognized value (a CHECK-constraint violation
-    /// upstream would have to have happened first).
-    pub fn from_db(s: &str) -> anyhow::Result<Self> {
-        match s {
-            "provisioning" => Ok(ProvisioningState::Provisioning),
-            "active" => Ok(ProvisioningState::Active),
-            "deprovisioning" => Ok(ProvisioningState::Deprovisioning),
-            other => Err(anyhow::anyhow!("unknown provisioning_state {other:?}")),
-        }
-    }
-}
 
 /// A network.
 #[derive(Debug, Clone)]

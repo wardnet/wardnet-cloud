@@ -9,6 +9,8 @@ use super::{provisioner_tick, reaper_tick};
 use crate::repository::OperationalRepository;
 use crate::service::DdnsService;
 use crate::test_helpers::{InMemoryOperational, MockDnsProvider, MockWorkQueue};
+use wardnet_common::contract::ProvisioningState;
+
 use crate::work_queue::{NetworkView, WorkQueue};
 
 const REGION: &str = "use1";
@@ -17,11 +19,13 @@ const PARENT: &str = "my.wardnet.services";
 fn view(id: &str, slug: &str, state: &str) -> NetworkView {
     NetworkView {
         id: id.to_string(),
+        tenant_id: "t1".to_string(),
         slug: slug.to_string(),
         display_name: slug.to_string(),
         region: REGION.to_string(),
-        provisioning_state: state.to_string(),
+        provisioning_state: ProvisioningState::from_db(state).unwrap(),
         created_at: Utc::now(),
+        updated_at: Utc::now(),
     }
 }
 

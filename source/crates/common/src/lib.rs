@@ -3,11 +3,12 @@
 //! This crate holds everything that is genuinely cross-service: identity tokens,
 //! mesh mTLS, the PROXY-protocol front-door, the replay cache, the DNS-provider
 //! trait, database pool plumbing, the HTTP error shape, request validation, the
-//! unified caller-type auth layer, the hyper connection server, and the health
-//! endpoint.
+//! unified caller-type auth layer, the hyper connection server, the health
+//! endpoint, and the shared API contract DTOs (`contract`).
 
 pub mod auth;
 pub mod config;
+pub mod contract;
 pub mod db;
 pub mod dns_provider;
 pub mod error;

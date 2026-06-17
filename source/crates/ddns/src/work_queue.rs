@@ -12,22 +12,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use serde::Deserialize;
 
+// `NetworkView` is the shared contract DTO; re-exported so the reconcile loops and
+// their tests keep referring to it via `crate::work_queue::NetworkView`.
+pub use wardnet_common::contract::NetworkView;
+use wardnet_common::contract::{ReconcileQuery, TransitionRequest};
 use wardnet_common::mtls::MeshClient;
-
-/// A network as seen on the work queue — a deserialize-mirror of the `snake_case`
-/// view Tenants serves (`crates/tenants/src/api/networks.rs::NetworkView`).
-#[derive(Debug, Clone, Deserialize)]
-pub struct NetworkView {
-    pub id: String,
-    pub slug: String,
-    pub display_name: String,
-    pub region: String,
-    pub provisioning_state: String,
-    pub created_at: DateTime<Utc>,
-}
 
 /// The desired-state work queue the provisioner/reaper drain and report back to.
 ///
@@ -81,15 +71,12 @@ impl WorkQueue for TenantsWorkQueue {
         limit: i64,
     ) -> anyhow::Result<Vec<NetworkView>> {
         let url = format!("{}/v1/networks", self.base_url);
-        let limit = limit.to_string();
-        let mut query: Vec<(&str, &str)> = vec![
-            ("provisioningState", state),
-            ("region", region),
-            ("limit", &limit),
-        ];
-        if let Some(after) = after_id {
-            query.push(("afterId", after));
-        }
+        let query = ReconcileQuery {
+            provisioning_state: state.to_string(),
+            region: region.to_string(),
+            after_id: after_id.map(str::to_string),
+            limit: Some(limit),
+        };
 
         let resp = self
             .mesh
@@ -105,7 +92,9 @@ impl WorkQueue for TenantsWorkQueue {
 
     async fn transition(&self, id: &str, target: &str) -> anyhow::Result<()> {
         let url = format!("{}/v1/networks/{id}", self.base_url);
-        let body = serde_json::json!({ "provisioningState": target });
+        let body = TransitionRequest {
+            provisioning_state: target.to_string(),
+        };
         let resp = self
             .mesh
             .current()

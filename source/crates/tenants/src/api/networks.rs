@@ -5,12 +5,11 @@
 
 use axum::Json;
 use axum::extract::State;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use wardnet_common::auth::{AuthCaller, Caller};
+use wardnet_common::contract::{NetworkView, RegisterNetworkRequest};
 
 use crate::error::ApiError;
 use crate::repository::Network;
@@ -21,38 +20,17 @@ pub fn register(router: OpenApiRouter<AppState>) -> OpenApiRouter<AppState> {
     router.routes(routes!(register_network))
 }
 
-/// Request body for `POST /v1/networks`.
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct RegisterNetworkRequest {
-    /// Desired vanity slug (`[a-z0-9-]`, 3–32, not reserved).
-    pub slug: String,
-    /// Human-facing name; defaults to the slug when omitted/empty.
-    #[serde(default)]
-    pub display_name: Option<String>,
-    /// Region that will own this network's DNS/tunnel.
-    pub region: String,
-}
-
-/// Public view of a network.
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct NetworkView {
-    pub id: String,
-    pub slug: String,
-    pub display_name: String,
-    pub region: String,
-    pub provisioning_state: String,
-    pub created_at: DateTime<Utc>,
-}
-
 impl From<Network> for NetworkView {
     fn from(n: Network) -> Self {
         Self {
             id: n.id,
+            tenant_id: n.tenant_id,
             slug: n.slug,
             display_name: n.display_name,
             region: n.region,
-            provisioning_state: n.provisioning_state.as_str().to_string(),
+            provisioning_state: n.provisioning_state,
             created_at: n.created_at,
+            updated_at: n.updated_at,
         }
     }
 }

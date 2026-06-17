@@ -6,9 +6,10 @@
 
 use axum::Json;
 use axum::extract::State;
-use serde::{Deserialize, Serialize};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
+
+use wardnet_common::contract::{EnrollRequest, EnrollResponse};
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -16,22 +17,6 @@ use crate::state::AppState;
 /// Register the enroll route.
 pub fn register(router: OpenApiRouter<AppState>) -> OpenApiRouter<AppState> {
     router.routes(routes!(enroll))
-}
-
-/// Request body for `POST /v1/enroll`.
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct EnrollRequest {
-    /// The one-time code (raw value, as emailed to the tenant).
-    pub code: String,
-    /// Base64-encoded raw Ed25519 public key (32 bytes) the daemon will sign with.
-    pub public_key: String,
-}
-
-/// Response body for `POST /v1/enroll`.
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct EnrollResponse {
-    /// The tenant this daemon is now (pending-)bound to.
-    pub tenant_id: String,
 }
 
 #[utoipa::path(

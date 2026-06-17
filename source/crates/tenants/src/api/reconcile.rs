@@ -16,11 +16,10 @@ use axum::http::StatusCode;
 use axum::middleware::from_fn_with_state;
 use axum::routing::{get, patch};
 use axum::{Json, Router};
-use serde::Deserialize;
 
 use wardnet_common::auth::{CallerType, authenticate};
+use wardnet_common::contract::{NetworkView, ReconcileQuery, TransitionRequest};
 
-use crate::api::networks::NetworkView;
 use crate::error::ApiError;
 use crate::repository::ProvisioningState;
 use crate::state::AppState;
@@ -43,16 +42,6 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Query for the reconcile scan.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReconcileQuery {
-    provisioning_state: String,
-    region: String,
-    after_id: Option<String>,
-    limit: Option<i64>,
-}
-
 async fn list_for_reconcile(
     State(state): State<AppState>,
     Query(query): Query<ReconcileQuery>,
@@ -70,13 +59,6 @@ async fn list_for_reconcile(
         )
         .await?;
     Ok(Json(networks.into_iter().map(Into::into).collect()))
-}
-
-/// Body for a network state transition.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TransitionRequest {
-    provisioning_state: String,
 }
 
 async fn transition_network(

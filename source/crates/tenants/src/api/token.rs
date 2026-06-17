@@ -10,11 +10,11 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, Uri};
-use serde::{Deserialize, Serialize};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use wardnet_common::auth::verify_pop_request;
+use wardnet_common::contract::{TokenRequest, TokenResponse};
 use wardnet_common::validation::validate_public_key;
 
 use crate::error::ApiError;
@@ -23,20 +23,6 @@ use crate::state::AppState;
 /// Register the token route.
 pub fn register(router: OpenApiRouter<AppState>) -> OpenApiRouter<AppState> {
     router.routes(routes!(issue_token))
-}
-
-/// Request body for `POST /v1/token`.
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct TokenRequest {
-    /// Base64-encoded raw Ed25519 public key (32 bytes) — the enrolled/registered key.
-    pub public_key: String,
-}
-
-/// Response body for `POST /v1/token`.
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct TokenResponse {
-    /// The minted identity JWT (`EdDSA`).
-    pub token: String,
 }
 
 #[utoipa::path(

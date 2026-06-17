@@ -3,70 +3,13 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
 
+// `Entitlement` + `SubscriptionStatus` are part of the shared API contract; they
+// double as the DB-domain types here (their helpers travel with them).
+pub use wardnet_common::contract::{Entitlement, SubscriptionStatus};
+
 use crate::db::DbPools;
-
-/// Per-tenant limits. JSONB-stored so new dimensions need no migration; `serde`
-/// defaults keep old rows readable as dimensions are added.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct Entitlement {
-    /// Maximum networks the tenant may hold.
-    #[serde(default = "Entitlement::one")]
-    pub max_networks: u32,
-    /// Maximum daemons across all the tenant's networks.
-    #[serde(default = "Entitlement::one")]
-    pub max_daemons: u32,
-}
-
-impl Entitlement {
-    /// The default a self-service (wizard-enrolled) tenant receives.
-    pub const DEFAULT: Entitlement = Entitlement {
-        max_networks: 1,
-        max_daemons: 1,
-    };
-
-    const fn one() -> u32 {
-        1
-    }
-}
-
-impl Default for Entitlement {
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
-
-/// Subscription state. Drives the network-deprovisioning cascade on cancel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum SubscriptionStatus {
-    /// Live subscription (or trial).
-    Active,
-    /// Cancelled — its networks are cascaded to `deprovisioning`.
-    Canceled,
-}
-
-impl SubscriptionStatus {
-    /// The DB/text form.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SubscriptionStatus::Active => "active",
-            SubscriptionStatus::Canceled => "canceled",
-        }
-    }
-
-    /// Parse from the DB/text form (unknown → `Active`, the safe default).
-    #[must_use]
-    pub fn from_db(s: &str) -> Self {
-        match s {
-            "canceled" => SubscriptionStatus::Canceled,
-            _ => SubscriptionStatus::Active,
-        }
-    }
-}
 
 /// A tenant account.
 #[derive(Debug, Clone)]
