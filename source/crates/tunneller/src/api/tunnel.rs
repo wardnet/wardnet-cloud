@@ -94,22 +94,27 @@ async fn tunnel_connect(
     }
 
     let slug = network.slug;
+    let tenant_id = network.tenant_id;
     let node_addr = state.node_addr().to_string();
-
-    // Claim the route (this node now owns the slug), then register + upgrade.
-    state
-        .routes()
-        .upsert(&slug, &node_addr, &network_id, &network.tenant_id)
-        .await
-        .map_err(ApiError::Internal)?;
-
     let registry = state.registry();
     let routes = state.routes();
-    let reg = registry.register(&slug);
 
-    tracing::info!(slug = %slug, network_id = %network_id, "tunnel established");
-
-    Ok(ws.on_upgrade(move |socket| {
-        crate::tunnel::handler::run(socket, slug, registry, routes, node_addr, reg)
+    // Claim ownership + register the tunnel **inside the upgrade callback**, so an
+    // abandoned upgrade (a client that never completes the 101) leaves no orphan
+    // registry entry or stale `tunnel_routes` row — and a reconnect only displaces a
+    // prior live tunnel once *this* socket is actually established. The registry is
+    // the source of truth, so register first; the route row is the cross-node hint.
+    Ok(ws.on_upgrade(move |socket| async move {
+        let reg = registry.register(&slug);
+        if let Err(e) = routes
+            .upsert(&slug, &node_addr, &network_id, &tenant_id)
+            .await
+        {
+            tracing::error!(slug = %slug, error = %e, "failed to claim tunnel route; aborting tunnel");
+            registry.unregister(&slug, reg.generation);
+            return;
+        }
+        tracing::info!(slug = %slug, network_id = %network_id, "tunnel established");
+        crate::tunnel::handler::run(socket, slug, registry, routes, node_addr, reg).await;
     }))
 }

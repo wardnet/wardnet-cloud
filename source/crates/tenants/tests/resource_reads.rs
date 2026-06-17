@@ -9,7 +9,7 @@ use http_body_util::BodyExt as _;
 use tower::ServiceExt as _;
 
 use wardnet_common::auth::ServiceIdentity;
-use wardnet_tenants::api::{network, tenant};
+use wardnet_tenants::api::{network, reconcile, tenant};
 use wardnet_tenants::repository::tenant::{Entitlement, SubscriptionStatus, Tenant};
 use wardnet_tenants::state::AppState;
 use wardnet_tenants::test_helpers::{build_state, daemon_keypair};
@@ -109,4 +109,30 @@ async fn get_tenant_404_for_unknown() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// The production mesh listener (`serve_mesh`) merges all three SERVICE routers —
+/// `reconcile` (GET `/v1/networks`, PATCH `/v1/networks/{id}`) + `network` (GET
+/// `/v1/networks/{id}`) + `tenant` (GET `/v1/tenants/{id}`). Build the same merged
+/// router and route through it, so a future same-method overlap (which would panic
+/// `Router::merge` at boot) is caught by a test rather than at startup.
+#[tokio::test]
+async fn merged_mesh_router_serves_resource_reads() {
+    let (state, network_id) = seeded().await;
+    let app = reconcile::router(state.clone())
+        .merge(network::router(state.clone()))
+        .merge(tenant::router(state));
+
+    let resp = app
+        .clone()
+        .oneshot(service_request(&format!("/v1/networks/{network_id}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(service_request("/v1/tenants/t1"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
