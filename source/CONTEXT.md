@@ -36,7 +36,8 @@ details. (See `docs/adr/` for the decisions behind these.)
 - **PoP (proof-of-possession)** — a daemon signs each request with its Ed25519 key;
   the signature is checked against the token's `cnf` key. Users are bearer-only.
 - **Mesh plane** — the private, mTLS-only service-to-service boundary
-  (DDNS ↔ Tenants). Not reachable by daemons or users.
+  (DDNS ↔ Tenants, Tunneller ↔ Tenants, and Tunneller node ↔ node). Not reachable
+  by daemons or users.
 - **Bootstrap endpoints** — the credential-minting endpoints (signup-code, enroll,
   token issue) that necessarily precede holding a JWT; each carries its own
   one-time-code / key-PoP check instead of the JWT layer.
@@ -66,3 +67,27 @@ details. (See `docs/adr/` for the decisions behind these.)
   Provisioner). This is what keeps the record pointed at a daemon whose IP changes.
 - **Work queue** — the mesh endpoints (`GET/PATCH /v1/networks`) the
   provisioner/reaper pull from and report back to.
+
+## Tunnelling (tenant data plane)
+
+- **Tunnel** — the long-lived reverse channel a daemon opens to the cloud so that
+  inbound tenant traffic can reach a device that has no public inbound address. The
+  daemon dials out and holds the channel open (days); the cloud pushes inbound
+  connections back down it. TLS is never terminated in the cloud — the channel
+  carries the daemon's own certificate end-to-end.
+- **Tunneller** — the regional service that accepts tunnels and routes inbound
+  tenant connections into them. It is a pure data plane: it owns no identity and no
+  desired state, and resolves a network's slug from Tenants when a tunnel is
+  established.
+- **SNI passthrough** — the way inbound tenant TLS is routed without being
+  decrypted: the Tunneller peeks the TLS `ClientHello` for the server name, maps the
+  vanity slug to its tunnel, and forwards the still-encrypted stream (L4).
+- **Node** — one Tunneller process. A region runs several active/active; a daemon's
+  tunnel is held by whichever node it happened to dial.
+- **Tunnel route** — the regional record of which node currently holds the tunnel
+  for a given slug. Written when a tunnel connects, removed when it disconnects; a
+  best-effort hint, since each node's live tunnels are the real source of truth.
+- **Inter-node forward** — when an inbound connection lands on a node that does not
+  hold the target slug's tunnel, it hands the raw stream to the node that does, over
+  the private authenticated mesh. Keeps routing correct regardless of which node the
+  connection or the tunnel landed on.

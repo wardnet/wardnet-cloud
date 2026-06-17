@@ -9,8 +9,10 @@
 mod availability;
 mod codes;
 mod enroll;
+pub mod network;
 pub mod networks;
 pub mod reconcile;
+pub mod tenant;
 pub mod tenants;
 mod token;
 

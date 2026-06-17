@@ -131,6 +131,22 @@ impl TenantsService {
         Ok(self.networks.list_by_tenant(tenant_id).await?)
     }
 
+    /// Fetch the full [`Network`] resource by id (the mesh-plane resource read).
+    ///
+    /// # Errors
+    /// [`TenantsError::Internal`] on a repository failure.
+    pub async fn find_network(&self, network_id: &str) -> Result<Option<Network>, TenantsError> {
+        Ok(self.networks.find_by_id(network_id).await?)
+    }
+
+    /// Fetch the full [`Tenant`] resource by id (the mesh-plane resource read).
+    ///
+    /// # Errors
+    /// [`TenantsError::Internal`] on a repository failure.
+    pub async fn find_tenant(&self, tenant_id: &str) -> Result<Option<Tenant>, TenantsError> {
+        Ok(self.tenants.find_by_id(tenant_id).await?)
+    }
+
     /// List a tenant's daemons.
     ///
     /// # Errors

@@ -8,10 +8,15 @@ Conventions and invariants for agents working inside `source/`.
 > `DAEMON`/`USER` via JWT). PoW self-registration and the `introspect` endpoint are
 > gone; DNS is now reconciled from desired state via a mesh work-queue
 > (`GET/PATCH /v1/networks`). See `CONTEXT.md` (glossary) and `docs/adr/0001`,
-> `docs/adr/0002`. `crates/cloud` is temporarily excluded from the workspace until it
-> is reworked onto the new `common` auth in its own slice. Several invariants below
-> still describe the *previous* identity/bearer model and are superseded pending the
-> WS-J docs pass.
+> `docs/adr/0002`. Several invariants below still describe the *previous*
+> identity/bearer model and are superseded pending the WS-J docs pass.
+>
+> **WS-D (2026-06-17):** `crates/cloud` was carved into **`crates/tunneller`** (the
+> multi-node SNI-passthrough reverse-tunnel edge) and **re-added to the workspace**;
+> the DDNS code it still held was deleted (it lives in `crates/ddns`). All API
+> request/response DTOs were rehomed into **`common::contract`** (invariant #21). See
+> `docs/adr/0004` and invariants #2/#10/#11/#12/#18 (now reworked to the live
+> Tunneller).
 
 > **Status:** invariants tagged `[#444]`/`[#445]` describe the agreed target architecture (SNI/tunnel
 > data plane, PostgreSQL/Neon, runtime `SecretsProvider`, multi-node `TunnelRouter`) and land with those
@@ -19,8 +24,8 @@ Conventions and invariants for agents working inside `source/`.
 
 ## Workspace layout
 
-`source/` is a Cargo workspace (`source/Cargo.toml`, `resolver = "3"`, edition 2024) with three members
-(`common`, `tenants`, `ddns`); `crates/cloud` is kept `exclude`d until its own slice:
+`source/` is a Cargo workspace (`source/Cargo.toml`, `resolver = "3"`, edition 2024) with four members
+(`common`, `tenants`, `ddns`, `tunneller`):
 
 - **`crates/common`** (lib `wardnet_common`) — everything genuinely cross-service: `token`, `mtls`,
   `proxy_protocol` (incl. `client_ip`), `replay_cache`, `dns_provider`, `db` (`DbPools` / `connect`),
@@ -48,14 +53,19 @@ Conventions and invariants for agents working inside `source/`.
   **route-layer** `authenticate(CallerType::DAEMON)`, **not** the `/v1/installs/` path-gate (#2): the
   target network is the JWT `net` claim, so a daemon can only ever touch its own network. Depends on
   `wardnet_common`.
-- **`crates/cloud`** (bin `wardnet-cloud`) — the temporary holding pen for the remaining service code,
-  now shrunk to **Tunneller** after the DDNS carve (`api`, `auth`, `cloudflare`, `repository`, `service`,
-  `sni`, `state`, `tunnel`, plus its own `config`/`db`/`error` shims over common). Auth here is
-  **JWT-only** (no identity DB lives here). Still `exclude`d from the workspace until reworked onto the
-  new `common` auth. Depends on `wardnet_common`. The remaining carve into `tunneller` is WS-D.
+- **`crates/tunneller`** (bin `wardnet-tunneller`, lib `wardnet_tunneller`) — the regional
+  **SNI-passthrough reverse-tunnel edge**, carved from `cloud` in WS-D and finished to its multi-node
+  end state. A daemon dials `GET /v1/tunnel` (network-scoped JWT, route-layer `authenticate(DAEMON)`)
+  and keeps a WebSocket open; the node forwards inbound L4 TLS arriving at its **SNI demuxer** (`sni`)
+  down that tunnel via a `TunnelRouter` (`router`) over the per-node `tunnel` registry. Multi-node from
+  the ground up: a regional Postgres `tunnel_routes` map (`repository`), a private mesh-mTLS inter-node
+  `forward` + a `TenantsClient` routing-policy reader (`mesh`), and a pull-reconcile abort + TTL reaper
+  (`reconcile`). Auth is **JWT-only** (the identity DB lives in Tenants); the routing policy reads
+  Network/Tenant over mesh mTLS. Owns its own `config`/`db`/`state`/`error` over common. Depends on
+  `wardnet_common`. See `docs/adr/0004`.
 
 **Where code goes:** if a primitive is (or will be) used by more than one service, it belongs in
-`common`; service-specific logic stays in its service crate (`tenants`/`cloud`). **Every API
+`common`; service-specific logic stays in its service crate (`tenants`/`ddns`/`tunneller`). **Every API
 request/response DTO lives in `wardnet_common::contract`** (the whole wire surface — bootstrap, daemon,
 account, mesh, all of it), shared by the producer and the consumer so a producer-side change is a compile
 error on the consumer; `ErrorBody` is the precedent (see invariant #21). The producer keeps its
@@ -69,7 +79,7 @@ do not pin versions per-crate. Lints come from `[workspace.lints.clippy]` (pedan
 
 1. **Bearer token never stored raw.** `register.rs` returns `hex(random_32_bytes)` to the caller once and stores only `hex(SHA-256(token))`. Never persist, log, or echo the raw token.
 
-2. **Credential resolution is path-gated and per-service.** `auth_layer` only resolves a credential when the request path starts with `/v1/installs/`. Adding a new public endpoint under that prefix would silently require auth — use a different path prefix. The **DB token lookup** (opaque-bearer path) is **Tenants-only**: only `crates/tenants` holds the identity table, so only its `AuthContext::resolve_credential` accepts a non-JWT bearer; `crates/cloud` is **JWT-only** and rejects an opaque bearer with `401` (see #18).
+2. **Auth is a route-layer caller-type guard, not a path-gate.** Every authenticated route group is wrapped in `authenticate(CallerType)` (`common::auth`), which resolves the caller (SERVICE via mTLS / DAEMON · USER via JWT+PoP) and rejects anything outside the allowed set. There is **no `/v1/installs/` path prefix** any more — DDNS report-IP/ACME and the Tunneller `GET /v1/tunnel` are all route-layer `authenticate(DAEMON)`, scoped to the JWT `net` claim, so a daemon can only ever touch its own network. (The legacy `auth_layer` opaque-bearer path-gate is retired with the old `cloud` bin; only Tenants ever held an identity table, and that path is gone.)
 
 3. **Uniqueness before challenge burn.** In `register.rs`, the global `names().reserve()` (the atomic slug allocation — its unique violation is the name-clash guard) always runs _before_ `challenges().consume()`. Reversing the order would consume the user's PoW proof on a name-conflict error. Registration is a **two-database saga** (global `names` + regional `installs`); any failure after `reserve` must `release` both rows.
 
@@ -85,11 +95,11 @@ do not pin versions per-crate. Lints come from `[workspace.lints.clippy]` (pedan
 
 9. **Secrets come from `SecretsProvider`, never the environment.** `[#445]` In production, `DATABASE_URL`, the Cloudflare token, etc. are fetched at runtime into memory via the `SecretsProvider` trait. Never read prod secrets from env, never write them to disk, never log them. The bootstrap session token lives on tmpfs only. `FileSecrets`/`EnvSecrets` are for dev/test with dummy values only.
 
-10. **Tunnel upgrade requires Ed25519 challenge-response.** `[#445]` `GET /v1/installs/:id/tunnel` must verify a server-nonce challenge signed by the install's registered key before binding the tunnel — the bearer token alone is insufficient (an unauthenticated tunnel claim hijacks all of that install's traffic).
+10. **(retired)** The old per-install **nonce challenge** for the tunnel upgrade is gone. `GET /v1/tunnel` is route-layer `authenticate(DAEMON)`: the per-request Ed25519 **PoP** that the auth layer enforces on the upgrade GET already proves possession of the daemon's `cnf` key, so a separate server-nonce challenge is redundant. The `into_parts`/`from_parts` in the middleware preserve the `OnUpgrade` extension, so the WebSocket upgrade survives the layer (proven by `tunneller/tests/api.rs`).
 
-11. **Route inbound streams only through `TunnelRouter`.** `[#444/#445]` The SNI demuxer hands streams to the `TunnelRouter` trait — never look up the in-memory `TunnelRegistry` `DashMap` directly outside `LocalRouter`. Cross-node ownership lives in the `tunnel_routes` table; a node writes its ownership on tunnel connect and deletes it on disconnect.
+11. **Route inbound streams only through `TunnelRouter` (LIVE).** The SNI demuxer (`tunneller/src/sni`) hands every stream to the `TunnelRouter` trait keyed on **vanity slug** — never look up the in-memory `TunnelRegistry` `DashMap` directly outside `LocalRouter`. `LocalRouter` short-circuits slugs this node owns into the registry and forwards everything else over the private inter-node mesh link to the `node_addr` in `tunnel_routes`. A node `upsert`s its ownership on tunnel connect and deletes it on disconnect (own-node-guarded). The table is a **hint**: each node's live registry is the source of truth, so a forward to a node whose registry no longer holds the slug **fails closed** (the connection is dropped, not mis-routed). See `docs/adr/0004`.
 
-12. **The tunnel registry is in-memory and per-node.** `[#444]` It is not persisted; after a node restart all Pis reconnect. The inter-node forward listener is **private-network-only and authenticated** (it bypasses SNI, so it must be). Treat `conn_id` as wrapping (`u32`).
+12. **The tunnel registry is in-memory and per-node (LIVE).** It is not persisted; after a node restart all daemons reconnect. Registration is keyed on slug with a per-tunnel **abort token** (`CancellationToken`) + a generation so a reconnect cleanly displaces a stale handler and a superseded handler's cleanup is a no-op. The inter-node `forward` listener is **private mesh-mTLS only** (it bypasses SNI, so it must be authenticated — the handshake *is* the auth); a peer reads a `{slug, dest_port}` preamble then splices the raw L4 stream into the local registry. Treat `conn_id` as wrapping (`u32`). A live tunnel is torn down by the **pull-reconcile abort reaper** (per-node, ADR-0004) when its network is `404`/`deprovisioning` or its subscription lapses; the same pass heartbeats `last_seen`, and a TTL reaper purges rows orphaned by a crashed node.
 
 > ⚠️ **Superseded by WS-A (invariants #14–#17 below):** the in-app TLS-termination + ACME
 > subsystem has been **removed** (`tls/`, `acme/`, `sweep/`, `http01.rs`, `crypto.rs`,
@@ -101,7 +111,7 @@ do not pin versions per-crate. Lints come from `[workspace.lints.clippy]` (pedan
 > historical record until the WS-J rewrite; do not treat them as live. #14 has been
 > **replaced** with the plain-HTTP rule below.
 
-13. **Strip the PROXY v1 header first, consuming exactly the line.** Every public listener is fronted by nginx with PROXY protocol v1. Read the header byte-by-byte up to its CRLF and **no further** (`proxy_protocol::read_required`/`read_optional`) — never a `BufReader`, which would swallow the `ClientHello` and break the SNI peek. The recovered client IP must be threaded into the API as `ConnectInfo` so the per-IP rate limiter and IP-bound PoW keep working. On the API listener the header is **required** and **fail-closed**: a connection with a missing/invalid header, a read timeout, or a `PROXY UNKNOWN` family is **dropped** rather than served against nginx's loopback address (which would let `client_ip()` trust a spoofable `X-Forwarded-For`). See `serve_api` in `crates/cloud/src/main.rs`.
+13. **Strip the PROXY v1 header first, consuming exactly the line.** Every public listener is fronted by nginx with PROXY protocol v1. Read the header byte-by-byte up to its CRLF and **no further** (`proxy_protocol::read_required`/`read_optional`) — never a `BufReader`, which would swallow the `ClientHello` and break the SNI peek. The recovered client IP must be threaded into the API as `ConnectInfo` so the per-IP rate limiter and IP-bound PoW keep working. On the API listener the header is **required** and **fail-closed**: a connection with a missing/invalid header, a read timeout, or a `PROXY UNKNOWN` family is **dropped** rather than served against nginx's loopback address (which would let `client_ip()` trust a spoofable `X-Forwarded-For`). See `serve::run_api` in `crates/common/src/serve.rs` (used by every service's `main.rs`).
 
 14. **The control-plane API is served over plain HTTP behind nginx.** It listens on `config.api_listen_addr` (public `:80`, fronted by nginx which terminates TLS) and serves `/v1/health` + the API. There is no in-process TLS for the API any more — do **not** add a rustls/TLS-terminating branch to the API listener. The SNI listeners (`https_listen_addr`/`dot_listen_addr`) are **passthrough-only**: `sni::run(...)` forwards to the tenant tunnel on `dest_port` 443 / 853 and never inspects or terminates the inner TLS.
 
@@ -111,7 +121,7 @@ do not pin versions per-crate. Lints come from `[workspace.lints.clippy]` (pedan
 
 17. *(superseded — deleted machinery)* The public `GET /.well-known/acme-challenge/{token}` responder has been removed; nginx answers HTTP-01.
 
-18. **Two auth planes: JWT for external daemons, mTLS for the mesh.** External daemon requests (via nginx) authenticate with an identity JWT (Tenants-signed, verified offline) plus the Ed25519 PoP in `auth_layer`; in Tenants a non-JWT bearer additionally resolves via the identity-table lookup. **Inter-service / mesh-plane calls do not carry a JWT** — they authenticate by mutual TLS (a client cert chained to the mesh CA). `cloud` is JWT-only and returns `401` for an opaque bearer (its `resolve_credential` is the JWT-only path). The `aud` claim was deliberately **not** added — grant scoping is deferred to WS-F.
+18. **Two auth planes: JWT for external daemons, mTLS for the mesh.** External daemon/user requests (via nginx) authenticate with an identity JWT (Tenants-signed, verified offline) plus, for daemons, the Ed25519 PoP — all via route-layer `authenticate(DAEMON|USER)`. **Inter-service / mesh-plane calls carry no JWT** — they authenticate by mutual TLS (a client cert chained to the mesh CA → a `ServiceIdentity` that `authenticate(SERVICE)` accepts). The **Tunneller spans both**: it is a JWT-only daemon endpoint (`GET /v1/tunnel`) *and* a mesh-mTLS client (its routing policy reads Tenants' `GET /v1/networks/{id}` · `GET /v1/tenants/{id}`, and its nodes forward to each other over a private mesh-mTLS link). The `aud` claim was deliberately **not** added — grant scoping is deferred to WS-F.
 
 19. **The mesh work-queue is mTLS-only and off the public router.** The reconcile work-queue (`GET/PATCH /v1/networks`, Tenants ↔ DDNS provisioner/reaper) is served by a separate internal listener on `config.mesh_listen_addr`. **Transport vs API are split:** the mTLS listener lives in `crates/tenants/src/mesh.rs` (`serve_mesh` — TLS acceptor + accept loop + semaphore), and the SERVICE-plane handlers + DTOs live in `crates/tenants/src/api/reconcile.rs` (`pub fn router`). "mesh" names the mTLS *transport*, never a route group. The reconcile router is **not** mounted on the public nginx-fronted router and carries `authenticate(SERVICE)` — the mutual-TLS handshake (server presents the mesh leaf cert, requires a client cert chained to the mesh CA via `mtls::server_config_from_pem`, which stamps a `ServiceIdentity`) is what `SERVICE` resolves against. Never expose the reconcile routes on the public router or add a JWT/bearer layer to them. (`POST /v1/introspect` is gone — DNS teardown is the DDNS reaper draining this work-queue, per ADR-0001.)
 
@@ -123,7 +133,7 @@ do not pin versions per-crate. Lints come from `[workspace.lints.clippy]` (pedan
 
 Tests **must not** be inline (`mod tests { ... }` inside the source file).
 
-Paths below are relative to the owning crate (`crates/common/`, `crates/tenants/`, `crates/ddns/`, or `crates/cloud/`).
+Paths below are relative to the owning crate (`crates/common/`, `crates/tenants/`, `crates/ddns/`, or `crates/tunneller/`).
 
 ### Unit tests (`src/`)
 
@@ -138,9 +148,11 @@ Declare them with `#[cfg(test)] mod tests;` at the bottom of the source file.
 
 Tests that exercise the public API end-to-end belong in the owning crate's `tests/` dir. They are compiled as a separate crate so they can only call `pub` items — this is intentional. Shared helpers live in `tests/common/mod.rs`.
 
-- `crates/cloud/tests/api.rs` — full HTTP API surface via mock repos
 - `crates/ddns/tests/api.rs` — DDNS HTTP API surface via mock repos
 - `crates/ddns/tests/work_queue_mtls.rs` — mTLS work-queue client integration test
+- `crates/tunneller/tests/api.rs` — the daemon `GET /v1/tunnel` surface (auth / network-scope / routing policy / WS upgrade) against a live mock-backed server
+- `crates/tunneller/tests/mesh_mtls.rs` — inter-node forward round-trip + `TenantsClient` reads over real mTLS (`#[ignore]`)
+- `crates/tenants/tests/resource_reads.rs` — the mesh-plane `GET /v1/networks/{id}` · `GET /v1/tenants/{id}` reads
 
 Add new integration test files here when a feature requires two or more real infrastructure components to test correctly. (The former pebble-based `tests/acme.rs` / `tests/tls_renewal.rs` were removed with the in-app TLS/ACME subsystem.)
 
@@ -154,25 +166,27 @@ Add new integration test files here when a feature requires two or more real inf
 
 ## Adding a new authenticated endpoint
 
-1. Place it under `/v1/installs/` — the auth middleware enforces Ed25519 signing automatically.
-2. Use the `AuthenticatedInstall` extractor to access the verified install:
-   ```rust
-   pub async fn my_handler(
-       AuthenticatedInstall(install): AuthenticatedInstall,
-       ...
-   ) -> Result<..., ApiError> { ... }
-   ```
-3. Give the module a `pub fn register(r: OpenApiRouter<AppState>) -> OpenApiRouter<AppState>` (using `utoipa_axum::routes!`) and add a `r = <module>::register(r);` line to `build_openapi_router` in `crates/cloud/src/api/mod.rs`.
+1. Put its request/response DTOs in **`common::contract`** (invariant #21), and keep any
+   `impl From<DomainType> for ContractDTO` in the owning service crate.
+2. Give the module a `pub fn register(r: OpenApiRouter<AppState>) -> OpenApiRouter<AppState>`
+   (using `utoipa_axum::routes!`), then add it to a **route group** wrapped in
+   `authenticate(CallerType)` for the caller kinds it accepts — see the group wiring in each
+   service's `api/mod.rs` (`from_fn_with_state(state, |st, r, n| authenticate(CallerType::DAEMON, st, r, n))`).
+   A SERVICE-plane endpoint (mesh mTLS) is mounted on the mesh listener, not the public router.
+3. Read the verified caller with the `AuthCaller(Caller)` extractor and match the kind you need
+   (`Caller::Daemon(d)` exposes `tenant_id` + `network`); apply any **policy in the handler**,
+   not in the endpoint you call.
 4. Add `#[utoipa::path(...)]` with at least `401` in the responses.
 
 ## Adding a new unauthenticated endpoint
 
-- Use a path prefix **other than** `/v1/installs/`.
+- Put it in the **bootstrap** group (no `authenticate` layer) — e.g. health, or an endpoint that
+  verifies its own one-time-code / key-PoP credential in the handler.
 - Annotate `#[utoipa::path]` with `security(())` to mark it public in the OpenAPI spec.
 
 ## Error handling
 
-- `ApiError` / `ErrorBody` are the transport-neutral HTTP shape and live in `wardnet_common::error` (re-exported as `crate::error::{ApiError, ErrorBody}` in cloud).
+- `ApiError` / `ErrorBody` are the transport-neutral HTTP shape and live in `wardnet_common::error` (re-exported as `crate::error::{ApiError, ErrorBody}` in each service crate).
 - Return `ApiError` from handlers — it maps to `(StatusCode, Json<ErrorBody>)` via `IntoResponse`.
 - Wrap database errors with `map_err(ApiError::Internal)`.
 - Use `ApiError::BadRequest`, `ApiError::Conflict`, `ApiError::TooManyRequests`, `ApiError::Unauthorized`, `ApiError::Forbidden` for client errors.

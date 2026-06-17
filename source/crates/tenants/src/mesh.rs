@@ -42,7 +42,12 @@ pub async fn serve_mesh(config: &Config, state: AppState) -> anyhow::Result<()> 
 
     let server_config = mtls::server_config_from_pem(&cert, &key, &ca)?;
     let acceptor = TlsAcceptor::from(server_config);
-    let router = api::reconcile::router(state);
+    // The mesh listener serves the reconcile work-queue plus the SERVICE-plane
+    // resource reads (`GET /v1/networks/{id}`, `GET /v1/tenants/{id}`) the Tunneller
+    // routing policy consumes. All carry `authenticate(SERVICE)`.
+    let router = api::reconcile::router(state.clone())
+        .merge(api::network::router(state.clone()))
+        .merge(api::tenant::router(state));
 
     let listener = TcpListener::bind(&config.mesh_listen_addr).await?;
     tracing::info!(addr = %config.mesh_listen_addr, "mesh work-queue listener (mTLS) listening");
