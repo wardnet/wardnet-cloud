@@ -45,7 +45,10 @@ fn service_request(uri: &str) -> Request<Body> {
         .method("GET")
         .uri(uri)
         .extension(ServiceIdentity {
-            subject: String::new(),
+            trust_domain: "wardnet.test".to_string(),
+            env: "dev".to_string(),
+            scope: "use1".to_string(),
+            service: "tunneller".to_string(),
         })
         .body(Body::empty())
         .unwrap()

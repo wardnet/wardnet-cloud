@@ -522,9 +522,9 @@ pub fn test_config() -> Config {
         known_regions: vec!["use1".to_string(), "eu1".to_string()],
         api_listen_addr: "127.0.0.1:0".to_string(),
         mesh_listen_addr: "127.0.0.1:0".to_string(),
-        mesh_ca_path: "/dev/null".to_string(),
-        mesh_cert_path: "/dev/null".to_string(),
-        mesh_key_path: "/dev/null".to_string(),
+        trust_bundle_path: "/dev/null".to_string(),
+        leaf_cert_path: "/dev/null".to_string(),
+        leaf_key_path: "/dev/null".to_string(),
     }
 }
 

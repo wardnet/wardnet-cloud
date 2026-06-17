@@ -72,12 +72,18 @@ impl TestMeshCa {
         &self.root_pem
     }
 
-    /// Mint a leaf for `fqdn` carrying the given extended key usage
-    /// (`ServerAuth` for a serving cert, `ClientAuth` for a mesh client cert).
+    /// Mint a leaf whose only SAN is the SPIFFE URI `spiffe_id`, carrying the given
+    /// extended key usage (`ServerAuth` for a serving cert, `ClientAuth` for a mesh
+    /// client cert). Mirrors inforge's mesh leaves: a SPIFFE URI SAN and **no DNS SAN**.
     #[must_use]
-    pub fn leaf(&self, fqdn: &str, eku: ExtendedKeyUsagePurpose) -> TestLeaf {
+    pub fn leaf(&self, spiffe_id: &str, eku: ExtendedKeyUsagePurpose) -> TestLeaf {
         let key = KeyPair::generate().expect("generate leaf key");
-        let mut params = CertificateParams::new(vec![fqdn.to_owned()]).expect("leaf params");
+        let mut params = CertificateParams::new(Vec::new()).expect("leaf params");
+        params.subject_alt_names = vec![rcgen::SanType::URI(
+            spiffe_id
+                .try_into()
+                .expect("spiffe id is a valid IA5 string"),
+        )];
         params.is_ca = IsCa::ExplicitNoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![eku];

@@ -60,12 +60,33 @@ bitflags! {
 // ── Resolved caller ─────────────────────────────────────────────────────────────
 
 /// Identity of a peer service authenticated by mesh mTLS. Presence means the
-/// handshake validated a client certificate chained to the mesh CA.
+/// handshake validated a client certificate chained to the mesh trust bundle and the
+/// acceptor accepted its SPIFFE scope (see `wardnet_common::mtls`).
+///
+/// These are the structured fields of the peer leaf's SPIFFE id
+/// (`spiffe://<trust_domain>/<env>/<scope>/<service>`), parsed from the post-handshake
+/// peer certificate.
 #[derive(Debug, Clone)]
 pub struct ServiceIdentity {
-    /// Best-effort peer leaf subject (currently unparsed — reserved for richer
-    /// per-service authorization later). The trust decision is the handshake.
-    pub subject: String,
+    /// The trust domain that issued the peer's id.
+    pub trust_domain: String,
+    /// The deployment environment segment of the peer's id.
+    pub env: String,
+    /// The peer's scope (`global` or a region slug).
+    pub scope: String,
+    /// The peer's canonical mesh service name (`tenants` / `ddns` / `tunneller`).
+    pub service: String,
+}
+
+impl From<crate::mtls::SpiffeId> for ServiceIdentity {
+    fn from(id: crate::mtls::SpiffeId) -> Self {
+        Self {
+            trust_domain: id.trust_domain,
+            env: id.env,
+            scope: id.scope,
+            service: id.service,
+        }
+    }
 }
 
 /// A daemon caller resolved from a JWT (+ verified `PoP`).

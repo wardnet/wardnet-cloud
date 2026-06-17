@@ -7,28 +7,34 @@
 //! registry as a [`ForwardRequest`] — so from the tunnel handler's view a forwarded
 //! connection is indistinguishable from a local one.
 //!
-//! The listener requires a client certificate chained to the mesh CA (the handshake
-//! *is* the authentication — it bypasses SNI, so it must be authenticated); the
-//! dialer presents this node's leaf and verifies the peer's leaf against the same
-//! mesh root under the shared [`Config::forward_server_name`] SAN.
+//! The listener requires a client certificate chained to the mesh **trust bundle** (the
+//! handshake *is* the authentication — it bypasses SNI, so it must be authenticated) and
+//! additionally pins the peer's SPIFFE `scope == own scope` and `service == tunneller`;
+//! the dialer presents this node's leaf and pins the peer as `tunneller` in this node's
+//! scope via the mesh SPIFFE verifier, ignoring the (placeholder) SNI. Both the dialer
+//! connector and the acceptor config hot-reload on leaf rotation.
 
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use rustls::ClientConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use wardnet_common::mtls::{self, ExpectedPeer, ReloadableServerConfig};
 
-use crate::config::Config;
 use crate::tunnel::{ForwardRequest, ForwardResult, TunnelRegistry};
 
 /// Max concurrent in-flight inter-node forward connections (accept-storm guard).
 const MAX_CONCURRENT_FORWARD: usize = 4096;
 /// Upper bound on the preamble slug length (defensive — slugs are ≤32 chars).
 const MAX_SLUG_LEN: usize = 64;
+/// Placeholder SNI for the inter-node dialer. Mesh leaves carry no DNS SAN and the
+/// SPIFFE verifier ignores the SNI, so this is never matched against the peer cert — it
+/// only satisfies the `connect` API's `ServerName` argument.
+const FORWARD_SNI_PLACEHOLDER: &str = "tunneller.mesh";
 
 /// Cross-node forwarding seam: hand a local client stream to the node that owns the
 /// tunnel for `slug`. Mocked in `LocalRouter` unit tests.
@@ -48,32 +54,74 @@ pub trait InterNodeForwarder: Send + Sync {
     ) -> anyhow::Result<()>;
 }
 
-/// mTLS-backed [`InterNodeForwarder`] presenting this node's mesh leaf.
+/// mTLS-backed [`InterNodeForwarder`] presenting this node's mesh leaf and pinning the
+/// peer as `tunneller` in this node's scope (via the mesh SPIFFE verifier). The
+/// connector lives in an [`ArcSwap`] so a rotated leaf can be swapped in without a
+/// restart ([`reload`](Self::reload)).
 pub struct MtlsForwarder {
-    connector: TlsConnector,
+    connector: ArcSwap<TlsConnector>,
+    expected: ExpectedPeer,
     server_name: ServerName<'static>,
 }
 
 impl MtlsForwarder {
-    /// Build the forwarder from this node's mesh PEM material and the server name
-    /// every Tunneller leaf carries as a SAN.
+    /// Build the forwarder from this node's mesh PEM material, pinning `expected` as the
+    /// peer identity it will accept on every dial.
     ///
     /// # Errors
-    /// Returns an error if the PEM is malformed or `server_name` is not a valid DNS
-    /// name.
+    /// Returns an error if the PEM is malformed or the connector cannot be built.
     pub fn new(
         leaf_cert_pem: &[u8],
         leaf_key_pem: &[u8],
-        mesh_root_pem: &[u8],
-        server_name: &str,
-    ) -> anyhow::Result<Self> {
-        let config = client_config_from_pem(leaf_cert_pem, leaf_key_pem, mesh_root_pem)?;
-        let server_name = ServerName::try_from(server_name.to_string())
-            .map_err(|e| anyhow::anyhow!("invalid forward server name: {e}"))?;
-        Ok(Self {
-            connector: TlsConnector::from(config),
+        trust_bundle_pem: &[u8],
+        expected: ExpectedPeer,
+    ) -> anyhow::Result<Arc<Self>> {
+        let connector =
+            Self::build_connector(leaf_cert_pem, leaf_key_pem, trust_bundle_pem, &expected)?;
+        let server_name = ServerName::try_from(FORWARD_SNI_PLACEHOLDER.to_string())
+            .expect("placeholder forward SNI is a valid DNS name");
+        Ok(Arc::new(Self {
+            connector: ArcSwap::from_pointee(connector),
+            expected,
             server_name,
-        })
+        }))
+    }
+
+    /// Rebuild the connector from rotated material and swap it in atomically. The pinned
+    /// [`ExpectedPeer`] is preserved.
+    ///
+    /// # Errors
+    /// Returns an error if the new connector cannot be built; the previous one is left
+    /// in place on failure.
+    pub fn reload(
+        &self,
+        leaf_cert_pem: &[u8],
+        leaf_key_pem: &[u8],
+        trust_bundle_pem: &[u8],
+    ) -> anyhow::Result<()> {
+        let connector = Self::build_connector(
+            leaf_cert_pem,
+            leaf_key_pem,
+            trust_bundle_pem,
+            &self.expected,
+        )?;
+        self.connector.store(Arc::new(connector));
+        Ok(())
+    }
+
+    fn build_connector(
+        leaf_cert_pem: &[u8],
+        leaf_key_pem: &[u8],
+        trust_bundle_pem: &[u8],
+        expected: &ExpectedPeer,
+    ) -> anyhow::Result<TlsConnector> {
+        let config = mtls::client_config_from_pem(
+            leaf_cert_pem,
+            leaf_key_pem,
+            trust_bundle_pem,
+            expected.clone(),
+        )?;
+        Ok(TlsConnector::from(Arc::new(config)))
     }
 }
 
@@ -86,11 +134,9 @@ impl InterNodeForwarder for MtlsForwarder {
         dest_port: u16,
         mut client: TcpStream,
     ) -> anyhow::Result<()> {
+        let connector = self.connector.load_full();
         let tcp = TcpStream::connect(node_addr).await?;
-        let mut peer = self
-            .connector
-            .connect(self.server_name.clone(), tcp)
-            .await?;
+        let mut peer = connector.connect(self.server_name.clone(), tcp).await?;
         write_preamble(&mut peer, slug, dest_port).await?;
         // Splice the raw L4 stream both ways until either side closes.
         tokio::io::copy_bidirectional(&mut client, &mut peer).await?;
@@ -98,55 +144,23 @@ impl InterNodeForwarder for MtlsForwarder {
     }
 }
 
-/// Build a rustls [`ClientConfig`] that presents `leaf` and trusts **only** the mesh
-/// root for the peer's server certificate.
+/// Serve the inter-node forward listener over mutual TLS on `forward_listen_addr`. The
+/// `server_config` holder is read once per accepted connection (so a leaf rotation takes
+/// effect on new connections); after the handshake the peer's SPIFFE identity must be a
+/// `tunneller` in `own_scope` (the scope-direction rule for a regional acceptor — other
+/// scopes/services and other regions are already bundle-blocked) before its preamble is
+/// read and the remaining mTLS stream is spliced into this node's local registry.
 ///
 /// # Errors
-/// Returns an error if any PEM is malformed/empty or the config cannot be built.
-pub fn client_config_from_pem(
-    leaf_cert_pem: &[u8],
-    leaf_key_pem: &[u8],
-    mesh_root_pem: &[u8],
-) -> anyhow::Result<Arc<ClientConfig>> {
-    let roots = wardnet_common::mtls::root_store_from_pem(mesh_root_pem)?;
-
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &leaf_cert_pem[..])
-        .collect::<Result<_, _>>()
-        .map_err(|e| anyhow::anyhow!("failed to parse mesh leaf certificate PEM: {e}"))?;
-    if certs.is_empty() {
-        anyhow::bail!("mesh leaf certificate PEM contained no certificates");
-    }
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut &leaf_key_pem[..])
-        .map_err(|e| anyhow::anyhow!("failed to parse mesh leaf key PEM: {e}"))?
-        .ok_or_else(|| anyhow::anyhow!("mesh leaf key PEM contained no private key"))?;
-
-    let config = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_client_auth_cert(certs, key)
-        .map_err(|e| anyhow::anyhow!("failed to build mesh client config: {e}"))?;
-    Ok(Arc::new(config))
-}
-
-/// Serve the inter-node forward listener over mutual TLS on
-/// `config.forward_listen_addr`. Each accepted connection's preamble is read and the
-/// remaining mTLS stream is spliced into this node's local registry.
-///
-/// # Errors
-/// Returns an error if the mesh PEM cannot be read/parsed or the listener cannot be
-/// bound.
-pub async fn serve_forward(config: &Config, registry: Arc<TunnelRegistry>) -> anyhow::Result<()> {
-    let ca = std::fs::read(&config.mesh_ca_path)
-        .map_err(|e| anyhow::anyhow!("read mesh CA at {}: {e}", config.mesh_ca_path))?;
-    let cert = std::fs::read(&config.mesh_cert_path)
-        .map_err(|e| anyhow::anyhow!("read mesh cert at {}: {e}", config.mesh_cert_path))?;
-    let key = std::fs::read(&config.mesh_key_path)
-        .map_err(|e| anyhow::anyhow!("read mesh key at {}: {e}", config.mesh_key_path))?;
-
-    let server_config = wardnet_common::mtls::server_config_from_pem(&cert, &key, &ca)?;
-    let acceptor = TlsAcceptor::from(server_config);
-
-    let listener = TcpListener::bind(&config.forward_listen_addr).await?;
-    tracing::info!(addr = %config.forward_listen_addr, "inter-node forward listener (mTLS) listening");
+/// Returns an error if the listener cannot be bound.
+pub async fn serve_forward(
+    forward_listen_addr: &str,
+    server_config: Arc<ReloadableServerConfig>,
+    registry: Arc<TunnelRegistry>,
+    own_scope: String,
+) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(forward_listen_addr).await?;
+    tracing::info!(addr = %forward_listen_addr, "inter-node forward listener (mTLS) listening");
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FORWARD));
 
@@ -158,18 +172,45 @@ pub async fn serve_forward(config: &Config, registry: Arc<TunnelRegistry>) -> an
                 continue;
             }
         };
-        let acceptor = acceptor.clone();
+        let acceptor = TlsAcceptor::from(server_config.current());
         let registry = Arc::clone(&registry);
+        let own_scope = own_scope.clone();
         let permit = Arc::clone(&semaphore)
             .acquire_owned()
             .await
             .expect("semaphore closed");
         tokio::spawn(async move {
             let _permit = permit;
-            match acceptor.accept(stream).await {
-                Ok(tls) => handle_forward(tls, &registry).await,
-                Err(e) => tracing::debug!(error = %e, %peer, "forward mTLS handshake rejected"),
+            let tls = match acceptor.accept(stream).await {
+                Ok(tls) => tls,
+                Err(e) => {
+                    tracing::debug!(error = %e, %peer, "forward mTLS handshake rejected");
+                    return;
+                }
+            };
+            // Scope-direction rule: a regional acceptor admits only same-scope peers,
+            // and the forward plane is same-service-only (`tunneller`). The chain is
+            // already enforced by rustls; this pins the SPIFFE identity on top.
+            let Some(peer_id) = tls
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|certs| mtls::peer_spiffe_id(certs).ok())
+            else {
+                tracing::debug!(%peer, "forward peer presented no parseable SPIFFE id, dropping");
+                return;
+            };
+            if peer_id.service != "tunneller" || peer_id.scope != own_scope {
+                tracing::debug!(
+                    %peer,
+                    peer_service = %peer_id.service,
+                    peer_scope = %peer_id.scope,
+                    %own_scope,
+                    "forward peer rejected by scope-direction rule, dropping"
+                );
+                return;
             }
+            handle_forward(tls, &registry).await;
         });
     }
 }

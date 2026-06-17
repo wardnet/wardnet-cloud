@@ -32,6 +32,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
 async-trait = { workspace = true }
+arc-swap = { workspace = true }
 dashmap = { workspace = true }
 rand = { workspace = true }
 

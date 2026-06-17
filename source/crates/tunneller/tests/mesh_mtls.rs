@@ -3,7 +3,7 @@
 //!
 //! `#[ignore]`'d — they bind real TCP listeners and complete TLS handshakes.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::Path;
@@ -19,13 +19,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
-use wardnet_common::mtls::{self, MeshClient};
+use wardnet_common::mtls::{self, ExpectedPeer, MeshClient};
 use wardnet_common::serve;
 use wardnet_tunneller::mesh::forward::read_preamble;
 use wardnet_tunneller::mesh::{InterNodeForwarder, MtlsForwarder, TenantsClient, TenantsResolver};
 use wardnet_tunneller::tunnel::{ForwardRequest, TunnelRegistry};
 
-const FORWARD_SAN: &str = "tunneller.mesh";
+/// Mesh leaf SPIFFE ids (URI SAN only — no DNS/IP SAN).
+const TUNNELLER_SPIFFE: &str = "spiffe://wardnet.test/dev/use1/tunneller";
+const TENANTS_SPIFFE: &str = "spiffe://wardnet.test/dev/global/tenants";
 
 struct MeshCa {
     issuer: Issuer<'static, KeyPair>,
@@ -114,12 +116,13 @@ async fn spawn_forward_listener(
 async fn inter_node_forward_round_trip() {
     mtls::install_crypto_provider();
     let ca = MeshCa::new();
+    // Both ends are `tunneller` in the same region (node↔node).
     let server = ca.leaf(
-        SanType::DnsName(FORWARD_SAN.try_into().unwrap()),
+        SanType::URI(TUNNELLER_SPIFFE.try_into().unwrap()),
         ExtendedKeyUsagePurpose::ServerAuth,
     );
     let client = ca.leaf(
-        SanType::DnsName("peer.tunneller.mesh".try_into().unwrap()),
+        SanType::URI(TUNNELLER_SPIFFE.try_into().unwrap()),
         ExtendedKeyUsagePurpose::ClientAuth,
     );
 
@@ -134,7 +137,7 @@ async fn inter_node_forward_round_trip() {
         client.cert_pem.as_bytes(),
         client.key_pem.as_bytes(),
         ca.root_pem.as_bytes(),
-        FORWARD_SAN,
+        ExpectedPeer::new("tunneller", "use1"),
     )
     .expect("build forwarder");
 
@@ -237,11 +240,11 @@ async fn tenants_client_reads_network_and_tenant() {
     mtls::install_crypto_provider();
     let ca = MeshCa::new();
     let server = ca.leaf(
-        SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        SanType::URI(TENANTS_SPIFFE.try_into().unwrap()),
         ExtendedKeyUsagePurpose::ServerAuth,
     );
     let client = ca.leaf(
-        SanType::DnsName("tunneller.mesh.local".try_into().unwrap()),
+        SanType::URI(TUNNELLER_SPIFFE.try_into().unwrap()),
         ExtendedKeyUsagePurpose::ClientAuth,
     );
 
@@ -251,6 +254,7 @@ async fn tenants_client_reads_network_and_tenant() {
         client.cert_pem.as_bytes(),
         client.key_pem.as_bytes(),
         ca.root_pem.as_bytes(),
+        ExpectedPeer::new("tenants", "global"),
     )
     .expect("build mesh client");
     let tenants = TenantsClient::new(mesh, format!("https://127.0.0.1:{}", addr.port()));

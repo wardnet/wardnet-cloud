@@ -18,6 +18,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use wardnet_common::auth::ServiceIdentity;
+use wardnet_common::mtls::ExpectedPeer;
 use wardnet_common::{mtls, serve};
 use wardnet_tenants::api::reconcile;
 use wardnet_tenants::repository::tenant::{Entitlement, SubscriptionStatus, Tenant};
@@ -27,6 +28,9 @@ use wardnet_tenants::test_helpers::{build_state, daemon_keypair};
 const SEED: u8 = 5;
 const REGION: &str = "use1";
 const SERVER_NAME: &str = "tenants.mesh.local";
+/// SPIFFE ids for the mesh leaves (URI SAN only — no DNS SAN).
+const TENANTS_SPIFFE: &str = "spiffe://wardnet.test/dev/global/tenants";
+const DDNS_SPIFFE: &str = "spiffe://wardnet.test/dev/use1/ddns";
 
 // ── Throwaway mesh PKI ──────────────────────────────────────────────────────────
 
@@ -58,9 +62,12 @@ impl MeshCa {
         &self.root_pem
     }
 
-    fn leaf(&self, fqdn: &str, eku: ExtendedKeyUsagePurpose) -> Leaf {
+    fn leaf(&self, spiffe_id: &str, eku: ExtendedKeyUsagePurpose) -> Leaf {
         let key = KeyPair::generate().expect("generate leaf key");
-        let mut params = CertificateParams::new(vec![fqdn.to_owned()]).expect("leaf params");
+        let mut params = CertificateParams::new(Vec::new()).expect("leaf params");
+        params.subject_alt_names = vec![rcgen::SanType::URI(
+            spiffe_id.try_into().expect("valid spiffe id"),
+        )];
         params.is_ca = IsCa::ExplicitNoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![eku];
@@ -109,9 +116,7 @@ async fn spawn_mesh(state: AppState, server: &Leaf, ca_pem: &str) -> SocketAddr 
     )
     .expect("build mesh server config");
     let acceptor = TlsAcceptor::from(server_config);
-    let router = reconcile::router(state).layer(Extension(ServiceIdentity {
-        subject: String::new(),
-    }));
+    let router = reconcile::router(state);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -119,6 +124,14 @@ async fn spawn_mesh(state: AppState, server: &Leaf, ca_pem: &str) -> SocketAddr 
         let (stream, peer) = listener.accept().await.expect("accept mesh conn");
         match acceptor.accept(stream).await {
             Ok(tls) => {
+                // Mirror serve_mesh: parse the peer SPIFFE id and stamp it.
+                let peer_id = tls
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .and_then(|certs| mtls::peer_spiffe_id(certs).ok())
+                    .expect("peer SPIFFE id");
+                let router = router.layer(Extension(ServiceIdentity::from(peer_id)));
                 let _ = serve::connection(tls, router, peer).await;
             }
             Err(e) => tracing::debug!(error = %e, "mesh handshake rejected"),
@@ -128,16 +141,15 @@ async fn spawn_mesh(state: AppState, server: &Leaf, ca_pem: &str) -> SocketAddr 
 }
 
 fn mesh_client(client: &Leaf, ca_pem: &str, addr: SocketAddr) -> reqwest::Client {
-    let mut identity_pem = client.cert_pem.clone();
-    identity_pem.push_str(&client.key_pem);
-    let identity =
-        reqwest::Identity::from_pem(identity_pem.as_bytes()).expect("build client identity");
-    let ca = reqwest::Certificate::from_pem(ca_pem.as_bytes()).expect("parse CA");
+    let config = mtls::client_config_from_pem(
+        client.cert_pem.as_bytes(),
+        client.key_pem.as_bytes(),
+        ca_pem.as_bytes(),
+        ExpectedPeer::new("tenants", "global"),
+    )
+    .expect("build mesh client config");
     reqwest::Client::builder()
-        .use_rustls_tls()
-        .tls_built_in_root_certs(false)
-        .add_root_certificate(ca)
-        .identity(identity)
+        .use_preconfigured_tls(config)
         .resolve(SERVER_NAME, addr)
         .build()
         .expect("build mesh reqwest client")
@@ -149,8 +161,8 @@ fn mesh_client(client: &Leaf, ca_pem: &str, addr: SocketAddr) -> reqwest::Client
 async fn reconcile_get_then_patch_over_mtls() {
     mtls::install_crypto_provider();
     let ca = MeshCa::new();
-    let server = ca.leaf(SERVER_NAME, ExtendedKeyUsagePurpose::ServerAuth);
-    let client = ca.leaf("ddns.mesh.local", ExtendedKeyUsagePurpose::ClientAuth);
+    let server = ca.leaf(TENANTS_SPIFFE, ExtendedKeyUsagePurpose::ServerAuth);
+    let client = ca.leaf(DDNS_SPIFFE, ExtendedKeyUsagePurpose::ClientAuth);
 
     let (state, network_id) = state_with_network().await;
     let addr = spawn_mesh(state, &server, ca.root_pem()).await;
@@ -184,8 +196,8 @@ async fn reconcile_get_then_patch_over_mtls() {
 async fn reaper_deprovisioned_patch_is_idempotent() {
     mtls::install_crypto_provider();
     let ca = MeshCa::new();
-    let server = ca.leaf(SERVER_NAME, ExtendedKeyUsagePurpose::ServerAuth);
-    let client = ca.leaf("ddns.mesh.local", ExtendedKeyUsagePurpose::ClientAuth);
+    let server = ca.leaf(TENANTS_SPIFFE, ExtendedKeyUsagePurpose::ServerAuth);
+    let client = ca.leaf(DDNS_SPIFFE, ExtendedKeyUsagePurpose::ClientAuth);
 
     let (state, network_id) = state_with_network().await;
     // Move the network to `deprovisioning` (subscription cancel cascade).
@@ -209,9 +221,8 @@ async fn mesh_rejects_client_cert_from_a_foreign_ca() {
     mtls::install_crypto_provider();
     let server_ca = MeshCa::new();
     let foreign_ca = MeshCa::new();
-    let server = server_ca.leaf(SERVER_NAME, ExtendedKeyUsagePurpose::ServerAuth);
-    let foreign_client =
-        foreign_ca.leaf("attacker.mesh.local", ExtendedKeyUsagePurpose::ClientAuth);
+    let server = server_ca.leaf(TENANTS_SPIFFE, ExtendedKeyUsagePurpose::ServerAuth);
+    let foreign_client = foreign_ca.leaf(DDNS_SPIFFE, ExtendedKeyUsagePurpose::ClientAuth);
 
     let (state, _id) = state_with_network().await;
     let addr = spawn_mesh(state, &server, server_ca.root_pem()).await;

@@ -36,12 +36,12 @@ pub struct Config {
     pub api_listen_addr: String,
     /// Base URL of the Tenants mesh work-queue (e.g. `https://tenants.mesh:9443`).
     pub mesh_base_url: String,
-    /// Mesh CA PEM path (verifies the Tenants server cert).
-    pub mesh_ca_path: String,
+    /// Mesh trust-bundle PEM path (anchors that verify the Tenants server leaf).
+    pub trust_bundle_path: String,
     /// This service's mesh client leaf cert PEM path.
-    pub mesh_cert_path: String,
+    pub leaf_cert_path: String,
     /// This service's mesh client leaf key PEM path.
-    pub mesh_key_path: String,
+    pub leaf_key_path: String,
     /// Provisioner tick interval (seconds).
     pub provisioner_interval_secs: u64,
     /// Reaper tick interval (seconds).
@@ -60,9 +60,9 @@ impl std::fmt::Debug for Config {
             .field("region", &self.region)
             .field("api_listen_addr", &self.api_listen_addr)
             .field("mesh_base_url", &self.mesh_base_url)
-            .field("mesh_ca_path", &self.mesh_ca_path)
-            .field("mesh_cert_path", &self.mesh_cert_path)
-            .field("mesh_key_path", &self.mesh_key_path)
+            .field("trust_bundle_path", &self.trust_bundle_path)
+            .field("leaf_cert_path", &self.leaf_cert_path)
+            .field("leaf_key_path", &self.leaf_key_path)
             .field("provisioner_interval_secs", &self.provisioner_interval_secs)
             .field("reaper_interval_secs", &self.reaper_interval_secs)
             .field("reaper_jitter_secs", &self.reaper_jitter_secs)
@@ -86,9 +86,9 @@ impl Config {
             api_listen_addr: std::env::var("API_LISTEN_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:8080".to_string()),
             mesh_base_url: required("MESH_BASE_URL")?,
-            mesh_ca_path: required("MESH_CA_PATH")?,
-            mesh_cert_path: required("MESH_CERT_PATH")?,
-            mesh_key_path: required("MESH_KEY_PATH")?,
+            trust_bundle_path: required("MTLS_TRUST_BUNDLE_PATH")?,
+            leaf_cert_path: required("MTLS_LEAF_CERT_PATH")?,
+            leaf_key_path: required("MTLS_LEAF_KEY_PATH")?,
             provisioner_interval_secs: parse_secs(
                 "PROVISIONER_INTERVAL_SECS",
                 DEFAULT_PROVISIONER_INTERVAL_SECS,

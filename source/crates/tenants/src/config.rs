@@ -31,11 +31,11 @@ pub struct Config {
     pub mesh_listen_addr: String,
 
     /// PEM path: the mesh CA the mesh listener requires client certs to chain to.
-    pub mesh_ca_path: String,
+    pub trust_bundle_path: String,
     /// PEM path: this service's mesh server leaf certificate.
-    pub mesh_cert_path: String,
+    pub leaf_cert_path: String,
     /// PEM path: this service's mesh server private key.
-    pub mesh_key_path: String,
+    pub leaf_key_path: String,
 }
 
 impl std::fmt::Debug for Config {
@@ -47,9 +47,9 @@ impl std::fmt::Debug for Config {
             .field("known_regions", &self.known_regions)
             .field("api_listen_addr", &self.api_listen_addr)
             .field("mesh_listen_addr", &self.mesh_listen_addr)
-            .field("mesh_ca_path", &self.mesh_ca_path)
-            .field("mesh_cert_path", &self.mesh_cert_path)
-            .field("mesh_key_path", &self.mesh_key_path)
+            .field("trust_bundle_path", &self.trust_bundle_path)
+            .field("leaf_cert_path", &self.leaf_cert_path)
+            .field("leaf_key_path", &self.leaf_key_path)
             .finish()
     }
 }
@@ -72,9 +72,9 @@ impl Config {
                 .unwrap_or_else(|_| "127.0.0.1:8080".to_string()),
             mesh_listen_addr: std::env::var("MESH_LISTEN_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:9443".to_string()),
-            mesh_ca_path: required("MESH_CA_PATH")?,
-            mesh_cert_path: required("MESH_CERT_PATH")?,
-            mesh_key_path: required("MESH_KEY_PATH")?,
+            trust_bundle_path: required("MTLS_TRUST_BUNDLE_PATH")?,
+            leaf_cert_path: required("MTLS_LEAF_CERT_PATH")?,
+            leaf_key_path: required("MTLS_LEAF_KEY_PATH")?,
         })
     }
 }

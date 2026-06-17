@@ -46,13 +46,13 @@ pub struct Config {
     /// (no trailing slash). The routing policy reads networks/tenants from it.
     pub mesh_base_url: String,
 
-    /// Mesh root CA PEM path — trust anchor for both the outbound mesh client and
-    /// the inbound inter-node forward listener's client-cert verifier.
-    pub mesh_ca_path: String,
+    /// Mesh trust-bundle PEM path — anchors for both the outbound mesh client and the
+    /// inbound inter-node forward listener's client-cert verifier.
+    pub trust_bundle_path: String,
     /// This node's mesh leaf certificate PEM path.
-    pub mesh_cert_path: String,
+    pub leaf_cert_path: String,
     /// This node's mesh leaf private-key PEM path.
-    pub mesh_key_path: String,
+    pub leaf_key_path: String,
 
     /// Private bind address for the inter-node forward listener (mesh mTLS). Default
     /// `0.0.0.0:9444`.
@@ -61,9 +61,6 @@ pub struct Config {
     /// `node_addr` written into every `tunnel_routes` row this node owns, e.g.
     /// `node-use1-0.tunneller.mesh:9444`.
     pub forward_advertise_addr: String,
-    /// Server name a dialing peer expects on the forward listener's leaf certificate
-    /// (all Tunneller leaves share it as a SAN). Default `tunneller.mesh`.
-    pub forward_server_name: String,
 
     /// Short region slug, e.g. `"use1"` (from `INFORGE_DEPLOYMENT_REGION_SLUG`).
     pub region: String,
@@ -95,12 +92,11 @@ impl std::fmt::Debug for Config {
             .field("dot_listen_addr", &self.dot_listen_addr)
             .field("database_url", &"<redacted>")
             .field("mesh_base_url", &self.mesh_base_url)
-            .field("mesh_ca_path", &self.mesh_ca_path)
-            .field("mesh_cert_path", &self.mesh_cert_path)
-            .field("mesh_key_path", &"<redacted>")
+            .field("trust_bundle_path", &self.trust_bundle_path)
+            .field("leaf_cert_path", &self.leaf_cert_path)
+            .field("leaf_key_path", &"<redacted>")
             .field("forward_listen_addr", &self.forward_listen_addr)
             .field("forward_advertise_addr", &self.forward_advertise_addr)
-            .field("forward_server_name", &self.forward_server_name)
             .field("region", &self.region)
             .field("subdomain_parent", &self.subdomain_parent)
             .field("reconcile_interval_secs", &self.reconcile_interval_secs)
@@ -127,14 +123,12 @@ impl Config {
                 .unwrap_or_else(|_| "127.0.0.1:8853".to_string()),
             database_url: required("DATABASE_URL")?,
             mesh_base_url: required("MESH_BASE_URL")?,
-            mesh_ca_path: required("MESH_CA_PATH")?,
-            mesh_cert_path: required("MESH_CERT_PATH")?,
-            mesh_key_path: required("MESH_KEY_PATH")?,
+            trust_bundle_path: required("MTLS_TRUST_BUNDLE_PATH")?,
+            leaf_cert_path: required("MTLS_LEAF_CERT_PATH")?,
+            leaf_key_path: required("MTLS_LEAF_KEY_PATH")?,
             forward_listen_addr: std::env::var("FORWARD_LISTEN_ADDR")
                 .unwrap_or_else(|_| "0.0.0.0:9444".to_string()),
             forward_advertise_addr: required("FORWARD_ADVERTISE_ADDR")?,
-            forward_server_name: std::env::var("FORWARD_SERVER_NAME")
-                .unwrap_or_else(|_| "tunneller.mesh".to_string()),
             region: required("INFORGE_DEPLOYMENT_REGION_SLUG")?,
             subdomain_parent: required("SUBDOMAIN_PARENT")?,
             reconcile_interval_secs: parse_secs("RECONCILE_INTERVAL_SECS", 30)?,

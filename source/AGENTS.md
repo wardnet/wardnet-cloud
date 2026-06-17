@@ -17,6 +17,16 @@ Conventions and invariants for agents working inside `source/`.
 > request/response DTOs were rehomed into **`common::contract`** (invariant #21). See
 > `docs/adr/0004` and invariants #2/#10/#11/#12/#18 (now reworked to the live
 > Tunneller).
+>
+> **WS-E (2026-06-17):** mesh mTLS is now **SPIFFE-verified, bundle-anchored, and
+> hot-reloaded** to match the inforge contract. Leaves carry a SPIFFE URI SAN only
+> (`spiffe://<trust_domain>/<env>/<scope>/<service>`, **no DNS SAN**); trust is a
+> per-scope **bundle of intermediates**; the files (`MTLS_LEAF_CERT_PATH` /
+> `MTLS_LEAF_KEY_PATH` / `MTLS_TRUST_BUNDLE_PATH`) are re-projected in place on renewal
+> and each service file-watches + hot-reloads them. Authorization = bundle membership +
+> a scope-direction rule (no per-peer-service allowlist); initiators pin an
+> `ExpectedPeer{service,scope}`. `ServiceIdentity` is now structured
+> `{trust_domain,env,scope,service}`. See `docs/adr/0005` and invariants #18/#19.
 
 > **Status:** invariants tagged `[#444]`/`[#445]` describe the agreed target architecture (SNI/tunnel
 > data plane, PostgreSQL/Neon, runtime `SecretsProvider`, multi-node `TunnelRouter`) and land with those
@@ -32,7 +42,10 @@ Conventions and invariants for agents working inside `source/`.
   `error` (`ApiError` / `ErrorBody`), `validation`, the generic `auth` core (`auth_layer<S: AuthContext>`
   — body guard, timestamp window, canonical payload, Ed25519 PoP, replay cache — each bin implements
   `AuthContext::resolve_credential`), `serve` (`run_api`, the PROXY-required plain-HTTP listener, plus a
-  stream-generic `connection`), `mtls` (incl. `server_config_from_pem`), generic `health::register`, the
+  stream-generic `connection`), `mtls` (SPIFFE mesh mTLS: `SpiffeId`/`ExpectedPeer`, the SNI-ignoring
+  `client_config_from_pem`/`mesh_client` initiator side, `server_config_from_pem` + `peer_spiffe_id`
+  acceptor side, the hot-reload holders `MeshClient`/`ReloadableServerConfig`, and `watch_mesh_files`),
+  generic `health::register`, the
   env-`config` helpers, and — transiently, until enrollment is redesigned — `pow`.
 - **`crates/tenants`** (bin `wardnet-tenants`, lib `wardnet_tenants`) — the global identity/naming
   service, carved out of `cloud` in WS-B. Owns the identity + challenge repos, the JWT `Signer`,
@@ -121,9 +134,9 @@ do not pin versions per-crate. Lints come from `[workspace.lints.clippy]` (pedan
 
 17. *(superseded — deleted machinery)* The public `GET /.well-known/acme-challenge/{token}` responder has been removed; nginx answers HTTP-01.
 
-18. **Two auth planes: JWT for external daemons, mTLS for the mesh.** External daemon/user requests (via nginx) authenticate with an identity JWT (Tenants-signed, verified offline) plus, for daemons, the Ed25519 PoP — all via route-layer `authenticate(DAEMON|USER)`. **Inter-service / mesh-plane calls carry no JWT** — they authenticate by mutual TLS (a client cert chained to the mesh CA → a `ServiceIdentity` that `authenticate(SERVICE)` accepts). The **Tunneller spans both**: it is a JWT-only daemon endpoint (`GET /v1/tunnel`) *and* a mesh-mTLS client (its routing policy reads Tenants' `GET /v1/networks/{id}` · `GET /v1/tenants/{id}`, and its nodes forward to each other over a private mesh-mTLS link). The `aud` claim was deliberately **not** added — grant scoping is deferred to WS-F.
+18. **Two auth planes: JWT for external daemons, mTLS for the mesh.** External daemon/user requests (via nginx) authenticate with an identity JWT (Tenants-signed, verified offline) plus, for daemons, the Ed25519 PoP — all via route-layer `authenticate(DAEMON|USER)`. **Inter-service / mesh-plane calls carry no JWT** — they authenticate by **SPIFFE-verified** mutual TLS: a client cert chained to the per-scope **trust bundle** whose URI SAN parses to a `ServiceIdentity{trust_domain,env,scope,service}` that `authenticate(SERVICE)` accepts. Mesh leaves carry a SPIFFE URI SAN only (**no DNS SAN**), so initiators pin an `ExpectedPeer{service,scope}` in a custom verifier that **ignores the SNI** (`mtls::client_config_from_pem`/`mesh_client`), and acceptors enforce a **scope-direction rule** on the parsed peer id (global acceptor → any in-bundle scope; regional acceptor → peer scope == own scope) instead of a per-peer-service allowlist (the bundle is the allowlist). Rotated material hot-reloads in place (ADR-0005). The **Tunneller spans both**: it is a JWT-only daemon endpoint (`GET /v1/tunnel`) *and* a mesh-mTLS client (its routing policy reads Tenants' `GET /v1/networks/{id}` · `GET /v1/tenants/{id}`, and its nodes forward to each other over a private mesh-mTLS link whose acceptor additionally pins `service == tunneller`). The `aud` claim was deliberately **not** added — grant scoping is deferred to WS-F.
 
-19. **The mesh work-queue is mTLS-only and off the public router.** The reconcile work-queue (`GET/PATCH /v1/networks`, Tenants ↔ DDNS provisioner/reaper) is served by a separate internal listener on `config.mesh_listen_addr`. **Transport vs API are split:** the mTLS listener lives in `crates/tenants/src/mesh.rs` (`serve_mesh` — TLS acceptor + accept loop + semaphore), and the SERVICE-plane handlers + DTOs live in `crates/tenants/src/api/reconcile.rs` (`pub fn router`). "mesh" names the mTLS *transport*, never a route group. The reconcile router is **not** mounted on the public nginx-fronted router and carries `authenticate(SERVICE)` — the mutual-TLS handshake (server presents the mesh leaf cert, requires a client cert chained to the mesh CA via `mtls::server_config_from_pem`, which stamps a `ServiceIdentity`) is what `SERVICE` resolves against. Never expose the reconcile routes on the public router or add a JWT/bearer layer to them. (`POST /v1/introspect` is gone — DNS teardown is the DDNS reaper draining this work-queue, per ADR-0001.)
+19. **The mesh work-queue is mTLS-only and off the public router.** The reconcile work-queue (`GET/PATCH /v1/networks`, Tenants ↔ DDNS provisioner/reaper) is served by a separate internal listener on `config.mesh_listen_addr`. **Transport vs API are split:** the mTLS listener lives in `crates/tenants/src/mesh.rs` (`serve_mesh` — TLS acceptor + accept loop + semaphore), and the SERVICE-plane handlers + DTOs live in `crates/tenants/src/api/reconcile.rs` (`pub fn router`). "mesh" names the mTLS *transport*, never a route group. The reconcile router is **not** mounted on the public nginx-fronted router and carries `authenticate(SERVICE)` — the mutual-TLS handshake (server presents the mesh leaf via the hot-reloadable `mtls::ReloadableServerConfig`, requires a client cert chained to the trust bundle via `mtls::server_config_from_pem`; the accept loop then parses the peer's SPIFFE id with `mtls::peer_spiffe_id` and stamps the structured `ServiceIdentity`, applying the global-acceptor scope rule) is what `SERVICE` resolves against. Never expose the reconcile routes on the public router or add a JWT/bearer layer to them. (`POST /v1/introspect` is gone — DNS teardown is the DDNS reaper draining this work-queue, per ADR-0001.)
 
 20. **DDNS A-record creation is the provisioner's alone, and is adopt-or-create + CAS.** Only `DdnsService::provision` (the provisioner) creates a Cloudflare A record; **report-IP only ever updates in place** (`OperationalRepository::record_ip` writes the `ip` column only — never `fqdn`/`cf_a_record_id`), so a daemon's IP report can never resurrect a record the reaper just deleted. To tolerate N regional replicas, `provision` adopts an existing record for the FQDN or creates one, then CAS-claims the id (`WHERE cf_a_record_id IS NULL`); on a lost CAS it deletes its record **only if** that record is not the one the winner stored. Do not add a create path to report-IP, and do not drop the `cf_a_record_id IS NULL` guard on the claim. See ADR-0003.
 

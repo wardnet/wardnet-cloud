@@ -38,6 +38,20 @@ details. (See `docs/adr/` for the decisions behind these.)
 - **Mesh plane** — the private, mTLS-only service-to-service boundary
   (DDNS ↔ Tenants, Tunneller ↔ Tenants, and Tunneller node ↔ node). Not reachable
   by daemons or users.
+- **SPIFFE identity** — a mesh service's identity, carried as the **only** SAN (a URI,
+  no DNS name) of its mTLS leaf: `spiffe://<trust_domain>/<env>/<scope>/<service>`.
+  `scope` is `global` or a region slug; `service` is `tenants` / `ddns` / `tunneller`.
+  A service learns its own identity by parsing its own leaf at boot.
+- **Trust bundle** — the per-scope set of CA intermediates a service trusts for the
+  mesh (always `global`; a regional service adds its own region; a global service adds
+  all regions). It is the membership allowlist: a peer whose chain validates against the
+  bundle is a mesh member. Cross-region peers fail the chain.
+- **Expected peer** — the `{service, scope}` an initiator pins for its specific mesh
+  target (replacing the absent DNS-name check); a custom verifier asserts it against the
+  peer's SPIFFE id and ignores the TLS SNI.
+- **Scope-direction rule** — an acceptor's only authorization beyond bundle membership:
+  a global acceptor admits any in-bundle scope; a regional acceptor admits only its own
+  scope (and the node↔node forward plane additionally only `service == tunneller`).
 - **Bootstrap endpoints** — the credential-minting endpoints (signup-code, enroll,
   token issue) that necessarily precede holding a JWT; each carries its own
   one-time-code / key-PoP check instead of the JWT layer.

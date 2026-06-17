@@ -57,6 +57,9 @@ rustls = { version = "0.23", features = ["aws_lc_rs"] }
 rustls-pemfile = "2"
 tokio-rustls = "0.26"
 rcgen = "0.14.8"
+# Mesh-mTLS SPIFFE identity: parse the leaf's URI SAN + hot-reload rotated material.
+x509-parser = "0.18"
+notify = "8"
 jsonwebtoken = { version = "10.4.0", default-features = false, features = ["use_pem", "rust_crypto"] }
 
 # Hyper (manual connection serving)

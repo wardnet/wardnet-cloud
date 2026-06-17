@@ -1,218 +1,546 @@
-//! Service-mesh mTLS primitives shared by the cloud services.
+//! Service-mesh mTLS primitives shared by every cloud service.
 //!
-//! **Status (#610):** these are verified primitives, not yet wired into a running
-//! listener or client. No service serves an mTLS listener or makes an outbound
-//! mesh call yet; both are turned on at the three-binary split (WS-E). Until then
-//! these are exercised only by tests.
+//! The mesh (Tenants ↔ DDNS ↔ Tunneller node↔node) authenticates peers with
+//! **SPIFFE-identified** mutual TLS. The deployer (inforge) mints each service a leaf
+//! whose only SAN is a SPIFFE URI — `spiffe://<trust_domain>/<env>/<scope>/<service>`,
+//! **no DNS SAN** — and delivers a per-scope **trust bundle of intermediates** (not a
+//! single root). On renewal it re-projects the leaf/key/bundle files **in place**, so a
+//! service watches those files ([`watch_mesh_files`]) and hot-reloads its TLS material
+//! without restarting.
 //!
-//! The split into Tenants / DDNS / Tunneller turns what used to be in-process
-//! calls into network hops. Those hops are authenticated with **mutual TLS over a
-//! private two-root PKI** (see `docs/adr-service-decomposition.md`): a cold mesh
-//! root signs per-region intermediates which mint per-service leaves at deploy
-//! time. Each service holds only `leaf cert + leaf key + mesh-root cert` — there
-//! is no online mesh CA.
+//! Authorization is split between the two ends of a call:
 //!
-//! This module is the concrete surface both sides use:
-//! - **server**: [`client_verifier_from_pem`] builds a [`ClientCertVerifier`] from
-//!   the mesh-root PEM; a service's internal listener installs it to require a
-//!   mesh-chained client cert instead of `.with_no_client_auth()`.
-//! - **client**: [`MeshClient`] holds a `reqwest::Client` that presents this
-//!   service's leaf and trusts *only* the mesh root. A `reqwest::Client` bakes its
-//!   identity at build time, so rotation rebuilds the client — [`MeshClient`] keeps
-//!   it behind an [`ArcSwap`] so the swap is lock-free and in-flight callers are
-//!   unaffected.
+//! - **Initiators** pin their target's identity ([`ExpectedPeer`]) inside a custom
+//!   [`ServerCertVerifier`] (built by [`client_config_from_pem`] / [`mesh_client`]):
+//!   it chain-validates the server leaf against the bundle anchors, **ignores the DNS
+//!   SNI** (there is none), and asserts the peer leaf's `service` + `scope`. This is the
+//!   replacement for the lost DNS-name check.
+//! - **Acceptors** keep an ordinary [`server_config_from_pem`] (rustls enforces the
+//!   client-cert chain), then read the post-handshake peer leaf, parse its [`SpiffeId`]
+//!   ([`peer_spiffe_id`]), and apply the scope-direction rule in their own accept loop —
+//!   so adding a new in-bundle caller needs no code change in the acceptor.
 //!
-//! Revocation is by **short certificate TTL**, not CRL/OCSP — a rotated-out leaf
-//! simply stops being reissued (consistent with the serving-cert renewal model).
+//! Rotation without restart is provided by [`MeshClient`] (reqwest client) and
+//! [`ReloadableServerConfig`] (acceptor config), each an [`ArcSwap`] snapshot a
+//! connection reads once; [`watch_mesh_files`] re-reads the three files on change and
+//! drives every consumer's `reload`.
 
+use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use rustls::RootCertStore;
-use rustls::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::server::WebPkiClientVerifier;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::verify_server_cert_signed_by_trust_anchor;
+use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::danger::ClientCertVerifier;
+use rustls::server::{ParsedCertificate, WebPkiClientVerifier};
+use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
 
-/// Install the aws-lc-rs [`CryptoProvider`](rustls::crypto::CryptoProvider) as the
-/// process default (idempotent).
+/// Install the process-default rustls crypto provider (aws-lc-rs).
 ///
-/// rustls 0.23 requires a default crypto provider before any TLS work; a service
-/// that serves a mesh-mTLS listener or builds a [`ClientCertVerifier`] calls this
-/// once at startup. Idempotent — a second call is a no-op.
+/// rustls 0.23 requires a process-default [`CryptoProvider`](rustls::crypto::CryptoProvider)
+/// before any TLS config is built. Idempotent — a second call is a no-op.
 pub fn install_crypto_provider() {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .ok();
 }
 
-/// Parse one or more PEM CA certificates into a [`RootCertStore`] of trust anchors.
+/// Parse one or more PEM certificates into a [`RootCertStore`] of trust anchors.
 ///
-/// Used for both the mesh root (peer-service authZ) and, later, the daemon root
-/// (install authZ) — never mix the two stores, so the roots can't be path-confused.
+/// Used for the mesh **trust bundle** — a per-scope set of intermediates (every cert in
+/// the PEM becomes an anchor), not a single root.
 ///
 /// # Errors
-/// Returns an error if the PEM contains no certificates or any certificate is
-/// malformed.
+/// Returns an error if the PEM contains no certificates or any certificate is malformed.
 pub fn root_store_from_pem(pem: &[u8]) -> anyhow::Result<RootCertStore> {
     let mut reader = pem;
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
         .collect::<Result<_, _>>()
-        .map_err(|e| anyhow::anyhow!("failed to parse root CA PEM: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to parse trust bundle PEM: {e}"))?;
     if certs.is_empty() {
-        anyhow::bail!("root CA PEM contained no certificates");
+        anyhow::bail!("trust bundle PEM contained no certificates");
     }
 
     let mut store = RootCertStore::empty();
     for cert in certs {
         store
             .add(cert)
-            .map_err(|e| anyhow::anyhow!("invalid root CA certificate: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("invalid trust bundle certificate: {e}"))?;
     }
     Ok(store)
 }
 
-/// Build a [`ClientCertVerifier`] that accepts only leaves chained to
-/// `mesh_root_pem`.
-///
-/// Install the returned verifier on a service's internal mTLS listener to turn on
-/// client-auth instead of `.with_no_client_auth()`. A handshake presenting no
-/// client certificate, or one rooted in a different CA, is rejected at the TLS
-/// layer before any request handler runs.
+/// Build a [`ClientCertVerifier`] that accepts only client leaves chained to the mesh
+/// **trust bundle**. Install it on an acceptor to require a mesh-chained client cert
+/// instead of `.with_no_client_auth()`.
 ///
 /// # Errors
-/// Returns an error if `mesh_root_pem` cannot be parsed or the verifier cannot be
-/// built (e.g. the root store is empty).
+/// Returns an error if `trust_bundle_pem` cannot be parsed or the verifier cannot be
+/// built (e.g. the bundle is empty).
 pub fn client_verifier_from_pem(
-    mesh_root_pem: &[u8],
+    trust_bundle_pem: &[u8],
 ) -> anyhow::Result<Arc<dyn ClientCertVerifier>> {
-    let roots = root_store_from_pem(mesh_root_pem)?;
+    let roots = root_store_from_pem(trust_bundle_pem)?;
     WebPkiClientVerifier::builder(Arc::new(roots))
         .build()
         .map_err(|e| anyhow::anyhow!("failed to build mTLS client verifier: {e}"))
 }
 
-/// Build a rustls [`ServerConfig`] for an internal mesh listener: it presents the
-/// `server_cert_pem` chain + `server_key_pem`, and **requires** a client
-/// certificate chained to `mesh_root_pem`. A handshake presenting no client cert,
-/// or one from a different CA, is rejected — so mTLS *is* the authentication for
-/// the endpoints served behind it (e.g. Tenants' `/v1/introspect`).
+/// Build a [`ServerConfig`] for a mesh listener: presents `server_cert_pem` /
+/// `server_key_pem` and **requires** a client certificate chained to
+/// `trust_bundle_pem`. A handshake presenting no client cert, or one from a different
+/// CA, is rejected — the mutual-TLS handshake *is* the SERVICE authentication. The
+/// acceptor still parses the peer [`SpiffeId`] afterwards to apply the scope rule.
 ///
 /// # Errors
 /// Returns an error if any PEM is malformed/empty or the config cannot be built.
 pub fn server_config_from_pem(
     server_cert_pem: &[u8],
     server_key_pem: &[u8],
-    mesh_root_pem: &[u8],
+    trust_bundle_pem: &[u8],
 ) -> anyhow::Result<Arc<ServerConfig>> {
-    let verifier = client_verifier_from_pem(mesh_root_pem)?;
+    let verifier = client_verifier_from_pem(trust_bundle_pem)?;
 
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &server_cert_pem[..])
         .collect::<Result<_, _>>()
-        .map_err(|e| anyhow::anyhow!("failed to parse mesh server certificate PEM: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to parse server certificate PEM: {e}"))?;
     if certs.is_empty() {
         anyhow::bail!("mesh server certificate PEM contained no certificates");
     }
 
     let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut &server_key_pem[..])
-        .map_err(|e| anyhow::anyhow!("failed to parse mesh server key PEM: {e}"))?
-        .ok_or_else(|| anyhow::anyhow!("mesh server key PEM contained no private key"))?;
+        .map_err(|e| anyhow::anyhow!("failed to parse server key PEM: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("server key PEM contained no private key"))?;
 
     let config = ServerConfig::builder()
         .with_client_cert_verifier(verifier)
         .with_single_cert(certs, key)
         .map_err(|e| anyhow::anyhow!("failed to build mesh server config: {e}"))?;
-
     Ok(Arc::new(config))
 }
 
-/// Build a `reqwest::Client` that presents `leaf` as its client identity and
-/// trusts **only** `mesh_root_pem` (built-in/native roots are disabled).
+// ── SPIFFE identity ───────────────────────────────────────────────────────────────
+
+/// A parsed SPIFFE identity: `spiffe://<trust_domain>/<env>/<scope>/<service>`.
 ///
-/// This is the outbound half of mesh mTLS — e.g. the DDNS reconcile reaper calling
-/// the Tenants introspection endpoint. The leaf cert + key are combined into a
-/// single PEM bundle for `reqwest::Identity::from_pem`, which accepts the
-/// certificate and PKCS#8 key sections in any order.
+/// `scope` is `global` or a region slug; `service` is the canonical mesh name
+/// (`tenants`, `ddns`, `tunneller`). A service learns its **own** identity by parsing
+/// its own leaf at boot, and compares **peers** against this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpiffeId {
+    /// The trust domain (the authority that issued the id), e.g. `wardnet.io`.
+    pub trust_domain: String,
+    /// The deployment environment, e.g. `prod` / `staging` / `dev`.
+    pub env: String,
+    /// `global` for a global-scope service, otherwise the region slug.
+    pub scope: String,
+    /// The canonical mesh service name (`tenants` / `ddns` / `tunneller`).
+    pub service: String,
+}
+
+impl SpiffeId {
+    /// Parse a SPIFFE URI of the exact form
+    /// `spiffe://<trust_domain>/<env>/<scope>/<service>`.
+    ///
+    /// # Errors
+    /// Returns an error if the URI is not `spiffe://` or does not have exactly the four
+    /// non-empty path segments.
+    pub fn parse(uri: &str) -> anyhow::Result<Self> {
+        let rest = uri
+            .strip_prefix("spiffe://")
+            .ok_or_else(|| anyhow::anyhow!("not a spiffe:// URI: {uri}"))?;
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() != 4 || parts.iter().any(|s| s.is_empty()) {
+            anyhow::bail!(
+                "spiffe URI must be spiffe://<trust_domain>/<env>/<scope>/<service>: {uri}"
+            );
+        }
+        Ok(Self {
+            trust_domain: parts[0].to_owned(),
+            env: parts[1].to_owned(),
+            scope: parts[2].to_owned(),
+            service: parts[3].to_owned(),
+        })
+    }
+
+    /// Extract the SPIFFE id from a certificate's first URI SAN.
+    ///
+    /// # Errors
+    /// Returns an error if the DER cannot be parsed, the cert has no URI SAN, or the URI
+    /// is not a well-formed SPIFFE id.
+    pub fn from_cert(der: &CertificateDer<'_>) -> anyhow::Result<Self> {
+        use x509_parser::extensions::GeneralName;
+        use x509_parser::prelude::FromDer;
+
+        let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der.as_ref())
+            .map_err(|e| anyhow::anyhow!("failed to parse peer certificate: {e}"))?;
+        let san = cert
+            .subject_alternative_name()
+            .map_err(|e| anyhow::anyhow!("failed to parse peer SAN: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("peer certificate has no SAN extension"))?;
+        for name in &san.value.general_names {
+            if let GeneralName::URI(uri) = name {
+                return Self::parse(uri);
+            }
+        }
+        anyhow::bail!("peer certificate has no URI SAN")
+    }
+}
+
+/// Extract the [`SpiffeId`] from a TLS peer's leaf (first) certificate.
 ///
 /// # Errors
-/// Returns an error if the identity or root PEM is malformed, or the client cannot
-/// be built.
+/// Returns an error if the peer presented no certificates or the leaf has no valid
+/// SPIFFE URI SAN.
+pub fn peer_spiffe_id(peer_certs: &[CertificateDer<'_>]) -> anyhow::Result<SpiffeId> {
+    let leaf = peer_certs
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("peer presented no certificates"))?;
+    SpiffeId::from_cert(leaf)
+}
+
+/// Parse this service's **own** [`SpiffeId`] from its leaf certificate PEM (the first
+/// certificate). A service learns its own scope/service at boot from this, instead of
+/// configuring its own name.
+///
+/// # Errors
+/// Returns an error if the PEM has no certificate or the leaf has no valid SPIFFE URI
+/// SAN.
+pub fn own_spiffe_id(leaf_cert_pem: &[u8]) -> anyhow::Result<SpiffeId> {
+    let cert = rustls_pemfile::certs(&mut &leaf_cert_pem[..])
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("leaf certificate PEM contained no certificates"))?
+        .map_err(|e| anyhow::anyhow!("failed to parse leaf certificate PEM: {e}"))?;
+    SpiffeId::from_cert(&cert)
+}
+
+/// The identity an initiator expects of its mesh target: a specific `service` + `scope`.
+///
+/// Pinned on the dialer (intrinsic to the call) and asserted by [`SpiffeServerVerifier`].
+#[derive(Debug, Clone)]
+pub struct ExpectedPeer {
+    /// The canonical mesh service name the target must present (`tenants`, …).
+    pub service: String,
+    /// The scope the target must present (`global` or a region slug).
+    pub scope: String,
+}
+
+impl ExpectedPeer {
+    /// Construct an [`ExpectedPeer`] from a `service` and `scope`.
+    pub fn new(service: impl Into<String>, scope: impl Into<String>) -> Self {
+        Self {
+            service: service.into(),
+            scope: scope.into(),
+        }
+    }
+}
+
+// ── client side: SPIFFE-pinning server-cert verifier ────────────────────────────────
+
+/// A rustls [`ServerCertVerifier`] that chain-validates the server leaf against the mesh
+/// **trust bundle** and then asserts the peer leaf's SPIFFE `service` + `scope` match an
+/// [`ExpectedPeer`] — **ignoring the DNS SNI** entirely (mesh leaves carry no DNS SAN).
+#[derive(Debug)]
+struct SpiffeServerVerifier {
+    roots: Arc<RootCertStore>,
+    supported_algs: WebPkiSupportedAlgorithms,
+    expected: ExpectedPeer,
+}
+
+impl ServerCertVerifier for SpiffeServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let cert = ParsedCertificate::try_from(end_entity)?;
+        verify_server_cert_signed_by_trust_anchor(
+            &cert,
+            &self.roots,
+            intermediates,
+            now,
+            self.supported_algs.all,
+        )?;
+
+        let id = SpiffeId::from_cert(end_entity)
+            .map_err(|e| rustls::Error::General(format!("peer SPIFFE id: {e}")))?;
+        if id.service != self.expected.service || id.scope != self.expected.scope {
+            return Err(rustls::Error::General(format!(
+                "mesh peer identity mismatch: expected service={}/scope={}, got service={}/scope={}",
+                self.expected.service, self.expected.scope, id.service, id.scope,
+            )));
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(message, cert, dss, &self.supported_algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(message, cert, dss, &self.supported_algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.supported_algs.supported_schemes()
+    }
+}
+
+/// Build a rustls [`ClientConfig`] that presents `leaf` as the client identity and
+/// verifies the server with a [`SpiffeServerVerifier`] pinned to `expected` — chain
+/// against `trust_bundle_pem`, ignore the DNS SNI, assert the peer SPIFFE id.
+///
+/// Shared by [`mesh_client`] (reqwest, via `use_preconfigured_tls`) and the Tunneller
+/// inter-node forwarder (a raw `tokio-rustls` connector).
+///
+/// # Errors
+/// Returns an error if any PEM is malformed/empty, no crypto provider is installed, or
+/// the config cannot be built.
+pub fn client_config_from_pem(
+    leaf_cert_pem: &[u8],
+    leaf_key_pem: &[u8],
+    trust_bundle_pem: &[u8],
+    expected: ExpectedPeer,
+) -> anyhow::Result<ClientConfig> {
+    let roots = Arc::new(root_store_from_pem(trust_bundle_pem)?);
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .ok_or_else(|| anyhow::anyhow!("no default rustls crypto provider installed"))?;
+    let verifier = Arc::new(SpiffeServerVerifier {
+        roots,
+        supported_algs: provider.signature_verification_algorithms,
+        expected,
+    });
+
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &leaf_cert_pem[..])
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("failed to parse mesh leaf certificate PEM: {e}"))?;
+    if certs.is_empty() {
+        anyhow::bail!("mesh leaf certificate PEM contained no certificates");
+    }
+    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut &leaf_key_pem[..])
+        .map_err(|e| anyhow::anyhow!("failed to parse mesh leaf key PEM: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("mesh leaf key PEM contained no private key"))?;
+
+    ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(certs, key)
+        .map_err(|e| anyhow::anyhow!("failed to build mesh client config: {e}"))
+}
+
+/// Build a `reqwest::Client` that presents `leaf` as its client identity and verifies
+/// the mesh peer with a [`SpiffeServerVerifier`] pinned to `expected`.
+///
+/// # Errors
+/// Returns an error if the identity/bundle PEM is malformed or the client cannot be
+/// built.
 pub fn mesh_client(
     leaf_cert_pem: &[u8],
     leaf_key_pem: &[u8],
-    mesh_root_pem: &[u8],
+    trust_bundle_pem: &[u8],
+    expected: ExpectedPeer,
 ) -> anyhow::Result<reqwest::Client> {
-    // reqwest's rustls `Identity::from_pem` scans the bundle for the private key and
-    // the certificate chain, so the section order does not matter; we concatenate
-    // key then chain with a separating newline for safety.
-    let mut bundle = Vec::with_capacity(leaf_key_pem.len() + leaf_cert_pem.len() + 1);
-    bundle.extend_from_slice(leaf_key_pem);
-    bundle.push(b'\n');
-    bundle.extend_from_slice(leaf_cert_pem);
-
-    let identity = reqwest::Identity::from_pem(&bundle)
-        .map_err(|e| anyhow::anyhow!("failed to build mTLS client identity: {e}"))?;
-    let root = reqwest::Certificate::from_pem(mesh_root_pem)
-        .map_err(|e| anyhow::anyhow!("failed to parse mesh root for client: {e}"))?;
-
+    let config = client_config_from_pem(leaf_cert_pem, leaf_key_pem, trust_bundle_pem, expected)?;
     reqwest::Client::builder()
-        .use_rustls_tls()
-        .tls_built_in_root_certs(false)
-        .add_root_certificate(root)
-        .identity(identity)
+        .use_preconfigured_tls(config)
         .build()
         .map_err(|e| anyhow::anyhow!("failed to build mTLS reqwest client: {e}"))
 }
 
 /// A hot-swappable mesh mTLS HTTP client.
 ///
-/// `reqwest::Client` bakes its TLS identity at build time, so rotating the leaf
-/// certificate means building a fresh client. [`MeshClient`] keeps the live client
-/// behind an [`ArcSwap`]: callers take a cheap snapshot via [`MeshClient::current`]
-/// and keep using it for the life of their request, while [`MeshClient::reload`]
-/// swaps in a rebuilt client lock-free on the next cert rotation.
+/// A `reqwest::Client` bakes its TLS identity at build time, so rotating the leaf means
+/// building a fresh client. [`MeshClient`] keeps the live client in an [`ArcSwap`]:
+/// callers take a cheap snapshot ([`MeshClient::current`]) and a file-watcher swaps in a
+/// new client ([`MeshClient::reload`]) on rotation. The pinned [`ExpectedPeer`] is held
+/// once and reused across reloads.
 pub struct MeshClient {
     client: ArcSwap<reqwest::Client>,
+    expected: ExpectedPeer,
 }
 
 impl MeshClient {
-    /// Build a `MeshClient` from this service's leaf and the mesh root.
+    /// Build a [`MeshClient`] pinned to `expected`.
     ///
     /// # Errors
-    /// Returns an error if the underlying [`mesh_client`] cannot be built.
+    /// Returns an error if the initial client cannot be built (see [`mesh_client`]).
     pub fn new(
         leaf_cert_pem: &[u8],
         leaf_key_pem: &[u8],
-        mesh_root_pem: &[u8],
+        trust_bundle_pem: &[u8],
+        expected: ExpectedPeer,
     ) -> anyhow::Result<Arc<Self>> {
-        let client = mesh_client(leaf_cert_pem, leaf_key_pem, mesh_root_pem)?;
+        let client = mesh_client(
+            leaf_cert_pem,
+            leaf_key_pem,
+            trust_bundle_pem,
+            expected.clone(),
+        )?;
         Ok(Arc::new(Self {
             client: ArcSwap::from_pointee(client),
+            expected,
         }))
     }
 
-    /// A snapshot of the current client. Cheap (`Arc` clone); safe to hold across
-    /// a request even if [`reload`](Self::reload) swaps the client meanwhile.
+    /// A snapshot of the current client. Cheap (`Arc` clone); safe to hold across a
+    /// request even if [`reload`](Self::reload) swaps the client meanwhile.
     #[must_use]
     pub fn current(&self) -> Arc<reqwest::Client> {
         self.client.load_full()
     }
 
-    /// Rebuild the client from a freshly rotated leaf and swap it in atomically.
+    /// Rebuild the client from freshly rotated material and swap it in atomically. The
+    /// pinned [`ExpectedPeer`] is preserved.
     ///
     /// # Errors
-    /// Returns an error if the new client cannot be built; the previous client is
-    /// left in place on failure.
+    /// Returns an error if the new client cannot be built; the previous client is left
+    /// in place on failure.
     pub fn reload(
         &self,
         leaf_cert_pem: &[u8],
         leaf_key_pem: &[u8],
-        mesh_root_pem: &[u8],
+        trust_bundle_pem: &[u8],
     ) -> anyhow::Result<()> {
-        let client = mesh_client(leaf_cert_pem, leaf_key_pem, mesh_root_pem)?;
+        let client = mesh_client(
+            leaf_cert_pem,
+            leaf_key_pem,
+            trust_bundle_pem,
+            self.expected.clone(),
+        )?;
         self.client.store(Arc::new(client));
         Ok(())
     }
+}
+
+/// A hot-swappable mesh mTLS [`ServerConfig`] for an acceptor.
+///
+/// The acceptor reads [`current`](Self::current) once per accepted connection and builds
+/// a `TlsAcceptor` from it; a file-watcher swaps in a fresh config ([`reload`](Self::reload))
+/// on leaf rotation. In-flight connections keep the config they started with.
+pub struct ReloadableServerConfig {
+    config: ArcSwap<ServerConfig>,
+}
+
+impl ReloadableServerConfig {
+    /// Build a holder from the initial mesh server material.
+    ///
+    /// # Errors
+    /// Returns an error if the config cannot be built (see [`server_config_from_pem`]).
+    pub fn new(
+        server_cert_pem: &[u8],
+        server_key_pem: &[u8],
+        trust_bundle_pem: &[u8],
+    ) -> anyhow::Result<Arc<Self>> {
+        let config = server_config_from_pem(server_cert_pem, server_key_pem, trust_bundle_pem)?;
+        Ok(Arc::new(Self {
+            config: ArcSwap::new(config),
+        }))
+    }
+
+    /// A snapshot of the current server config. Cheap (`Arc` clone).
+    #[must_use]
+    pub fn current(&self) -> Arc<ServerConfig> {
+        self.config.load_full()
+    }
+
+    /// Rebuild the server config from rotated material and swap it in atomically.
+    ///
+    /// # Errors
+    /// Returns an error if the new config cannot be built; the previous config is left
+    /// in place on failure.
+    pub fn reload(
+        &self,
+        server_cert_pem: &[u8],
+        server_key_pem: &[u8],
+        trust_bundle_pem: &[u8],
+    ) -> anyhow::Result<()> {
+        let config = server_config_from_pem(server_cert_pem, server_key_pem, trust_bundle_pem)?;
+        self.config.store(config);
+        Ok(())
+    }
+}
+
+/// Watch the directories holding the mesh PEM files and invoke `on_change` after each
+/// change, debounced.
+///
+/// inforge re-projects `leaf.crt` / `leaf.key` / `bundle.crt` **in place** on renewal;
+/// this watches their parent directories (more robust than watching the files, since an
+/// atomic replace swaps the inode) and calls `on_change` — which should re-read the three
+/// files and `reload` every consumer ([`MeshClient`], [`ReloadableServerConfig`]). The
+/// watcher runs on a dedicated thread that lives for the process; this returns once it is
+/// armed.
+///
+/// # Errors
+/// Returns an error if the watcher cannot be created or a parent directory cannot be
+/// watched.
+pub fn watch_mesh_files(
+    paths: &[String],
+    on_change: impl Fn() + Send + 'static,
+) -> anyhow::Result<()> {
+    use notify::{RecursiveMode, Watcher};
+
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    for p in paths {
+        let parent = Path::new(p).parent().unwrap_or_else(|| Path::new("."));
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if !dirs.iter().any(|d| d == parent) {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |res| {
+        let _ = tx.send(res);
+    })
+    .map_err(|e| anyhow::anyhow!("failed to create mesh cert watcher: {e}"))?;
+    for dir in &dirs {
+        watcher
+            .watch(dir, RecursiveMode::NonRecursive)
+            .map_err(|e| anyhow::anyhow!("failed to watch mesh cert dir {}: {e}", dir.display()))?;
+    }
+
+    std::thread::Builder::new()
+        .name("mesh-cert-watch".to_string())
+        .spawn(move || {
+            // Keep the watcher alive for the life of this thread (dropping it stops
+            // watching).
+            let _watcher = watcher;
+            while let Ok(event) = rx.recv() {
+                match event {
+                    Ok(_) => {
+                        // Debounce the burst of events a single re-projection emits.
+                        std::thread::sleep(Duration::from_millis(200));
+                        while rx.try_recv().is_ok() {}
+                        on_change();
+                    }
+                    Err(e) => tracing::warn!(error = %e, "mesh cert watch error"),
+                }
+            }
+            tracing::warn!("mesh cert watcher channel closed; hot-reload stopped");
+        })
+        .map_err(|e| anyhow::anyhow!("failed to spawn mesh cert watch thread: {e}"))?;
+
+    Ok(())
 }
 
 #[cfg(test)]

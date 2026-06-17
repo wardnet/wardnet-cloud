@@ -4,7 +4,7 @@ use std::time::Duration;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use wardnet_common::config as common_config;
-use wardnet_common::mtls::MeshClient;
+use wardnet_common::mtls::{ExpectedPeer, MeshClient, ReloadableServerConfig, SpiffeId};
 use wardnet_common::{mtls, serve, token};
 use wardnet_tunneller::{
     api,
@@ -22,6 +22,14 @@ use wardnet_tunneller::{
 /// Ports the SNI passthrough listeners forward to on the tenant tunnels.
 const HTTPS_TUNNEL_PORT: u16 = 443;
 const DOT_TUNNEL_PORT: u16 = 853;
+
+/// The mesh mTLS consumers [`setup_mesh`] builds, plus this node's own SPIFFE id.
+type MeshSetup = (
+    Arc<MeshClient>,
+    Arc<MtlsForwarder>,
+    Arc<ReloadableServerConfig>,
+    SpiffeId,
+);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -49,35 +57,19 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(PgTunnelRouteRepository::new_pools(pools));
     let registry = Arc::new(TunnelRegistry::new());
 
-    // Mesh PEM material (mTLS): trust anchor + this node's leaf. Static for now —
-    // certificate rotation is deferred.
-    let mesh_ca = std::fs::read(&config.mesh_ca_path)
-        .map_err(|e| anyhow::anyhow!("read mesh CA at {}: {e}", config.mesh_ca_path))?;
-    let mesh_cert = std::fs::read(&config.mesh_cert_path)
-        .map_err(|e| anyhow::anyhow!("read mesh cert at {}: {e}", config.mesh_cert_path))?;
-    let mesh_key = std::fs::read(&config.mesh_key_path)
-        .map_err(|e| anyhow::anyhow!("read mesh key at {}: {e}", config.mesh_key_path))?;
-
-    // Routing-policy reads against Tenants (mesh mTLS over HTTP).
-    let mesh_client = MeshClient::new(&mesh_cert, &mesh_key, &mesh_ca)?;
+    // Mesh mTLS consumers (Tenants reader, inter-node forwarder, forward acceptor
+    // config) + the rotation watcher; `own_id` carries this node's scope/service.
+    let (mesh_client, forwarder, forward_server_config, own_id) = setup_mesh(&config)?;
     let tenants: Arc<dyn TenantsResolver> = Arc::new(TenantsClient::new(
-        mesh_client,
+        Arc::clone(&mesh_client),
         config.mesh_base_url.clone(),
     ));
-
-    // Inter-node forward dialer (raw mTLS L4 splice).
-    let forwarder: Arc<dyn InterNodeForwarder> = Arc::new(MtlsForwarder::new(
-        &mesh_cert,
-        &mesh_key,
-        &mesh_ca,
-        &config.forward_server_name,
-    )?);
 
     // The SNI demuxer routes through this — local registry first, else inter-node.
     let tunnel_router: Arc<dyn TunnelRouter> = Arc::new(LocalRouter::new(
         Arc::clone(&registry),
         Arc::clone(&routes),
-        forwarder,
+        Arc::clone(&forwarder) as Arc<dyn InterNodeForwarder>,
         config.forward_advertise_addr.clone(),
     ));
 
@@ -113,7 +105,12 @@ async fn main() -> anyhow::Result<()> {
         res = sni::run(&dot_listen_addr, &subdomain_parent, Arc::clone(&tunnel_router), DOT_TUNNEL_PORT) => res?,
 
         // Private inter-node forward listener (mesh mTLS).
-        res = serve_forward(&config, Arc::clone(&registry)) => res?,
+        res = serve_forward(
+            &config.forward_listen_addr,
+            Arc::clone(&forward_server_config),
+            Arc::clone(&registry),
+            own_id.scope.clone(),
+        ) => res?,
 
         // Pull-reconcile abort + heartbeat over this node's own routes.
         () = reconcile::abort_reaper(
@@ -130,4 +127,67 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Load the mesh PEM material, build the mTLS consumers (Tenants reader, inter-node
+/// forwarder, forward acceptor config), and spawn the in-process rotation watcher.
+/// Returns the consumers plus this node's own SPIFFE id (its scope/service, parsed from
+/// its own leaf). inforge re-projects the leaf/key/bundle files in place on renewal; the
+/// watcher re-reads them and hot-reloads every consumer.
+fn setup_mesh(config: &Config) -> anyhow::Result<MeshSetup> {
+    let leaf = std::fs::read(&config.leaf_cert_path)
+        .map_err(|e| anyhow::anyhow!("read mesh leaf at {}: {e}", config.leaf_cert_path))?;
+    let key = std::fs::read(&config.leaf_key_path)
+        .map_err(|e| anyhow::anyhow!("read mesh key at {}: {e}", config.leaf_key_path))?;
+    let bundle = std::fs::read(&config.trust_bundle_path)
+        .map_err(|e| anyhow::anyhow!("read trust bundle at {}: {e}", config.trust_bundle_path))?;
+
+    // Learn this node's own identity (scope/service) by parsing its own leaf.
+    let own_id = mtls::own_spiffe_id(&leaf)?;
+    tracing::info!(scope = %own_id.scope, service = %own_id.service, "mesh identity");
+
+    // Routing-policy reads against Tenants (mesh mTLS over HTTP); pin Tenants (global).
+    let mesh_client =
+        MeshClient::new(&leaf, &key, &bundle, ExpectedPeer::new("tenants", "global"))?;
+    // Inter-node forward dialer; pin a `tunneller` in our own scope.
+    let forwarder = MtlsForwarder::new(
+        &leaf,
+        &key,
+        &bundle,
+        ExpectedPeer::new("tunneller", own_id.scope.clone()),
+    )?;
+    // Inter-node forward acceptor config (mesh mTLS), hot-reloadable per connection.
+    let forward_server_config = ReloadableServerConfig::new(&leaf, &key, &bundle)?;
+
+    let leaf_path = config.leaf_cert_path.clone();
+    let key_path = config.leaf_key_path.clone();
+    let bundle_path = config.trust_bundle_path.clone();
+    let w_mesh = Arc::clone(&mesh_client);
+    let w_fwd = Arc::clone(&forwarder);
+    let w_srv = Arc::clone(&forward_server_config);
+    mtls::watch_mesh_files(
+        &[leaf_path.clone(), key_path.clone(), bundle_path.clone()],
+        move || {
+            let (Ok(leaf), Ok(key), Ok(bundle)) = (
+                std::fs::read(&leaf_path),
+                std::fs::read(&key_path),
+                std::fs::read(&bundle_path),
+            ) else {
+                tracing::error!("failed to re-read mesh cert files after change");
+                return;
+            };
+            for r in [
+                w_mesh.reload(&leaf, &key, &bundle),
+                w_fwd.reload(&leaf, &key, &bundle),
+                w_srv.reload(&leaf, &key, &bundle),
+            ] {
+                if let Err(e) = r {
+                    tracing::error!(error = %e, "mesh cert reload failed");
+                }
+            }
+            tracing::info!("reloaded mesh certificates");
+        },
+    )?;
+
+    Ok((mesh_client, forwarder, forward_server_config, own_id))
 }

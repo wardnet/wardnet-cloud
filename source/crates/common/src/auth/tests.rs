@@ -250,7 +250,10 @@ fn service_request() -> Request<Body> {
         .unwrap();
     // The mTLS listener stamps this after a successful handshake.
     req.extensions_mut().insert(ServiceIdentity {
-        subject: String::new(),
+        trust_domain: "wardnet.test".to_string(),
+        env: "dev".to_string(),
+        scope: "global".to_string(),
+        service: "ddns".to_string(),
     });
     req
 }

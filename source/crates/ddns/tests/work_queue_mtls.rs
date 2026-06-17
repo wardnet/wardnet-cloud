@@ -5,7 +5,7 @@
 //!
 //! `#[ignore]`'d — it binds a real TCP listener and completes a TLS handshake.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 
 use axum::routing::{get, patch};
 use axum::{Json, Router};
@@ -16,7 +16,7 @@ use rcgen::{
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-use wardnet_common::mtls::{self, MeshClient};
+use wardnet_common::mtls::{self, ExpectedPeer, MeshClient};
 use wardnet_common::serve;
 use wardnet_ddns::work_queue::{TenantsWorkQueue, WorkQueue};
 
@@ -116,12 +116,18 @@ async fn spawn_mesh(server: &Leaf, ca_pem: &str) -> SocketAddr {
 async fn list_then_transition_round_trip_over_mtls() {
     mtls::install_crypto_provider();
     let ca = MeshCa::new();
+    // Mesh leaves carry a SPIFFE URI SAN only (no DNS/IP SAN); the client pins the
+    // server as `tenants`/`global` and the verifier ignores the SNI.
     let server = ca.leaf(
-        SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        SanType::URI(
+            "spiffe://wardnet.test/dev/global/tenants"
+                .try_into()
+                .unwrap(),
+        ),
         ExtendedKeyUsagePurpose::ServerAuth,
     );
     let client = ca.leaf(
-        SanType::DnsName("ddns.mesh.local".try_into().unwrap()),
+        SanType::URI("spiffe://wardnet.test/dev/use1/ddns".try_into().unwrap()),
         ExtendedKeyUsagePurpose::ClientAuth,
     );
 
@@ -131,6 +137,7 @@ async fn list_then_transition_round_trip_over_mtls() {
         client.cert_pem.as_bytes(),
         client.key_pem.as_bytes(),
         ca.root_pem.as_bytes(),
+        ExpectedPeer::new("tenants", "global"),
     )
     .expect("build mesh client");
     let work = TenantsWorkQueue::new(mesh, format!("https://127.0.0.1:{}", addr.port()));

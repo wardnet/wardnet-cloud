@@ -33,6 +33,8 @@ rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 rcgen = { workspace = true }
 jsonwebtoken = { workspace = true }
+x509-parser = { workspace = true }
+notify = { workspace = true }
 
 hyper = { workspace = true }
 hyper-util = { workspace = true }
