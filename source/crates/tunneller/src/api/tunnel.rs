@@ -101,19 +101,20 @@ async fn tunnel_connect(
 
     // Claim ownership + register the tunnel **inside the upgrade callback**, so an
     // abandoned upgrade (a client that never completes the 101) leaves no orphan
-    // registry entry or stale `tunnel_routes` row — and a reconnect only displaces a
-    // prior live tunnel once *this* socket is actually established. The registry is
-    // the source of truth, so register first; the route row is the cross-node hint.
+    // registry entry or stale `tunnel_routes` row. Claim the route row **first**
+    // (the only fallible step): `register` cancels any prior live tunnel for the
+    // slug, so deferring it until the claim succeeds means a transient claim failure
+    // on a reconnect leaves the existing tunnel intact rather than tearing it down
+    // for an establishment that never happens.
     Ok(ws.on_upgrade(move |socket| async move {
-        let reg = registry.register(&slug);
         if let Err(e) = routes
             .upsert(&slug, &node_addr, &network_id, &tenant_id)
             .await
         {
             tracing::error!(slug = %slug, error = %e, "failed to claim tunnel route; aborting tunnel");
-            registry.unregister(&slug, reg.generation);
             return;
         }
+        let reg = registry.register(&slug);
         tracing::info!(slug = %slug, network_id = %network_id, "tunnel established");
         crate::tunnel::handler::run(socket, slug, registry, routes, node_addr, reg).await;
     }))
