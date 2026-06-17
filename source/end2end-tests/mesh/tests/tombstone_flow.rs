@@ -166,11 +166,12 @@ async fn connect_with_retry(url: &str) -> PgPool {
 
 /// Poll until `table` exists (a service has run its migrations) or time out.
 async fn await_table(pool: &PgPool, table: &str) {
-    let query = format!("SELECT to_regclass('public.{table}') IS NOT NULL AS present");
+    let qualified = format!("public.{table}");
     await_until(&format!("table {table} present"), || {
-        let query = query.clone();
+        let qualified = qualified.clone();
         async move {
-            sqlx::query(&query)
+            sqlx::query("SELECT to_regclass($1::text) IS NOT NULL AS present")
+                .bind(&qualified)
                 .fetch_one(pool)
                 .await
                 .is_ok_and(|r| r.get::<bool, _>("present"))

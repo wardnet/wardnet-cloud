@@ -333,6 +333,19 @@ async fn deregister_tombstones_cascades_cancels_and_is_idempotent() {
 }
 
 #[tokio::test]
+async fn issue_tenant_code_rejected_after_deregister() {
+    let (state, _store, tenant_id, _cnf, _slug) = enrolled_and_registered().await;
+    // A live tenant can issue an add-daemon code.
+    assert!(state.tenants().issue_tenant_code(&tenant_id).await.is_ok());
+    // After deregister, the tombstoned tenant cannot grow daemons.
+    state.tenants().deregister_tenant(&tenant_id).await.unwrap();
+    assert!(matches!(
+        state.tenants().issue_tenant_code(&tenant_id).await,
+        Err(TenantsError::Forbidden(_))
+    ));
+}
+
+#[tokio::test]
 async fn deregister_unknown_tenant_is_not_found() {
     let (state, _store) = build_state(SEED);
     assert!(matches!(

@@ -282,13 +282,21 @@ impl TenantsService {
     /// Issue an add-daemon one-time code for an existing tenant. Returns the raw code.
     ///
     /// # Errors
-    /// [`TenantsError::NotFound`] if the tenant does not exist.
+    /// [`TenantsError::NotFound`] if the tenant does not exist;
+    /// [`TenantsError::Forbidden`] if the tenant is deregistered.
     pub async fn issue_tenant_code(&self, tenant_id: &str) -> Result<String, TenantsError> {
         let tenant = self
             .tenants
             .find_by_id(tenant_id)
             .await?
             .ok_or_else(|| TenantsError::NotFound("no such tenant".to_string()))?;
+        // A tombstoned tenant cannot grow daemons (enroll would reject the code anyway —
+        // reject here so the issue itself fails cleanly, mirroring `mint_jwt`).
+        if tenant.deregistered_at.is_some() {
+            return Err(TenantsError::Forbidden(
+                "tenant is deregistered".to_string(),
+            ));
+        }
         let (code, code_hash) = generate_code();
         self.enrollment
             .issue_code(
