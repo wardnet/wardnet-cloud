@@ -400,6 +400,7 @@ pub fn test_config() -> Config {
         database_url: "postgres://ignored".to_string(),
         cloudflare_api_token: "ignored".to_string(),
         cloudflare_zone_id: "ignored".to_string(),
+        cloudflare_api_base: None,
         subdomain_parent: "my.wardnet.services".to_string(),
         region: "use1".to_string(),
         api_listen_addr: "127.0.0.1:0".to_string(),

@@ -1,0 +1,64 @@
+{
+  "mappings": [
+    {
+      "name": "list-a-records-empty",
+      "request": {
+        "method": "GET",
+        "urlPathPattern": "/zones/[^/]+/dns_records"
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": { "success": true, "errors": [], "result": [] }
+      }
+    },
+    {
+      "name": "create-dns-record",
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "/zones/[^/]+/dns_records"
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": {
+          "success": true,
+          "errors": [],
+          "result": { "id": "e2e-record-id" }
+        }
+      }
+    },
+    {
+      "name": "update-dns-record",
+      "request": {
+        "method": "PUT",
+        "urlPathPattern": "/zones/[^/]+/dns_records/[^/]+"
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": {
+          "success": true,
+          "errors": [],
+          "result": { "id": "e2e-record-id" }
+        }
+      }
+    },
+    {
+      "name": "delete-dns-record",
+      "request": {
+        "method": "DELETE",
+        "urlPathPattern": "/zones/[^/]+/dns_records/[^/]+"
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": {
+          "success": true,
+          "errors": [],
+          "result": { "id": "e2e-record-id" }
+        }
+      }
+    }
+  ]
+}

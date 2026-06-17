@@ -1,0 +1,20 @@
+[package]
+name = "wardnet-e2e-mesh"
+version = "0.1.0"
+edition = { workspace = true }
+license = { workspace = true }
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+wardnet_common = { workspace = true }
+tokio = { workspace = true }
+sqlx = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }

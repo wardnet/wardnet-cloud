@@ -4,7 +4,7 @@ use rcgen::ExtendedKeyUsagePurpose;
 
 use super::{
     ExpectedPeer, MeshClient, ReloadableServerConfig, SpiffeId, client_verifier_from_pem,
-    mesh_client, root_store_from_pem,
+    files_digest, mesh_client, root_store_from_pem,
 };
 use crate::test_helpers::TestMeshCa;
 
@@ -69,6 +69,9 @@ fn root_store_rejects_garbage() {
 
 #[test]
 fn client_verifier_builds_from_bundle() {
+    // Building a WebPki verifier needs the process-default crypto provider; install it
+    // here so the test does not depend on another test having installed it first.
+    crate::mtls::install_crypto_provider();
     let ca = TestMeshCa::new();
     assert!(client_verifier_from_pem(ca.root_pem().as_bytes()).is_ok());
 }
@@ -206,4 +209,52 @@ fn server_config_holder_reload_failure_keeps_previous() {
 
     let after = holder.current();
     assert!(Arc::ptr_eq(&before, &after));
+}
+
+#[test]
+fn files_digest_is_stable_until_contents_change() {
+    let dir = std::env::temp_dir().join(format!("mesh-digest-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = dir.join("a.pem");
+    let b = dir.join("b.pem");
+    std::fs::write(&a, b"alpha").unwrap();
+    std::fs::write(&b, b"beta").unwrap();
+    let paths = [
+        a.to_str().unwrap().to_string(),
+        b.to_str().unwrap().to_string(),
+    ];
+
+    let first = files_digest(&paths);
+    // Re-reading identical contents yields the same digest (spurious events are no-ops).
+    assert_eq!(first, files_digest(&paths));
+
+    // A real rotation of either file changes the digest.
+    std::fs::write(&a, b"alpha-rotated").unwrap();
+    assert_ne!(first, files_digest(&paths));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn files_digest_distinguishes_content_shift_across_files() {
+    // A length-prefixed digest must not collapse ("ab","") and ("a","b").
+    let dir = std::env::temp_dir().join(format!("mesh-digest-shift-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = dir.join("a");
+    let b = dir.join("b");
+    let paths = [
+        a.to_str().unwrap().to_string(),
+        b.to_str().unwrap().to_string(),
+    ];
+
+    std::fs::write(&a, b"ab").unwrap();
+    std::fs::write(&b, b"").unwrap();
+    let d1 = files_digest(&paths);
+
+    std::fs::write(&a, b"a").unwrap();
+    std::fs::write(&b, b"b").unwrap();
+    let d2 = files_digest(&paths);
+
+    assert_ne!(d1, d2);
+    std::fs::remove_dir_all(&dir).ok();
 }

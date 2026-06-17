@@ -39,9 +39,10 @@ async fn main() -> anyhow::Result<()> {
     let operational: Arc<dyn OperationalRepository> =
         Arc::new(PgOperationalRepository::new_pools(pools));
 
-    let dns_provider = Arc::new(CloudflareDnsProvider::new(
+    let dns_provider = Arc::new(CloudflareDnsProvider::with_base_url(
         &config.cloudflare_api_token,
         &config.cloudflare_zone_id,
+        config.cloudflare_api_base.as_deref(),
     )?);
 
     let ddns = Arc::new(DdnsService::new(operational.clone(), dns_provider));

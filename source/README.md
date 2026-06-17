@@ -153,6 +153,21 @@ make build-bridge   # release binary
 
 Repository/integration tests run against a live Postgres started via `docker compose up -d` before running the tests. For a local smoke run, point `DATABASE_URL` at a local or Neon dev database and use `FileSecrets`/env for the Cloudflare values.
 
+### End-to-end mesh-mTLS harness
+
+A docker-compose topology exercises the **SPIFFE mesh-mTLS** plane with real
+service binaries — `tenants` + `ddns` over real mutual TLS, two Postgres
+instances, and a wiremock standing in for Cloudflare. It drives the full account
+tombstone lifecycle (provision → USER deregister → reaper → sweep):
+
+```sh
+make e2e-all     # gen certs (xtask) → build images → up → run test → tear down
+```
+
+Dev mesh material (CA + per-service SPIFFE leaves + JWT keypair) is minted by the
+`xtask` cert generator. With Podman, point compose at the Podman socket first
+(`export DOCKER_HOST=...`). See [`end2end-tests/mesh/README.md`](end2end-tests/mesh/README.md).
+
 ## Releasing and deploying
 
 The bridge releases **independently of the daemon**. Its version source of truth

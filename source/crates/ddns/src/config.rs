@@ -27,6 +27,9 @@ pub struct Config {
     pub cloudflare_api_token: String,
     /// Cloudflare zone ID that owns [`Self::subdomain_parent`].
     pub cloudflare_zone_id: String,
+    /// Optional Cloudflare API base-URL override (`CLOUDFLARE_API_BASE`). Unset in
+    /// production (real API); the e2e harness points it at a mock Cloudflare.
+    pub cloudflare_api_base: Option<String>,
     /// DNS parent under which network records are created
     /// (e.g. `my.wardnet.services`).
     pub subdomain_parent: String,
@@ -56,6 +59,7 @@ impl std::fmt::Debug for Config {
             .field("database_url", &"<redacted>")
             .field("cloudflare_api_token", &"<redacted>")
             .field("cloudflare_zone_id", &self.cloudflare_zone_id)
+            .field("cloudflare_api_base", &self.cloudflare_api_base)
             .field("subdomain_parent", &self.subdomain_parent)
             .field("region", &self.region)
             .field("api_listen_addr", &self.api_listen_addr)
@@ -81,6 +85,9 @@ impl Config {
             database_url: required("DATABASE_URL")?,
             cloudflare_api_token: required("CLOUDFLARE_API_TOKEN")?,
             cloudflare_zone_id: required("CLOUDFLARE_ZONE_ID")?,
+            cloudflare_api_base: std::env::var("CLOUDFLARE_API_BASE")
+                .ok()
+                .filter(|s| !s.is_empty()),
             subdomain_parent: required("SUBDOMAIN_PARENT")?,
             region: required("INFORGE_DEPLOYMENT_REGION_SLUG")?,
             api_listen_addr: std::env::var("API_LISTEN_ADDR")

@@ -1,3 +1,6 @@
+# Local dev Postgres for the `#[ignore]`d Postgres-backed unit/integration tests
+# (`cargo test --workspace -- --ignored`). The full mesh-mTLS end-to-end topology
+# lives separately under `end2end-tests/mesh/` (see `make e2e-all`).
 services:
   postgres:
     image: postgres:16
@@ -10,12 +13,3 @@ services:
       interval: 2s
       timeout: 5s
       retries: 30
-
-  pebble:
-    image: letsencrypt/pebble
-    environment:
-      PEBBLE_VA_ALWAYS_VALID: "1"
-      PEBBLE_VA_NOSLEEP: "1"
-    ports:
-      - "14000:14000"
-      - "15000:15000"

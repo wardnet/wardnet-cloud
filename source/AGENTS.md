@@ -175,6 +175,12 @@ Tests that exercise the public API end-to-end belong in the owning crate's `test
 
 Add new integration test files here when a feature requires two or more real infrastructure components to test correctly. (The former pebble-based `tests/acme.rs` / `tests/tls_renewal.rs` were removed with the in-app TLS/ACME subsystem.)
 
+### Cross-service end-to-end tests (`end2end-tests/`)
+
+A test that needs **multiple real service binaries running together** (not just a live DB or a single in-process mTLS round-trip) belongs in a dedicated docker-compose scenario under `end2end-tests/<scenario>/`, mirroring the daemon repo's layout — **not** in a service crate's `tests/`. Each scenario is its own `publish = false` workspace member: a `compose.yaml`, the `#[ignore]`d test in `tests/`, and any mock fixtures. Drive it from `source/Makefile` (`make e2e-*`), generating dev mesh material with the `xtask` cert generator (`cargo run -p xtask -- gen-certs`); the per-service `crates/*/Dockerfile`s build the images.
+
+- `end2end-tests/mesh/` — the full tombstone lifecycle over **real SPIFFE mesh mTLS**: real `tenants` + `ddns` containers (two Postgres instances, a wiremock Cloudflare) exercising provision → USER deregister → reaper → sweep. See its `README.md`. `ddns` points `CLOUDFLARE_API_BASE` at the wiremock so the harness never touches a real zone.
+
 ## SQL conventions
 
 - Query strings are `const &str` at module level — never inline in `sqlx::query(format!(...))`.
@@ -213,7 +219,7 @@ Add new integration test files here when a feature requires two or more real inf
 
 ## DNS provider
 
-`DnsProvider` is a trait in `wardnet_common::dns_provider` (`upsert_a_record` / `upsert_txt_record` / `delete_record` / `find_a_record`). Production uses `CloudflareDnsProvider` (`crates/ddns/src/cloudflare/`). In tests, use the `MockDnsProvider` in `crates/ddns/src/test_helpers.rs` (it simulates a Cloudflare zone). Never call the Cloudflare REST API in unit tests.
+`DnsProvider` is a trait in `wardnet_common::dns_provider` (`upsert_a_record` / `upsert_txt_record` / `delete_record` / `find_a_record`). Production uses `CloudflareDnsProvider` (`crates/ddns/src/cloudflare/`). In tests, use the `MockDnsProvider` in `crates/ddns/src/test_helpers.rs` (it simulates a Cloudflare zone). Never call the Cloudflare REST API in unit tests. The optional `CLOUDFLARE_API_BASE` env var (`CloudflareDnsProvider::with_base_url`) overrides the API base URL so the e2e harness can point a real `ddns` binary at a wiremock; it is **unset in production** (the real API).
 
 ## Validation
 

@@ -51,6 +51,21 @@ impl CloudflareDnsProvider {
     /// The `Authorization: Bearer <token>` header is baked into a shared
     /// [`reqwest::Client`] and attached to every outbound request automatically.
     pub fn new(api_token: &str, zone_id: &str) -> anyhow::Result<Self> {
+        Self::with_base_url(api_token, zone_id, None)
+    }
+
+    /// Build a provider, optionally overriding the API base URL.
+    ///
+    /// `base_url` defaults to the real Cloudflare API ([`CF_API_BASE`]) when `None`.
+    /// A `Some(_)` override points the client at a mock Cloudflare API and is the
+    /// production seam the end-to-end harness uses (`CLOUDFLARE_API_BASE`) — it never
+    /// touches the real Cloudflare zone. Mirrors the `#[cfg(test)]` `new_for_test`
+    /// constructor used by the unit tests.
+    pub fn with_base_url(
+        api_token: &str,
+        zone_id: &str,
+        base_url: Option<&str>,
+    ) -> anyhow::Result<Self> {
         use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
         let mut headers = HeaderMap::new();
@@ -68,7 +83,7 @@ impl CloudflareDnsProvider {
         Ok(Self {
             zone_id: zone_id.to_string(),
             http,
-            base_url: CF_API_BASE.to_string(),
+            base_url: base_url.unwrap_or(CF_API_BASE).to_string(),
             initial_backoff: INITIAL_BACKOFF,
         })
     }

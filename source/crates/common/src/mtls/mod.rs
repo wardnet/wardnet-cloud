@@ -477,7 +477,7 @@ impl ReloadableServerConfig {
 }
 
 /// Watch the directories holding the mesh PEM files and invoke `on_change` after each
-/// change, debounced.
+/// change, debounced and **deduplicated on file contents**.
 ///
 /// inforge re-projects `leaf.crt` / `leaf.key` / `bundle.crt` **in place** on renewal;
 /// this watches their parent directories (more robust than watching the files, since an
@@ -485,6 +485,10 @@ impl ReloadableServerConfig {
 /// files and `reload` every consumer ([`MeshClient`], [`ReloadableServerConfig`]). The
 /// watcher runs on a dedicated thread that lives for the process; this returns once it is
 /// armed.
+///
+/// `on_change` fires only when the combined contents of `paths` actually differ from what
+/// was last seen, so a directory that emits a continuous stream of spurious change events
+/// (some networked/overlay filesystems do) does not trigger a reload storm.
 ///
 /// # Errors
 /// Returns an error if the watcher cannot be created or a parent directory cannot be
@@ -519,6 +523,8 @@ pub fn watch_mesh_files(
             .map_err(|e| anyhow::anyhow!("failed to watch mesh cert dir {}: {e}", dir.display()))?;
     }
 
+    let watched_paths: Vec<String> = paths.to_vec();
+    let mut last_digest = files_digest(&watched_paths);
     std::thread::Builder::new()
         .name("mesh-cert-watch".to_string())
         .spawn(move || {
@@ -531,7 +537,13 @@ pub fn watch_mesh_files(
                         // Debounce the burst of events a single re-projection emits.
                         std::thread::sleep(Duration::from_millis(200));
                         while rx.try_recv().is_ok() {}
-                        on_change();
+                        // Only reload when the bytes actually changed — ignore spurious
+                        // events from filesystems that emit them continuously.
+                        let digest = files_digest(&watched_paths);
+                        if digest != last_digest {
+                            last_digest = digest;
+                            on_change();
+                        }
                     }
                     Err(e) => tracing::warn!(error = %e, "mesh cert watch error"),
                 }
@@ -541,6 +553,19 @@ pub fn watch_mesh_files(
         .map_err(|e| anyhow::anyhow!("failed to spawn mesh cert watch thread: {e}"))?;
 
     Ok(())
+}
+
+/// A combined SHA-256 over the contents of `paths` (an unreadable file hashes as empty),
+/// used to tell a real rotation from a spurious filesystem event.
+fn files_digest(paths: &[String]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for p in paths {
+        let bytes = std::fs::read(p).unwrap_or_default();
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+    }
+    hasher.finalize().into()
 }
 
 #[cfg(test)]

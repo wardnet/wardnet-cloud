@@ -3164,6 +3164,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wardnet-e2e-mesh"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "wardnet_common",
+]
+
+[[package]]
 name = "wardnet-tenants"
 version = "0.1.0"
 dependencies = [
@@ -3855,6 +3867,16 @@ dependencies = [
  "rusticata-macros",
  "thiserror",
  "time",
+]
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ed25519-dalek",
+ "rand 0.10.1",
+ "rcgen",
 ]
 
 [[package]]
