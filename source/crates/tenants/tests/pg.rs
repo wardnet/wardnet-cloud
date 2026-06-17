@@ -122,3 +122,56 @@ async fn slug_uniqueness_and_single_use_code_on_postgres() {
         .await;
     assert!(outcome.is_err());
 }
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn deregister_tombstone_sweep_and_email_reuse_on_postgres() {
+    let svc = service(test_pool().await);
+    let (_k1, c1) = daemon_keypair(11);
+
+    // Signup → enroll → register-network.
+    let code = svc
+        .issue_signup_code("reuse@example.com", "1.2.3.4")
+        .await
+        .unwrap();
+    let first_id = svc.enroll(&code, &c1).await.unwrap().tenant_id;
+    let network = svc
+        .register_network(&first_id, &c1, "tombstone-net", None, REGION)
+        .await
+        .unwrap();
+
+    // Deregister tombstones, cascades the network to deprovisioning, and cancels.
+    assert!(svc.deregister_tenant(&first_id).await.unwrap());
+    assert_eq!(
+        svc.find_network(&network.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .provisioning_state,
+        ProvisioningState::Deprovisioning
+    );
+    // A tombstoned tenant can no longer mint a token.
+    assert!(svc.mint_jwt(&c1).await.is_err());
+    // Idempotent second deregister.
+    assert!(!svc.deregister_tenant(&first_id).await.unwrap());
+
+    // The partial unique index frees the email: a fresh signup gets a new tenant id.
+    let code2 = svc
+        .issue_signup_code("reuse@example.com", "1.2.3.4")
+        .await
+        .unwrap();
+    let (_k2, c2) = daemon_keypair(22);
+    let second_id = svc.enroll(&code2, &c2).await.unwrap().tenant_id;
+    assert_ne!(first_id, second_id);
+
+    // The sweep must not delete the tombstoned tenant while its network row survives.
+    assert_eq!(svc.sweep_deregistered().await.unwrap(), 0);
+    assert!(svc.find_tenant(&first_id).await.unwrap().is_some());
+
+    // Reaper finishes deprovision → network row gone → sweep deletes the tenant.
+    assert!(svc.finish_deprovision(&network.id).await.unwrap());
+    assert_eq!(svc.sweep_deregistered().await.unwrap(), 1);
+    assert!(svc.find_tenant(&first_id).await.unwrap().is_none());
+    // The live re-signup tenant is untouched.
+    assert!(svc.find_tenant(&second_id).await.unwrap().is_some());
+}

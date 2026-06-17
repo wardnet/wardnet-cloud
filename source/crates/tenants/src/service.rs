@@ -89,6 +89,7 @@ impl TenantsService {
             subscription_status: SubscriptionStatus::Active,
             subscription_id: None,
             created_at: Utc::now(),
+            deregistered_at: None,
         };
         match self.tenants.create(&tenant).await? {
             CreateTenantOutcome::Created => Ok(tenant),
@@ -121,6 +122,53 @@ impl TenantsService {
             "subscription canceled; networks deprovisioning"
         );
         Ok(())
+    }
+
+    /// Deregister (tombstone) a tenant account: stamp `deregistered_at`, cascade its
+    /// `{active, provisioning}` networks to `deprovisioning` (the DDNS reaper then tears
+    /// down DNS and the row), and cancel its subscription. The tombstone is terminal and
+    /// distinct from the reversible `subscription_status`; it frees the email for a fresh
+    /// signup and makes `mint_jwt`/`enroll` reject the tenant. Idempotent — a second call
+    /// on an already-tombstoned tenant is a no-op. Returns `true` if it newly tombstoned.
+    ///
+    /// # Errors
+    /// [`TenantsError::NotFound`] if no such tenant.
+    pub async fn deregister_tenant(&self, tenant_id: &str) -> Result<bool, TenantsError> {
+        // find_by_id returns tombstoned tenants too, so a missing row is the only 404.
+        if self.tenants.find_by_id(tenant_id).await?.is_none() {
+            return Err(TenantsError::NotFound("no such tenant".to_string()));
+        }
+        if !self.tenants.set_deregistered(tenant_id).await? {
+            // Already tombstoned — idempotent no-op.
+            return Ok(false);
+        }
+        let n = self
+            .networks
+            .set_deprovisioning_for_tenant(tenant_id)
+            .await?;
+        self.tenants
+            .set_subscription_status(tenant_id, SubscriptionStatus::Canceled)
+            .await?;
+        tracing::info!(
+            tenant_id,
+            networks = n,
+            "tenant deregistered; networks deprovisioning, subscription canceled"
+        );
+        Ok(true)
+    }
+
+    /// Delete tombstoned tenants whose networks are fully deprovisioned (FK-cascading
+    /// their daemons, codes, and pending enrollments). Driven by a periodic sweep loop;
+    /// N-replica-safe and idempotent. Returns the number of tenants deleted.
+    ///
+    /// # Errors
+    /// [`TenantsError::Internal`] on a repository failure.
+    pub async fn sweep_deregistered(&self) -> Result<u64, TenantsError> {
+        let deleted = self.tenants.delete_tombstoned_empty().await?;
+        if deleted > 0 {
+            tracing::info!(deleted, "swept tombstoned tenants");
+        }
+        Ok(deleted)
     }
 
     /// List a tenant's networks.
@@ -318,6 +366,11 @@ impl TenantsService {
             .find_by_id(&tenant_id)
             .await?
             .ok_or_else(|| TenantsError::NotFound("tenant not found".to_string()))?;
+        if tenant.deregistered_at.is_some() {
+            return Err(TenantsError::Forbidden(
+                "tenant is deregistered".to_string(),
+            ));
+        }
         if tenant.subscription_status != SubscriptionStatus::Active {
             return Err(TenantsError::Forbidden(
                 "tenant subscription is not active".to_string(),

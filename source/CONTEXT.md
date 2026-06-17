@@ -16,6 +16,19 @@ details. (See `docs/adr/` for the decisions behind these.)
 - **Vanity / slug** — the network's public name (`<slug>.<zone>`); globally unique.
 - **Entitlement** — the per-tenant limits a subscription grants: at minimum
   `max_networks` and `max_daemons`. Default for a self-service tenant: 1 / 1.
+- **Deregister** — the account-closing act: the tenant is **tombstoned**, all its
+  networks are cascaded to [deprovisioning](#provisioning-state), and its
+  subscription is canceled. Idempotent. Distinct from a subscription cancel (which
+  is reversible and leaves the account intact). The owning user triggers it
+  (`DELETE /v1/tenants/{id}`).
+- **Tombstone** — the terminal marker (`deregistered_at`) on a deregistered tenant.
+  A tombstoned tenant cannot mint tokens or enroll daemons, and its email is freed
+  for a fresh signup immediately (only *live* tenants reserve their email). The row
+  itself lingers until the **sweep** removes it.
+- **Sweep** — the periodic reaper that deletes tombstoned tenants once their
+  networks are fully deprovisioned (the DDNS reaper having torn down DNS first),
+  FK-cascading the tenant's daemons, codes, and pending enrollments. N-replica-safe
+  and idempotent.
 
 ## Enrollment credentials
 

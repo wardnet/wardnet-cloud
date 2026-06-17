@@ -28,7 +28,7 @@ pub fn register(router: OpenApiRouter<AppState>) -> OpenApiRouter<AppState> {
         .routes(routes!(list_networks))
         .routes(routes!(list_tenant_daemons))
         .routes(routes!(list_network_daemons))
-        .routes(routes!(update_tenant))
+        .routes(routes!(update_tenant, delete_tenant))
         .routes(routes!(delete_network))
 }
 
@@ -208,5 +208,28 @@ async fn delete_network(
 ) -> Result<StatusCode, ApiError> {
     require_owner(&caller, &id)?;
     state.tenants().delete_network(&id, &slug).await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+#[utoipa::path(
+    delete, path = "/v1/tenants/{id}", tag = "tenants",
+    description = "Deregister (tombstone) the account: all its networks are marked for \
+                   deprovisioning, its subscription is canceled, and once the networks are \
+                   fully reaped the account row is swept. Idempotent.",
+    responses(
+        (status = 202, description = "Accepted; account is deregistering"),
+        (status = 401, description = "Unauthenticated"),
+        (status = 403, description = "Not your tenant"),
+        (status = 404, description = "No such tenant"),
+    ),
+)]
+async fn delete_tenant(
+    State(state): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_owner(&caller, &id)?;
+    // Idempotent: a repeat call on an already-tombstoned tenant still returns 202.
+    state.tenants().deregister_tenant(&id).await?;
     Ok(StatusCode::ACCEPTED)
 }

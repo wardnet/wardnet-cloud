@@ -22,6 +22,9 @@ pub struct Tenant {
     /// Provider-agnostic subscription handle; `None` until billing is wired.
     pub subscription_id: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// Account-deregistration tombstone: `None` = live; `Some` = terminally
+    /// deregistered (its email is freed, and mint/enroll reject it).
+    pub deregistered_at: Option<DateTime<Utc>>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -32,6 +35,7 @@ struct TenantRow {
     subscription_status: String,
     subscription_id: Option<String>,
     created_at: DateTime<Utc>,
+    deregistered_at: Option<DateTime<Utc>>,
 }
 
 impl From<TenantRow> for Tenant {
@@ -43,6 +47,7 @@ impl From<TenantRow> for Tenant {
             subscription_status: SubscriptionStatus::from_db(&r.subscription_status),
             subscription_id: r.subscription_id,
             created_at: r.created_at,
+            deregistered_at: r.deregistered_at,
         }
     }
 }
@@ -71,6 +76,14 @@ pub trait TenantRepository: Send + Sync {
         id: &str,
         status: SubscriptionStatus,
     ) -> anyhow::Result<bool>;
+    /// Stamp the deregistration tombstone on a live tenant. Returns `true` if it newly
+    /// tombstoned the tenant, `false` if it was already tombstoned or no such tenant
+    /// (idempotent).
+    async fn set_deregistered(&self, id: &str) -> anyhow::Result<bool>;
+    /// Delete every tombstoned tenant that no longer owns any networks, returning the
+    /// number of rows deleted. FK `ON DELETE CASCADE` removes the tenant's daemons,
+    /// enrollment codes, and pending enrollments. N-replica-safe and idempotent.
+    async fn delete_tombstoned_empty(&self) -> anyhow::Result<u64>;
 }
 
 /// `PostgreSQL`-backed [`TenantRepository`].
@@ -98,7 +111,7 @@ impl TenantRepository for PgTenantRepository {
         let affected = sqlx::query(
             "INSERT INTO tenants (id, email, entitlement, subscription_status, subscription_id, created_at)
              VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (email) DO NOTHING",
+             ON CONFLICT (email) WHERE deregistered_at IS NULL DO NOTHING",
         )
         .bind(&tenant.id)
         .bind(&tenant.email)
@@ -118,7 +131,7 @@ impl TenantRepository for PgTenantRepository {
 
     async fn find_by_id(&self, id: &str) -> anyhow::Result<Option<Tenant>> {
         let row = sqlx::query_as::<_, TenantRow>(
-            "SELECT id, email, entitlement, subscription_status, subscription_id, created_at \
+            "SELECT id, email, entitlement, subscription_status, subscription_id, created_at, deregistered_at \
              FROM tenants WHERE id = $1",
         )
         .bind(id)
@@ -129,8 +142,8 @@ impl TenantRepository for PgTenantRepository {
 
     async fn find_by_email(&self, email: &str) -> anyhow::Result<Option<Tenant>> {
         let row = sqlx::query_as::<_, TenantRow>(
-            "SELECT id, email, entitlement, subscription_status, subscription_id, created_at \
-             FROM tenants WHERE email = $1",
+            "SELECT id, email, entitlement, subscription_status, subscription_id, created_at, deregistered_at \
+             FROM tenants WHERE email = $1 AND deregistered_at IS NULL",
         )
         .bind(email)
         .fetch_optional(&self.pools.read)
@@ -150,5 +163,29 @@ impl TenantRepository for PgTenantRepository {
             .await?
             .rows_affected();
         Ok(affected > 0)
+    }
+
+    async fn set_deregistered(&self, id: &str) -> anyhow::Result<bool> {
+        let affected = sqlx::query(
+            "UPDATE tenants SET deregistered_at = now() \
+             WHERE id = $1 AND deregistered_at IS NULL",
+        )
+        .bind(id)
+        .execute(&self.pools.write)
+        .await?
+        .rows_affected();
+        Ok(affected > 0)
+    }
+
+    async fn delete_tombstoned_empty(&self) -> anyhow::Result<u64> {
+        let affected = sqlx::query(
+            "DELETE FROM tenants \
+             WHERE deregistered_at IS NOT NULL \
+               AND NOT EXISTS (SELECT 1 FROM networks WHERE networks.tenant_id = tenants.id)",
+        )
+        .execute(&self.pools.write)
+        .await?
+        .rows_affected();
+        Ok(affected)
     }
 }

@@ -229,6 +229,112 @@ async fn register_network_without_auth_is_unauthorized() {
 }
 
 #[tokio::test]
+async fn delete_tenant_is_owner_scoped_and_idempotent() {
+    let app = app();
+    let (key, cnf) = daemon_keypair(11);
+
+    // Enroll a tenant via the full bootstrap flow so it exists in the store.
+    let mut signup = Request::builder()
+        .method("POST")
+        .uri("/v1/enrollment-codes")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({"email": "del@b.com"})).unwrap(),
+        ))
+        .unwrap();
+    signup
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
+    let code = json_body(app.clone().oneshot(signup).await.unwrap()).await["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/enroll")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"code": code, "public_key": cnf})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let tenant_id = json_body(resp).await["tenant_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let _ = key;
+
+    // A different tenant's user cannot delete this account.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/tenants/{tenant_id}"))
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", user_token("other")),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // The owner deregisters → 202.
+    let utoken = user_token(&tenant_id);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/tenants/{tenant_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {utoken}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    // Idempotent: a repeat delete still returns 202.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/tenants/{tenant_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {utoken}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn delete_tenant_without_auth_is_unauthorized() {
+    let resp = app()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/tenants/some-tenant")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn user_cannot_read_another_tenant() {
     let utoken = user_token("tenant-a");
     let resp = app()

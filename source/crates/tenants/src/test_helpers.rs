@@ -124,6 +124,24 @@ impl MockStore {
             .find(|n| n.slug == slug)
             .map(|n| n.provisioning_state)
     }
+
+    /// The id of the network with `slug`, if present.
+    #[must_use]
+    pub fn network_id(&self, slug: &str) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .networks
+            .values()
+            .find(|n| n.slug == slug)
+            .map(|n| n.id.clone())
+    }
+
+    /// The tenant row with `id`, if present (including tombstoned tenants).
+    #[must_use]
+    pub fn find_tenant(&self, id: &str) -> Option<Tenant> {
+        self.0.lock().unwrap().tenants.get(id).cloned()
+    }
 }
 
 impl Default for MockStore {
@@ -138,7 +156,11 @@ impl Default for MockStore {
 impl TenantRepository for MockStore {
     async fn create(&self, tenant: &Tenant) -> anyhow::Result<CreateTenantOutcome> {
         let mut d = self.0.lock().unwrap();
-        if d.tenants.values().any(|t| t.email == tenant.email) {
+        // Mirror the partial unique index: only LIVE tenants reserve their email.
+        if d.tenants
+            .values()
+            .any(|t| t.email == tenant.email && t.deregistered_at.is_none())
+        {
             return Ok(CreateTenantOutcome::EmailTaken);
         }
         d.tenants.insert(tenant.id.clone(), tenant.clone());
@@ -156,7 +178,7 @@ impl TenantRepository for MockStore {
             .unwrap()
             .tenants
             .values()
-            .find(|t| t.email == email)
+            .find(|t| t.email == email && t.deregistered_at.is_none())
             .cloned())
     }
 
@@ -172,6 +194,36 @@ impl TenantRepository for MockStore {
         } else {
             Ok(false)
         }
+    }
+
+    async fn set_deregistered(&self, id: &str) -> anyhow::Result<bool> {
+        let mut d = self.0.lock().unwrap();
+        match d.tenants.get_mut(id) {
+            Some(t) if t.deregistered_at.is_none() => {
+                t.deregistered_at = Some(chrono::Utc::now());
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn delete_tombstoned_empty(&self) -> anyhow::Result<u64> {
+        let mut d = self.0.lock().unwrap();
+        let to_delete: Vec<String> = d
+            .tenants
+            .values()
+            .filter(|t| t.deregistered_at.is_some())
+            .filter(|t| !d.networks.values().any(|n| n.tenant_id == t.id))
+            .map(|t| t.id.clone())
+            .collect();
+        for id in &to_delete {
+            d.tenants.remove(id);
+            d.daemons.retain(|_, dm| &dm.tenant_id != id);
+            d.codes
+                .retain(|_, c| c.tenant_id.as_deref() != Some(id.as_str()));
+            d.pending.retain(|_, p| &p.tenant_id != id);
+        }
+        Ok(to_delete.len() as u64)
     }
 }
 
@@ -414,8 +466,16 @@ impl EnrollmentRepository for MockStore {
 
         // Resolve the tenant.
         let tenant_id = if let Some(tid) = code_tenant_id {
-            tid
-        } else if let Some(t) = d.tenants.values().find(|t| t.email == email) {
+            // Add-daemon — never into a deregistered tenant.
+            match d.tenants.get(&tid) {
+                Some(t) if t.deregistered_at.is_none() => tid,
+                _ => return Ok(EnrollOutcome::BadCode),
+            }
+        } else if let Some(t) = d
+            .tenants
+            .values()
+            .find(|t| t.email == email && t.deregistered_at.is_none())
+        {
             t.id.clone()
         } else {
             let tenant = Tenant {
@@ -425,6 +485,7 @@ impl EnrollmentRepository for MockStore {
                 subscription_status: SubscriptionStatus::Active,
                 subscription_id: None,
                 created_at: now,
+                deregistered_at: None,
             };
             d.tenants.insert(tenant.id.clone(), tenant);
             new_tenant_id.to_string()
@@ -525,6 +586,7 @@ pub fn test_config() -> Config {
         trust_bundle_path: "/dev/null".to_string(),
         leaf_cert_path: "/dev/null".to_string(),
         leaf_key_path: "/dev/null".to_string(),
+        sweep_interval_secs: 3600,
     }
 }
 

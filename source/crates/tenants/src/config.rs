@@ -36,6 +36,10 @@ pub struct Config {
     pub leaf_cert_path: String,
     /// PEM path: this service's mesh server private key.
     pub leaf_key_path: String,
+
+    /// Interval (seconds) between sweeps that delete tombstoned tenants whose networks
+    /// are fully deprovisioned. Default 3600 (hourly).
+    pub sweep_interval_secs: u64,
 }
 
 impl std::fmt::Debug for Config {
@@ -50,6 +54,7 @@ impl std::fmt::Debug for Config {
             .field("trust_bundle_path", &self.trust_bundle_path)
             .field("leaf_cert_path", &self.leaf_cert_path)
             .field("leaf_key_path", &self.leaf_key_path)
+            .field("sweep_interval_secs", &self.sweep_interval_secs)
             .finish()
     }
 }
@@ -75,6 +80,10 @@ impl Config {
             trust_bundle_path: required("MTLS_TRUST_BUNDLE_PATH")?,
             leaf_cert_path: required("MTLS_LEAF_CERT_PATH")?,
             leaf_key_path: required("MTLS_LEAF_KEY_PATH")?,
+            sweep_interval_secs: std::env::var("TENANT_SWEEP_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3600),
         })
     }
 }

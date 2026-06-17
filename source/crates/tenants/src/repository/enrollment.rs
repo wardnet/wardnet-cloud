@@ -147,13 +147,25 @@ impl EnrollmentRepository for PgEnrollmentRepository {
         // Resolve the tenant: the code's tenant (add-daemon), or create/reuse by
         // email (new signup).
         let tenant_id = if let Some(tid) = code_tenant_id {
+            // Add-daemon into an existing tenant — but never into a deregistered one.
+            let live: Option<bool> =
+                sqlx::query_scalar("SELECT deregistered_at IS NULL FROM tenants WHERE id = $1")
+                    .bind(&tid)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if live != Some(true) {
+                tx.rollback().await?;
+                return Ok(EnrollOutcome::BadCode);
+            }
             tid
         } else {
-            // New signup: create the tenant, or reuse the existing one for this email.
+            // New signup: create the tenant, or reuse the existing LIVE one for this
+            // email. The partial unique index only reserves emails of live tenants, so
+            // a tombstoned tenant's email is free for a fresh signup.
             let created: Option<String> = sqlx::query_scalar(
                 "INSERT INTO tenants (id, email, entitlement, subscription_status, subscription_id, created_at)
                  VALUES ($1, $2, $3, 'active', NULL, $4)
-                 ON CONFLICT (email) DO NOTHING
+                 ON CONFLICT (email) WHERE deregistered_at IS NULL DO NOTHING
                  RETURNING id",
             )
             .bind(new_tenant_id)
@@ -165,10 +177,12 @@ impl EnrollmentRepository for PgEnrollmentRepository {
             if let Some(id) = created {
                 id
             } else {
-                sqlx::query_scalar("SELECT id FROM tenants WHERE email = $1")
-                    .bind(&email)
-                    .fetch_one(&mut *tx)
-                    .await?
+                sqlx::query_scalar(
+                    "SELECT id FROM tenants WHERE email = $1 AND deregistered_at IS NULL",
+                )
+                .bind(&email)
+                .fetch_one(&mut *tx)
+                .await?
             }
         };
 

@@ -54,8 +54,14 @@ Conventions and invariants for agents working inside `source/`.
   `config`/`state`/`error`. Serves a **public** nginx-fronted router (`register`/`challenge`/`names`/
   `token`/`deregister`/`health`) with dual-path auth, **plus** a separate **internal mesh-mTLS**
   reconcile listener (`src/mesh.rs` — mTLS transport only; handlers in `src/api/reconcile.rs`,
-  `GET/PATCH /v1/networks`) with no JWT layer. `deregister` is tombstone-only (the DDNS reaper
-  does DNS teardown — see invariant #19). Depends on `wardnet_common`.
+  `GET/PATCH /v1/networks`) with no JWT layer. Account deregister (`DELETE /v1/tenants/{id}`, USER,
+  owner-checked, 202, idempotent) **tombstones** (`deregistered_at`) rather than deleting: it cascades
+  the tenant's networks to `deprovisioning` (the DDNS reaper does DNS teardown — invariant #19) and
+  cancels the subscription, and a periodic **sweep loop** (`TENANT_SWEEP_INTERVAL_SECS`, default 3600,
+  N-replica-safe) FK-cascade-deletes tombstoned tenants once their networks are gone. The email is freed
+  for a fresh signup the moment the tombstone is set — a **partial unique index** (`email WHERE
+  deregistered_at IS NULL`) means only live tenants reserve it, and `mint_jwt`/`enroll` reject a
+  tombstoned tenant. Depends on `wardnet_common`.
 - **`crates/ddns`** (bin `wardnet-ddns`, lib `wardnet_ddns`) — the regional DNS reconciler, carved out
   of `cloud` in WS-C. A stateless controller that drives Cloudflare toward the desired state Tenants owns
   (ADR-0001): a short-interval **provisioner** + long-interval **reaper** (`src/reconcile.rs`) that drain

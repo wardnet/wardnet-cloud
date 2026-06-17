@@ -24,8 +24,15 @@ CREATE TABLE tenants (
     -- Provider-agnostic subscription handle (reserved; populated when billing lands).
     subscription_id     VARCHAR(255),
     created_at          TIMESTAMPTZ NOT NULL,
-    CONSTRAINT uq_tenants_email UNIQUE (email)
+    -- Account deregistration tombstone. NULL = live account; set = terminally
+    -- deregistered (distinct from the reversible billing `subscription_status`). A
+    -- tombstoned tenant frees its email for re-signup, is rejected by mint/enroll, and
+    -- is swept once its networks are fully deprovisioned.
+    deregistered_at     TIMESTAMPTZ
 );
+-- Email is unique only among LIVE tenants, so deregistering frees the address for a
+-- fresh signup while the tombstoned row lingers until its networks are reaped.
+CREATE UNIQUE INDEX uq_tenants_email_active ON tenants (email) WHERE deregistered_at IS NULL;
 
 CREATE TABLE networks (
     id                 TEXT PRIMARY KEY,

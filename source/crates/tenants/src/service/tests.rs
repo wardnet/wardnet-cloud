@@ -138,6 +138,7 @@ async fn register_network_enforces_network_limit() {
         subscription_status: SubscriptionStatus::Active,
         subscription_id: None,
         created_at: chrono::Utc::now(),
+        deregistered_at: None,
     };
     store.seed_tenant(tenant);
     let (_k1, c1) = daemon_keypair(31);
@@ -172,6 +173,7 @@ async fn register_network_rejects_taken_slug() {
         subscription_status: SubscriptionStatus::Active,
         subscription_id: None,
         created_at: chrono::Utc::now(),
+        deregistered_at: None,
     });
     let (_k1, c1) = daemon_keypair(41);
     let (_k2, c2) = daemon_keypair(42);
@@ -219,6 +221,7 @@ async fn register_network_rejects_unknown_region() {
         subscription_status: SubscriptionStatus::Active,
         subscription_id: None,
         created_at: chrono::Utc::now(),
+        deregistered_at: None,
     });
     let (_k, c) = daemon_keypair(51);
     assert!(matches!(
@@ -306,6 +309,88 @@ async fn reconcile_provisioner_then_reaper_lifecycle() {
 }
 
 #[tokio::test]
+async fn deregister_tombstones_cascades_cancels_and_is_idempotent() {
+    let (state, store, tenant_id, cnf, slug) = enrolled_and_registered().await;
+
+    // First deregister tombstones, cascades the network to deprovisioning, and cancels.
+    assert!(state.tenants().deregister_tenant(&tenant_id).await.unwrap());
+    let tenant = store.find_tenant(&tenant_id).unwrap();
+    assert!(tenant.deregistered_at.is_some());
+    assert_eq!(tenant.subscription_status, SubscriptionStatus::Canceled);
+    assert_eq!(
+        store.network_state(&slug),
+        Some(ProvisioningState::Deprovisioning)
+    );
+
+    // A tombstoned tenant's daemon key can no longer mint a token.
+    assert!(matches!(
+        state.tenants().mint_jwt(&cnf).await,
+        Err(TenantsError::Forbidden(_))
+    ));
+
+    // Idempotent: a second deregister is a no-op (false), not an error.
+    assert!(!state.tenants().deregister_tenant(&tenant_id).await.unwrap());
+}
+
+#[tokio::test]
+async fn deregister_unknown_tenant_is_not_found() {
+    let (state, _store) = build_state(SEED);
+    assert!(matches!(
+        state.tenants().deregister_tenant("nope").await,
+        Err(TenantsError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn sweep_deletes_tombstoned_only_after_networks_gone() {
+    let (state, store, tenant_id, _cnf, slug) = enrolled_and_registered().await;
+    let network_id = store.network_id(&slug).unwrap();
+
+    state.tenants().deregister_tenant(&tenant_id).await.unwrap();
+
+    // While the (deprovisioning) network row still exists, the sweep must not delete it.
+    assert_eq!(state.tenants().sweep_deregistered().await.unwrap(), 0);
+    assert!(store.find_tenant(&tenant_id).is_some());
+
+    // Reaper finishes deprovision → the network row is gone.
+    assert!(
+        state
+            .tenants()
+            .finish_deprovision(&network_id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(store.network_count(), 0);
+
+    // Now the sweep deletes the tombstoned, network-less tenant.
+    assert_eq!(state.tenants().sweep_deregistered().await.unwrap(), 1);
+    assert!(store.find_tenant(&tenant_id).is_none());
+}
+
+#[tokio::test]
+async fn deregister_frees_email_for_fresh_signup() {
+    let (state, _store) = build_state(SEED);
+    let (_k1, c1) = daemon_keypair(11);
+    let code = state
+        .tenants()
+        .issue_signup_code("reuse@example.com", "1.2.3.4")
+        .await
+        .unwrap();
+    let first_id = state.tenants().enroll(&code, &c1).await.unwrap().tenant_id;
+
+    // Tombstoning frees the email: a fresh signup resolves to a new tenant id.
+    state.tenants().deregister_tenant(&first_id).await.unwrap();
+    let (_k2, c2) = daemon_keypair(12);
+    let code2 = state
+        .tenants()
+        .issue_signup_code("reuse@example.com", "1.2.3.4")
+        .await
+        .unwrap();
+    let second_id = state.tenants().enroll(&code2, &c2).await.unwrap().tenant_id;
+    assert_ne!(first_id, second_id);
+}
+
+#[tokio::test]
 async fn reconcile_pagination_is_region_scoped_and_cursored() {
     let (state, store) = build_state(SEED);
     store.seed_tenant(Tenant {
@@ -318,6 +403,7 @@ async fn reconcile_pagination_is_region_scoped_and_cursored() {
         subscription_status: SubscriptionStatus::Active,
         subscription_id: None,
         created_at: chrono::Utc::now(),
+        deregistered_at: None,
     });
     for i in 0..5u8 {
         let (_k, c) = daemon_keypair(60 + i);

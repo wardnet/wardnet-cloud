@@ -30,6 +30,7 @@ async fn seeded() -> (AppState, String) {
         subscription_status: SubscriptionStatus::Active,
         subscription_id: None,
         created_at: chrono::Utc::now(),
+        deregistered_at: None,
     });
     let (_key, cnf) = daemon_keypair(11);
     let network = state

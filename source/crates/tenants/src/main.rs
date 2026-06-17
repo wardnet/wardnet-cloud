@@ -102,6 +102,8 @@ async fn main() -> anyhow::Result<()> {
         )?;
     }
 
+    let sweep_interval = std::time::Duration::from_secs(config.sweep_interval_secs);
+
     tokio::select! {
         // Public, nginx-fronted control-plane API (daemon + user JWT, bootstrap).
         res = serve::run_api(&config.api_listen_addr, api_router) => res?,
@@ -110,9 +112,25 @@ async fn main() -> anyhow::Result<()> {
         res = mesh::serve_mesh(
             &config.mesh_listen_addr,
             Arc::clone(&mesh_server_config),
-            state,
+            state.clone(),
         ) => res?,
+
+        // Periodic tombstone sweep: delete deregistered tenants whose networks are gone.
+        () = sweep_loop(state, sweep_interval) => {},
     }
 
     Ok(())
+}
+
+/// Periodically delete tombstoned tenants whose networks are fully deprovisioned. The
+/// first tick fires immediately, then every `interval`. N-replica-safe (the delete is
+/// idempotent), so every node may run it.
+async fn sweep_loop(state: AppState, interval: std::time::Duration) {
+    let mut tick = tokio::time::interval(interval);
+    loop {
+        tick.tick().await;
+        if let Err(e) = state.tenants().sweep_deregistered().await {
+            tracing::error!(error = %e, "tombstone sweep failed");
+        }
+    }
 }
