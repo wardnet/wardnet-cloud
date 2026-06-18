@@ -60,6 +60,12 @@ pub struct Config {
     /// Base URL of the account SPA; Stripe checkout success/cancel + portal return
     /// URLs hang off it.
     pub account_base_url: String,
+
+    /// Resend API key for transactional email. `None` falls back to the dev no-op
+    /// sender (logs the code instead of sending). Redacted in `Debug`.
+    pub resend_api_key: Option<String>,
+    /// The verified `from` address for enrollment-code emails.
+    pub email_from: String,
 }
 
 impl std::fmt::Debug for Config {
@@ -82,6 +88,11 @@ impl std::fmt::Debug for Config {
             .field("stripe_secret_key", &"<redacted>")
             .field("stripe_webhook_secret", &"<redacted>")
             .field("account_base_url", &self.account_base_url)
+            .field(
+                "resend_api_key",
+                &self.resend_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("email_from", &self.email_from)
             .finish()
     }
 }
@@ -130,6 +141,11 @@ impl Config {
             stripe_secret_key: required("STRIPE_SECRET_KEY")?,
             stripe_webhook_secret: required("STRIPE_WEBHOOK_SECRET")?,
             account_base_url: required("ACCOUNT_BASE_URL")?,
+            resend_api_key: std::env::var("RESEND_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            email_from: std::env::var("EMAIL_FROM")
+                .unwrap_or_else(|_| "wardnet <noreply@wardnet.io>".to_string()),
         })
     }
 }

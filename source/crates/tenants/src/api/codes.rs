@@ -48,5 +48,7 @@ async fn request_signup_code(
         .tenants()
         .issue_signup_code(&body.email, &remote_ip)
         .await?;
+    // Emailed in production → don't echo it; dev/no-op sender → return it.
+    let code = (!state.tenants().email_delivers()).then_some(code);
     Ok(Json(SignupCodeResponse { code }))
 }

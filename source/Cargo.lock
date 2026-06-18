@@ -3654,6 +3654,7 @@ dependencies = [
  "utoipa-axum",
  "uuid",
  "wardnet_common",
+ "wiremock",
 ]
 
 [[package]]

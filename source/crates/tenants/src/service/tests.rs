@@ -148,6 +148,21 @@ async fn mint_jwt_denied_without_a_subscription() {
 }
 
 #[tokio::test]
+async fn issue_signup_code_emails_the_code() {
+    let h = build_harness(SEED);
+    let code = h
+        .state
+        .tenants()
+        .issue_signup_code("mail@b.com", "1.2.3.4")
+        .await
+        .unwrap();
+    let sent = h.email.sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, "mail@b.com");
+    assert_eq!(sent[0].1, code);
+}
+
+#[tokio::test]
 async fn enroll_with_bad_code_is_rejected() {
     let (state, _store) = build_state(SEED);
     let (_key, cnf) = daemon_keypair(11);

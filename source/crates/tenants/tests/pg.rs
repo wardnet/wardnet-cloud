@@ -91,6 +91,7 @@ fn harness(pools: DbPools) -> PgHarness {
         Arc::new(PgEnrollmentRepository::new_pools(pools)) as Arc<dyn EnrollmentRepository>,
         subscriptions.clone(),
         events.clone(),
+        Arc::new(wardnet_tenants::email::NoopEmailSender),
         test_signer(SEED),
         ["use1".to_string(), "eu1".to_string()],
     ));

@@ -220,9 +220,9 @@ pub struct SignupCodeRequest {
 /// Response body for `POST /v1/enrollment-codes`.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SignupCodeResponse {
-    /// The one-time code. **Transitional:** returned here until email delivery
-    /// (Resend) lands; thereafter it is emailed, not returned.
-    pub code: String,
+    /// The one-time code — `None` once it has been **emailed** (production), `Some`
+    /// only in the dev/no-op email path so the flow stays exercisable without a mailbox.
+    pub code: Option<String>,
 }
 
 /// Request body for `POST /v1/enroll`.
@@ -297,8 +297,9 @@ pub struct RegisterTenantRequest {
 /// Response body for the add-daemon code endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CodeResponse {
-    /// The one-time code (transitional — emailed in production).
-    pub code: String,
+    /// The one-time code — `None` once emailed (production), `Some` in the dev/no-op
+    /// email path.
+    pub code: Option<String>,
 }
 
 /// Request body for `PATCH /v1/tenants/{id}`.

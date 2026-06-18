@@ -7,7 +7,9 @@ use wardnet_common::{mtls, serve, token};
 use wardnet_tenants::{
     api,
     config::Config,
-    db, mesh,
+    db,
+    email::{EmailSender, NoopEmailSender, ResendEmailSender},
+    mesh,
     repository::{
         DaemonRepository, EnrollmentRepository, NetworkRepository, PgDaemonRepository,
         PgEnrollmentRepository, PgNetworkRepository, PgSubscriptionRepository, PgTenantRepository,
@@ -85,6 +87,14 @@ async fn main() -> anyhow::Result<()> {
             payment_grace_days: config.payment_grace_days,
         },
     ));
+    // Transactional email: Resend when configured, else the dev no-op (logs the code).
+    let email: Arc<dyn EmailSender> = if let Some(key) = &config.resend_api_key {
+        Arc::new(ResendEmailSender::new(key, &config.email_from)?)
+    } else {
+        tracing::warn!("RESEND_API_KEY unset; using the no-op email sender (codes are logged)");
+        Arc::new(NoopEmailSender)
+    };
+
     let service = Arc::new(TenantsService::new(
         tenants_repo as Arc<dyn TenantRepository>,
         networks_repo as Arc<dyn NetworkRepository>,
@@ -92,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
         enrollment_repo as Arc<dyn EnrollmentRepository>,
         Arc::clone(&subscriptions),
         Arc::clone(&events),
+        email,
         signer,
         config.known_regions.clone(),
     ));

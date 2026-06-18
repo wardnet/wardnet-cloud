@@ -129,6 +129,7 @@ async fn issue_tenant_code(
 ) -> Result<Json<CodeResponse>, ApiError> {
     require_owner(&caller, &id)?;
     let code = state.tenants().issue_tenant_code(&id).await?;
+    let code = (!state.tenants().email_delivers()).then_some(code);
     Ok(Json(CodeResponse { code }))
 }
 

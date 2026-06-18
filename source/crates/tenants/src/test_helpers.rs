@@ -16,6 +16,7 @@ use wardnet_common::event::{BroadcastEventBus, DomainEvent, EventPublisher};
 use wardnet_common::token::{Signer, Verifier};
 
 use crate::config::Config;
+use crate::email::EmailSender;
 use crate::repository::daemon::{Daemon, DaemonRepository};
 use crate::repository::enrollment::{EnrollOutcome, EnrollmentRepository};
 use crate::repository::network::{
@@ -865,6 +866,51 @@ impl StripeGateway for MockStripeGateway {
     }
 }
 
+// ── Recording email sender ──────────────────────────────────────────────────────
+
+/// A recording [`EmailSender`] fake: records every `(to, code)` and reports
+/// `delivers() == false` (so the API still echoes the code, keeping mock-backed
+/// HTTP tests exercisable). Use [`sent`](Self::sent) to assert an email was sent.
+pub struct RecordingEmailSender {
+    sent: Mutex<Vec<(String, String)>>,
+}
+
+impl RecordingEmailSender {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            sent: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Every `(to, code)` sent so far.
+    #[must_use]
+    pub fn sent(&self) -> Vec<(String, String)> {
+        self.sent.lock().unwrap().clone()
+    }
+}
+
+impl Default for RecordingEmailSender {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl EmailSender for RecordingEmailSender {
+    async fn send_enrollment_code(&self, to: &str, code: &str) -> anyhow::Result<()> {
+        self.sent
+            .lock()
+            .unwrap()
+            .push((to.to_string(), code.to_string()));
+        Ok(())
+    }
+
+    fn delivers(&self) -> bool {
+        false
+    }
+}
+
 // ── Builders ──────────────────────────────────────────────────────────────────
 
 /// A throwaway [`Config`] (no real listeners/PEM are opened in mock-backed tests).
@@ -887,6 +933,8 @@ pub fn test_config() -> Config {
         stripe_secret_key: "sk_test_dummy".to_string(),
         stripe_webhook_secret: "whsec_dummy".to_string(),
         account_base_url: "https://account.wardnet.test".to_string(),
+        resend_api_key: None,
+        email_from: "wardnet <noreply@wardnet.test>".to_string(),
     }
 }
 
@@ -904,6 +952,7 @@ pub struct Harness {
     pub store: MockStore,
     pub events: Arc<RecordingEventPublisher>,
     pub stripe: Arc<MockStripeGateway>,
+    pub email: Arc<RecordingEmailSender>,
     pub subscriptions: Arc<SubscriptionService>,
     pub tenants: Arc<TenantsService>,
 }
@@ -943,6 +992,7 @@ pub fn build_harness(seed: u8) -> Harness {
     let store = MockStore::new();
     let events: Arc<RecordingEventPublisher> = Arc::new(RecordingEventPublisher::new());
     let stripe: Arc<MockStripeGateway> = Arc::new(MockStripeGateway::new());
+    let email: Arc<RecordingEmailSender> = Arc::new(RecordingEmailSender::new());
     let signer = test_signer(seed);
     let verifier = Verifier::from_pem(jwt_keypair_pem(seed).1.as_bytes()).unwrap();
 
@@ -963,6 +1013,7 @@ pub fn build_harness(seed: u8) -> Harness {
         Arc::new(store.clone()),
         subscriptions.clone(),
         events.clone(),
+        email.clone(),
         signer,
         ["use1".to_string(), "eu1".to_string()],
     ));
@@ -977,6 +1028,7 @@ pub fn build_harness(seed: u8) -> Harness {
         store,
         events,
         stripe,
+        email,
         subscriptions,
         tenants,
     }

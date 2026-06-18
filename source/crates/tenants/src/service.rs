@@ -22,6 +22,7 @@ use wardnet_common::event::{DomainEvent, EventPublisher};
 use wardnet_common::token::{ClaimsSpec, PrincipalType, Signer};
 use wardnet_common::validation::{is_valid_name, validate_public_key};
 
+use crate::email::EmailSender;
 use crate::error::TenantsError;
 use crate::repository::{
     CreateTenantOutcome, Daemon, DaemonRepository, EnrollOutcome, EnrollmentRepository, Network,
@@ -57,6 +58,8 @@ pub struct TenantsService {
     subscriptions: Arc<SubscriptionService>,
     /// Domain-event sink for cross-aggregate side-effects.
     events: Arc<dyn EventPublisher>,
+    /// Transactional email for enrollment codes (Resend in prod, no-op in dev/test).
+    email: Arc<dyn EmailSender>,
     signer: Signer,
     /// The fleet's real regions; a network may only be created in one of these
     /// (otherwise no DDNS provisioner would ever pick it up).
@@ -75,6 +78,7 @@ impl TenantsService {
         enrollment: Arc<dyn EnrollmentRepository>,
         subscriptions: Arc<SubscriptionService>,
         events: Arc<dyn EventPublisher>,
+        email: Arc<dyn EmailSender>,
         signer: Signer,
         regions: impl IntoIterator<Item = String>,
     ) -> Self {
@@ -85,9 +89,17 @@ impl TenantsService {
             enrollment,
             subscriptions,
             events,
+            email,
             signer,
             regions: regions.into_iter().collect(),
         }
+    }
+
+    /// Whether enrollment codes are delivered by email (a real provider) — when so,
+    /// the API does not echo the code in the response.
+    #[must_use]
+    pub fn email_delivers(&self) -> bool {
+        self.email.delivers()
     }
 
     // ── Account plane ────────────────────────────────────────────────────────────
@@ -285,8 +297,9 @@ impl TenantsService {
 
     // ── Enrollment plane (codes + enroll + JWT) ──────────────────────────────────
 
-    /// Issue a new-signup one-time code for `email` (public, rate-limited). Returns
-    /// the raw code (emailed in production; returned to the caller for now).
+    /// Issue a new-signup one-time code for `email` (public, rate-limited) and email
+    /// it. Returns the raw code; the API echoes it only when no real email was sent
+    /// (dev) — see [`email_delivers`](Self::email_delivers).
     ///
     /// # Errors
     /// [`TenantsError::RateLimited`] past the per-IP hourly cap.
@@ -319,6 +332,10 @@ impl TenantsService {
                 Utc::now() + Duration::seconds(CODE_TTL_SECS),
             )
             .await?;
+        self.email
+            .send_enrollment_code(&email, &code)
+            .await
+            .map_err(TenantsError::Internal)?;
         Ok(code)
     }
 
@@ -349,6 +366,10 @@ impl TenantsService {
                 Utc::now() + Duration::seconds(CODE_TTL_SECS),
             )
             .await?;
+        self.email
+            .send_enrollment_code(&tenant.email, &code)
+            .await
+            .map_err(TenantsError::Internal)?;
         Ok(code)
     }
 

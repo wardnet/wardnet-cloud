@@ -54,6 +54,7 @@ rcgen = { workspace = true }
 reqwest = { workspace = true }
 tower = { workspace = true }
 serde_json = { workspace = true }
+wiremock = { workspace = true }
 
 [lints]
 workspace = true
