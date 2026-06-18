@@ -308,6 +308,29 @@ pub struct UpdateTenantRequest {
     pub subscription_status: String,
 }
 
+// ── Tenants — account-plane billing (Stripe) ────────────────────────────────────
+
+/// Request body for `POST /v1/tenants/{id}/billing/checkout-session`.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CreateCheckoutSessionRequest {
+    /// The Stripe Price id of the plan being purchased.
+    pub price_id: String,
+}
+
+/// Response body for the create-checkout-session endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CheckoutSessionResponse {
+    /// The Stripe-hosted Checkout URL to redirect the user to.
+    pub url: String,
+}
+
+/// Response body for the billing-portal endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BillingPortalResponse {
+    /// The Stripe-hosted Billing Portal URL to redirect the user to.
+    pub url: String,
+}
+
 // ── Tenants — mesh / SERVICE plane (work queue) ─────────────────────────────────
 
 /// Query for the reconcile scan (`GET /v1/networks`, mesh-mTLS plane). The

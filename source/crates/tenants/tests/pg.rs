@@ -21,7 +21,7 @@ use wardnet_tenants::repository::{
 use wardnet_tenants::service::TenantsService;
 use wardnet_tenants::subscription::{SubscriptionService, TrialPolicy};
 use wardnet_tenants::test_helpers::{
-    RecordingEventPublisher, daemon_keypair, pump_events, test_signer,
+    MockStripeGateway, RecordingEventPublisher, daemon_keypair, pump_events, test_signer,
 };
 
 const SEED: u8 = 5;
@@ -77,6 +77,7 @@ fn harness(pools: DbPools) -> PgHarness {
         Arc::new(PgSubscriptionRepository::new_pools(pools.clone()))
             as Arc<dyn SubscriptionRepository>,
         events.clone(),
+        Arc::new(MockStripeGateway::new()),
         TrialPolicy {
             trial_days: 60,
             trial_grace_days: 15,

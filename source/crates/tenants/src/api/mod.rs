@@ -7,6 +7,7 @@
 //! their own one-time-code / key-`PoP` credentials.
 
 mod availability;
+mod billing;
 mod codes;
 mod enroll;
 pub mod network;
@@ -38,6 +39,7 @@ use crate::state::AppState;
         (name = "enrollment", description = "Daemon enrollment + JWT issuance"),
         (name = "networks", description = "Network registration + availability"),
         (name = "tenants", description = "Account-plane tenant management"),
+        (name = "billing", description = "Stripe billing webhook + checkout/portal"),
     ),
     components(schemas(ErrorBody)),
 )]
@@ -45,10 +47,10 @@ struct ApiDoc;
 
 /// Build the public API router.
 pub fn router(state: AppState) -> Router {
-    // Bootstrap: health + credential-minting endpoints. No auth middleware — each
-    // verifies its own one-time code / key PoP.
-    let bootstrap = codes::register(token::register(enroll::register(health::register(
-        OpenApiRouter::new(),
+    // Bootstrap: health + credential-minting endpoints + the Stripe webhook. No auth
+    // middleware — each verifies its own one-time code / key PoP / Stripe signature.
+    let bootstrap = billing::register(codes::register(token::register(enroll::register(
+        health::register(OpenApiRouter::new()),
     ))));
 
     // Availability accepts a daemon (wizard) or a user (account plane).

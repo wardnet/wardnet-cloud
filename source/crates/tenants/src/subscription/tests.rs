@@ -10,7 +10,7 @@ use wardnet_common::event::DomainEvent;
 use crate::repository::SubscriptionRepository;
 use crate::repository::subscription::{Entitlement, Subscription, SubscriptionStatus};
 use crate::subscription::{SubscriptionService, TrialPolicy};
-use crate::test_helpers::{MockStore, RecordingEventPublisher};
+use crate::test_helpers::{MockStore, MockStripeGateway, RecordingEventPublisher};
 
 const POLICY: TrialPolicy = TrialPolicy {
     trial_days: 60,
@@ -28,6 +28,7 @@ fn service() -> (
     let svc = Arc::new(SubscriptionService::new(
         Arc::new(store.clone()) as Arc<dyn SubscriptionRepository>,
         events.clone(),
+        Arc::new(MockStripeGateway::new()),
         POLICY,
     ));
     (svc, store, events)
@@ -134,6 +135,143 @@ async fn expire_overdue_cancels_expired_trials_and_past_due() {
     assert_eq!(deactivations, 2);
 }
 
+// ── Stripe-driven lifecycle ─────────────────────────────────────────────────────
+
+use crate::stripe::{StripeEvent, StripeEventKind, SubscriptionData};
+
+fn upsert_event(
+    id: &str,
+    tenant_id: Option<&str>,
+    sid: &str,
+    status: SubscriptionStatus,
+) -> StripeEvent {
+    StripeEvent {
+        id: id.to_string(),
+        kind: StripeEventKind::SubscriptionUpsert(SubscriptionData {
+            tenant_id: tenant_id.map(str::to_string),
+            stripe_subscription_id: sid.to_string(),
+            stripe_customer_id: "cus_1".to_string(),
+            price_id: Some("price_pro".to_string()),
+            entitlement: Some(Entitlement {
+                max_networks: 3,
+                max_daemons: 10,
+            }),
+            status,
+            current_period_end: Some(Utc::now() + Duration::days(30)),
+        }),
+    }
+}
+
+#[tokio::test]
+async fn webhook_created_converts_trial_to_paid() {
+    let (svc, store, _events) = service();
+    svc.create_trial("t1").await.unwrap();
+
+    svc.apply_stripe_event(upsert_event(
+        "evt_1",
+        Some("t1"),
+        "sub_x",
+        SubscriptionStatus::Active,
+    ))
+    .await
+    .unwrap();
+
+    let current = svc.current("t1").await.unwrap().unwrap();
+    assert_eq!(current.status, SubscriptionStatus::Active);
+    assert_eq!(current.entitlement.max_networks, 3);
+    assert_eq!(current.entitlement.max_daemons, 10);
+    assert_eq!(current.stripe_subscription_id.as_deref(), Some("sub_x"));
+    // The trial row was superseded → only one live row, history has two.
+    assert_eq!(store.subscription_count("t1"), 2);
+}
+
+#[tokio::test]
+async fn webhook_redelivery_is_idempotent() {
+    let (svc, store, _events) = service();
+    svc.create_trial("t1").await.unwrap();
+    let event = upsert_event("evt_1", Some("t1"), "sub_x", SubscriptionStatus::Active);
+
+    svc.apply_stripe_event(event.clone()).await.unwrap();
+    // Same event id again — must not create a second paid row.
+    svc.apply_stripe_event(event).await.unwrap();
+    assert_eq!(store.subscription_count("t1"), 2);
+}
+
+#[tokio::test]
+async fn webhook_missing_price_metadata_does_not_grant() {
+    let (svc, store, _events) = service();
+    svc.create_trial("t1").await.unwrap();
+    let mut event = upsert_event("evt_1", Some("t1"), "sub_x", SubscriptionStatus::Active);
+    if let StripeEventKind::SubscriptionUpsert(ref mut data) = event.kind {
+        data.entitlement = None; // price had no max_networks/max_daemons metadata
+    }
+    svc.apply_stripe_event(event).await.unwrap();
+    // No paid row created; the trial is still the current subscription.
+    let current = svc.current("t1").await.unwrap().unwrap();
+    assert_eq!(current.status, SubscriptionStatus::Trialing);
+    assert_eq!(store.subscription_count("t1"), 1);
+}
+
+#[tokio::test]
+async fn webhook_deleted_cancels_and_deactivates() {
+    let (svc, _store, events) = service();
+    svc.create_trial("t1").await.unwrap();
+    svc.apply_stripe_event(upsert_event(
+        "evt_1",
+        Some("t1"),
+        "sub_x",
+        SubscriptionStatus::Active,
+    ))
+    .await
+    .unwrap();
+
+    svc.apply_stripe_event(StripeEvent {
+        id: "evt_2".to_string(),
+        kind: StripeEventKind::SubscriptionDeleted {
+            stripe_subscription_id: "sub_x".to_string(),
+        },
+    })
+    .await
+    .unwrap();
+
+    assert!(svc.current("t1").await.unwrap().is_none());
+    assert!(
+        events
+            .published()
+            .contains(&DomainEvent::SubscriptionDeactivated {
+                tenant_id: "t1".to_string()
+            })
+    );
+}
+
+#[tokio::test]
+async fn webhook_payment_failed_moves_to_past_due() {
+    let (svc, _store, _events) = service();
+    svc.create_trial("t1").await.unwrap();
+    svc.apply_stripe_event(upsert_event(
+        "evt_1",
+        Some("t1"),
+        "sub_x",
+        SubscriptionStatus::Active,
+    ))
+    .await
+    .unwrap();
+
+    svc.apply_stripe_event(StripeEvent {
+        id: "evt_2".to_string(),
+        kind: StripeEventKind::PaymentFailed {
+            stripe_subscription_id: "sub_x".to_string(),
+        },
+    })
+    .await
+    .unwrap();
+
+    let current = svc.current("t1").await.unwrap().unwrap();
+    assert_eq!(current.status, SubscriptionStatus::PastDue);
+    // Entitlement is preserved across the payment-failed transition.
+    assert_eq!(current.entitlement.max_networks, 3);
+}
+
 #[test]
 fn is_active_respects_status_and_grace() {
     let store = MockStore::new();
@@ -141,6 +279,7 @@ fn is_active_respects_status_and_grace() {
     let svc = SubscriptionService::new(
         Arc::new(store) as Arc<dyn SubscriptionRepository>,
         events,
+        Arc::new(MockStripeGateway::new()),
         POLICY,
     );
     let now = Utc::now();

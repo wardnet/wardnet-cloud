@@ -27,6 +27,7 @@ use crate::repository::subscription::{
 use crate::repository::tenant::{CreateTenantOutcome, Tenant, TenantRepository};
 use crate::service::TenantsService;
 use crate::state::AppState;
+use crate::stripe::{CheckoutSession, StripeEvent, StripeGateway};
 use crate::subscription::{SubscriptionService, TrialPolicy};
 
 // ── Key material ────────────────────────────────────────────────────────────────
@@ -788,6 +789,82 @@ impl EventPublisher for RecordingEventPublisher {
     }
 }
 
+// ── Mock Stripe gateway ─────────────────────────────────────────────────────────
+
+/// A recording [`StripeGateway`] fake: checkout/portal return canned URLs and record
+/// their calls; `construct_event` returns a pre-set [`StripeEvent`] (set by the
+/// webhook-endpoint test). No real Stripe — the signature crypto is `async-stripe`'s
+/// concern, not ours to re-test.
+/// A recorded `create_checkout_session` call: `(customer_id, email, price_id, tenant_id)`.
+pub type CheckoutCall = (Option<String>, String, String, String);
+
+pub struct MockStripeGateway {
+    checkout_url: String,
+    portal_url: String,
+    checkout_customer_id: Option<String>,
+    event: Mutex<Option<StripeEvent>>,
+    /// Recorded `create_checkout_session` calls.
+    pub checkouts: Mutex<Vec<CheckoutCall>>,
+}
+
+impl MockStripeGateway {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            checkout_url: "https://checkout.stripe.test/session".to_string(),
+            portal_url: "https://billing.stripe.test/portal".to_string(),
+            checkout_customer_id: None,
+            event: Mutex::new(None),
+            checkouts: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Set the event `construct_event` will return (webhook-endpoint tests).
+    pub fn set_event(&self, event: StripeEvent) {
+        *self.event.lock().unwrap() = Some(event);
+    }
+}
+
+impl Default for MockStripeGateway {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl StripeGateway for MockStripeGateway {
+    async fn create_checkout_session(
+        &self,
+        customer_id: Option<&str>,
+        email: &str,
+        price_id: &str,
+        tenant_id: &str,
+    ) -> anyhow::Result<CheckoutSession> {
+        self.checkouts.lock().unwrap().push((
+            customer_id.map(str::to_string),
+            email.to_string(),
+            price_id.to_string(),
+            tenant_id.to_string(),
+        ));
+        Ok(CheckoutSession {
+            url: self.checkout_url.clone(),
+            customer_id: self.checkout_customer_id.clone(),
+        })
+    }
+
+    async fn create_billing_portal_session(&self, _customer_id: &str) -> anyhow::Result<String> {
+        Ok(self.portal_url.clone())
+    }
+
+    fn construct_event(&self, _payload: &[u8], _sig_header: &str) -> anyhow::Result<StripeEvent> {
+        self.event
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no canned event set on MockStripeGateway"))
+    }
+}
+
 // ── Builders ──────────────────────────────────────────────────────────────────
 
 /// A throwaway [`Config`] (no real listeners/PEM are opened in mock-backed tests).
@@ -807,6 +884,9 @@ pub fn test_config() -> Config {
         trial_grace_days: 15,
         payment_grace_days: 15,
         sub_reaper_interval_secs: 3600,
+        stripe_secret_key: "sk_test_dummy".to_string(),
+        stripe_webhook_secret: "whsec_dummy".to_string(),
+        account_base_url: "https://account.wardnet.test".to_string(),
     }
 }
 
@@ -823,6 +903,7 @@ pub struct Harness {
     pub state: AppState,
     pub store: MockStore,
     pub events: Arc<RecordingEventPublisher>,
+    pub stripe: Arc<MockStripeGateway>,
     pub subscriptions: Arc<SubscriptionService>,
     pub tenants: Arc<TenantsService>,
 }
@@ -861,12 +942,14 @@ pub async fn pump_events(
 pub fn build_harness(seed: u8) -> Harness {
     let store = MockStore::new();
     let events: Arc<RecordingEventPublisher> = Arc::new(RecordingEventPublisher::new());
+    let stripe: Arc<MockStripeGateway> = Arc::new(MockStripeGateway::new());
     let signer = test_signer(seed);
     let verifier = Verifier::from_pem(jwt_keypair_pem(seed).1.as_bytes()).unwrap();
 
     let subscriptions = Arc::new(SubscriptionService::new(
         Arc::new(store.clone()),
         events.clone(),
+        stripe.clone(),
         TrialPolicy {
             trial_days: 60,
             trial_grace_days: 15,
@@ -893,6 +976,7 @@ pub fn build_harness(seed: u8) -> Harness {
         state,
         store,
         events,
+        stripe,
         subscriptions,
         tenants,
     }

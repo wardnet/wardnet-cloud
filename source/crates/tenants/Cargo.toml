@@ -31,6 +31,8 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+async-stripe = { workspace = true }
+reqwest = { workspace = true }
 
 ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }

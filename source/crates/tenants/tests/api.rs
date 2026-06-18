@@ -15,6 +15,9 @@ use tower::ServiceExt;
 
 use wardnet_common::token::{ClaimsSpec, PrincipalType, canonical_request_payload};
 use wardnet_tenants::api;
+use wardnet_tenants::repository::subscription::SubscriptionStatus;
+use wardnet_tenants::repository::tenant::Tenant;
+use wardnet_tenants::stripe::{StripeEvent, StripeEventKind, SubscriptionData};
 use wardnet_tenants::test_helpers::{build_harness, build_state, daemon_keypair, test_signer};
 
 const SEED: u8 = 5;
@@ -353,4 +356,106 @@ async fn user_cannot_read_another_tenant() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn checkout_session_returns_stripe_url() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    h.store.seed_tenant(Tenant {
+        id: "tb".to_string(),
+        email: "owner@b.com".to_string(),
+        created_at: chrono::Utc::now(),
+        deregistered_at: None,
+    });
+    let token = user_token("tb");
+
+    let body = serde_json::to_vec(&json!({"price_id": "price_pro"})).unwrap();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tenants/tb/billing/checkout-session")
+                .header("content-type", "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(resp).await["url"],
+        json!("https://checkout.stripe.test/session")
+    );
+    // The service forwarded email + price + tenant to the gateway.
+    let checkouts = h.stripe.checkouts.lock().unwrap();
+    assert_eq!(checkouts.len(), 1);
+    assert_eq!(checkouts[0].1, "owner@b.com");
+    assert_eq!(checkouts[0].2, "price_pro");
+    assert_eq!(checkouts[0].3, "tb");
+}
+
+#[tokio::test]
+async fn stripe_webhook_converts_trial_to_paid() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    h.store.seed_tenant(Tenant {
+        id: "tw".to_string(),
+        email: "w@b.com".to_string(),
+        created_at: chrono::Utc::now(),
+        deregistered_at: None,
+    });
+    h.subscriptions.create_trial("tw").await.unwrap();
+
+    // The mock gateway returns this verified event regardless of the raw body/sig.
+    h.stripe.set_event(StripeEvent {
+        id: "evt_1".to_string(),
+        kind: StripeEventKind::SubscriptionUpsert(SubscriptionData {
+            tenant_id: Some("tw".to_string()),
+            stripe_subscription_id: "sub_w".to_string(),
+            stripe_customer_id: "cus_w".to_string(),
+            price_id: Some("price_pro".to_string()),
+            entitlement: Some(wardnet_common::contract::Entitlement {
+                max_networks: 5,
+                max_daemons: 20,
+            }),
+            status: SubscriptionStatus::Active,
+            current_period_end: Some(chrono::Utc::now()),
+        }),
+    });
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/billing/stripe/webhook")
+                .header("Stripe-Signature", "t=1,v1=deadbeef")
+                .body(Body::from(b"{}".to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let current = h.store.current_subscription("tw").unwrap();
+    assert_eq!(current.status, SubscriptionStatus::Active);
+    assert_eq!(current.entitlement.max_networks, 5);
+}
+
+#[tokio::test]
+async fn stripe_webhook_without_signature_is_bad_request() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/billing/stripe/webhook")
+                .body(Body::from(b"{}".to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }

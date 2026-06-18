@@ -13,7 +13,8 @@ use utoipa_axum::routes;
 
 use wardnet_common::auth::{AuthCaller, Caller};
 use wardnet_common::contract::{
-    CodeResponse, DaemonView, NetworkView, RegisterTenantRequest, SubscriptionView, TenantView,
+    BillingPortalResponse, CheckoutSessionResponse, CodeResponse, CreateCheckoutSessionRequest,
+    DaemonView, NetworkView, RegisterTenantRequest, SubscriptionView, TenantView,
     UpdateTenantRequest,
 };
 
@@ -31,6 +32,8 @@ pub fn register(router: OpenApiRouter<AppState>) -> OpenApiRouter<AppState> {
         .routes(routes!(list_network_daemons))
         .routes(routes!(update_tenant, delete_tenant))
         .routes(routes!(delete_network))
+        .routes(routes!(create_checkout_session))
+        .routes(routes!(billing_portal))
 }
 
 // ── Domain → contract conversions (orphan rule OK: the domain type is local) ───
@@ -250,4 +253,54 @@ async fn delete_tenant(
     // Idempotent: a repeat call on an already-tombstoned tenant still returns 202.
     state.tenants().deregister_tenant(&id).await?;
     Ok(StatusCode::ACCEPTED)
+}
+
+#[utoipa::path(
+    post, path = "/v1/tenants/{id}/billing/checkout-session", tag = "tenants",
+    description = "Start a Stripe Checkout for a plan; returns the URL to redirect to.",
+    request_body = CreateCheckoutSessionRequest,
+    responses(
+        (status = 200, description = "Checkout session created", body = CheckoutSessionResponse),
+        (status = 401, description = "Unauthenticated"),
+        (status = 403, description = "Not your tenant"),
+        (status = 404, description = "No such tenant"),
+    ),
+)]
+async fn create_checkout_session(
+    State(state): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+    Path(id): Path<String>,
+    Json(body): Json<CreateCheckoutSessionRequest>,
+) -> Result<Json<CheckoutSessionResponse>, ApiError> {
+    require_owner(&caller, &id)?;
+    let (tenant, _) = state
+        .tenants()
+        .find_tenant(&id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("no such tenant".to_string()))?;
+    let url = state
+        .subscriptions()
+        .start_checkout(&id, &tenant.email, &body.price_id)
+        .await?;
+    Ok(Json(CheckoutSessionResponse { url }))
+}
+
+#[utoipa::path(
+    post, path = "/v1/tenants/{id}/billing/portal", tag = "tenants",
+    description = "Create a Stripe Billing Portal session; returns the URL to redirect to.",
+    responses(
+        (status = 200, description = "Portal session created", body = BillingPortalResponse),
+        (status = 400, description = "Tenant has no billing account yet"),
+        (status = 401, description = "Unauthenticated"),
+        (status = 403, description = "Not your tenant"),
+    ),
+)]
+async fn billing_portal(
+    State(state): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+    Path(id): Path<String>,
+) -> Result<Json<BillingPortalResponse>, ApiError> {
+    require_owner(&caller, &id)?;
+    let url = state.subscriptions().billing_portal(&id).await?;
+    Ok(Json(BillingPortalResponse { url }))
 }

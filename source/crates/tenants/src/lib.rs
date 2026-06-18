@@ -19,6 +19,7 @@ pub mod mesh;
 pub mod repository;
 pub mod service;
 pub mod state;
+pub mod stripe;
 pub mod subscription;
 
 // Mocks + fixtures shared by unit and integration tests. Doc-hidden and not

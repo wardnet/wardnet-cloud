@@ -15,6 +15,7 @@ use wardnet_tenants::{
     },
     service::TenantsService,
     state::AppState,
+    stripe::StripeClient,
     subscription::{SubscriptionService, TrialPolicy, reactor},
 };
 
@@ -65,10 +66,19 @@ async fn main() -> anyhow::Result<()> {
     // cross-aggregate write call).
     let events: Arc<dyn EventPublisher> = Arc::new(BroadcastEventBus::new(EVENT_BUS_CAPACITY));
 
+    // Stripe gateway (real async-stripe client; the signature secret is the webhook
+    // credential). Secrets arrive in the env via inforge, like the DSN.
+    let stripe = Arc::new(StripeClient::new(
+        &config.stripe_secret_key,
+        &config.stripe_webhook_secret,
+        &config.account_base_url,
+    ));
+
     // Build the subscription aggregate first (Tenants reads it via a service method).
     let subscriptions = Arc::new(SubscriptionService::new(
         subscriptions_repo as Arc<dyn SubscriptionRepository>,
         Arc::clone(&events),
+        stripe,
         TrialPolicy {
             trial_days: config.trial_days,
             trial_grace_days: config.trial_grace_days,

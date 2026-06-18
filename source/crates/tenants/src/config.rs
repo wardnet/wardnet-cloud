@@ -51,6 +51,15 @@ pub struct Config {
     pub payment_grace_days: i64,
     /// Interval (seconds) between subscription-reaper + reconcile passes. Default 3600.
     pub sub_reaper_interval_secs: u64,
+
+    /// Stripe secret API key (inforge-injected, like the DSN). Redacted in `Debug`.
+    pub stripe_secret_key: String,
+    /// Stripe webhook signing secret — the credential the webhook endpoint verifies.
+    /// Redacted in `Debug`.
+    pub stripe_webhook_secret: String,
+    /// Base URL of the account SPA; Stripe checkout success/cancel + portal return
+    /// URLs hang off it.
+    pub account_base_url: String,
 }
 
 impl std::fmt::Debug for Config {
@@ -70,6 +79,9 @@ impl std::fmt::Debug for Config {
             .field("trial_grace_days", &self.trial_grace_days)
             .field("payment_grace_days", &self.payment_grace_days)
             .field("sub_reaper_interval_secs", &self.sub_reaper_interval_secs)
+            .field("stripe_secret_key", &"<redacted>")
+            .field("stripe_webhook_secret", &"<redacted>")
+            .field("account_base_url", &self.account_base_url)
             .finish()
     }
 }
@@ -115,6 +127,9 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3600),
+            stripe_secret_key: required("STRIPE_SECRET_KEY")?,
+            stripe_webhook_secret: required("STRIPE_WEBHOOK_SECRET")?,
+            account_base_url: required("ACCOUNT_BASE_URL")?,
         })
     }
 }
