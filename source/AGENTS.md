@@ -27,6 +27,14 @@ Conventions and invariants for agents working inside `source/`.
 > a scope-direction rule (no per-peer-service allowlist); initiators pin an
 > `ExpectedPeer{service,scope}`. `ServiceIdentity` is now structured
 > `{trust_domain,env,scope,service}`. See `docs/adr/0005` and invariants #18/#19.
+>
+> **WS-G (2026-06-18):** billing landed. Entitlement is **granted by a `subscriptions`
+> aggregate** (not the tenant — `tenants` is identity-only now), with a card-less
+> managed **trial** + grace windows; **Stripe** drives the paid lifecycle (webhook +
+> checkout/portal), entitlement from price metadata; **Resend** emails enrollment codes.
+> Cross-aggregate side-effects flow through **in-process domain events + reactors**
+> (`wardnet_common::event`) — no service touches another aggregate's repository. See
+> `docs/adr/0006`, `docs/adr/0007`, and invariants #22/#23/#24.
 
 > **Status:** invariants tagged `[#444]`/`[#445]` describe the agreed target architecture (SNI/tunnel
 > data plane, PostgreSQL/Neon, runtime `SecretsProvider`, multi-node `TunnelRouter`) and land with those
@@ -47,7 +55,8 @@ e2e scenario; see "Cross-service end-to-end tests" below):
   stream-generic `connection`), `mtls` (SPIFFE mesh mTLS: `SpiffeId`/`ExpectedPeer`, the SNI-ignoring
   `client_config_from_pem`/`mesh_client` initiator side, `server_config_from_pem` + `peer_spiffe_id`
   acceptor side, the hot-reload holders `MeshClient`/`ReloadableServerConfig`, and `watch_mesh_files`),
-  generic `health::register`, the
+  the in-process `event` bus (`EventPublisher` / `BroadcastEventBus` / `DomainEvent` — the
+  cross-aggregate decoupling substrate, invariant #23), generic `health::register`, the
   env-`config` helpers, and — transiently, until enrollment is redesigned — `pow`.
 - **`crates/tenants`** (bin `wardnet-tenants`, lib `wardnet_tenants`) — the global identity/naming
   service, carved out of `cloud` in WS-B. Owns the identity + challenge repos, the JWT `Signer`,
@@ -63,7 +72,11 @@ e2e scenario; see "Cross-service end-to-end tests" below):
   N-replica-safe) FK-cascade-deletes tombstoned tenants once their networks are gone. The email is freed
   for a fresh signup the moment the tombstone is set — a **partial unique index** (`email WHERE
   deregistered_at IS NULL`) means only live tenants reserve it, and `mint_jwt`/`enroll` reject a
-  tombstoned tenant. Depends on `wardnet_common`.
+  tombstoned tenant. **Billing (WS-G):** a separate `SubscriptionService` owns the `subscriptions`
+  aggregate (entitlement source, trial + grace, Stripe lifecycle via the `stripe` `StripeGateway`); a
+  `subscription` + `network` **reactor** apply `wardnet_common::event` domain events (invariants
+  #22/#23); the `email` `EmailSender` (Resend / dev no-op) sends enrollment codes. Depends on
+  `wardnet_common`, `async-stripe`, and `reqwest`.
 - **`crates/ddns`** (bin `wardnet-ddns`, lib `wardnet_ddns`) — the regional DNS reconciler, carved out
   of `cloud` in WS-C. A stateless controller that drives Cloudflare toward the desired state Tenants owns
   (ADR-0001): a short-interval **provisioner** + long-interval **reaper** (`src/reconcile.rs`) that drain
@@ -149,6 +162,12 @@ do not pin versions per-crate. Lints come from `[workspace.lints.clippy]` (pedan
 20. **DDNS A-record creation is the provisioner's alone, and is adopt-or-create + CAS.** Only `DdnsService::provision` (the provisioner) creates a Cloudflare A record; **report-IP only ever updates in place** (`OperationalRepository::record_ip` writes the `ip` column only — never `fqdn`/`cf_a_record_id`), so a daemon's IP report can never resurrect a record the reaper just deleted. To tolerate N regional replicas, `provision` adopts an existing record for the FQDN or creates one, then CAS-claims the id (`WHERE cf_a_record_id IS NULL`); on a lost CAS it deletes its record **only if** that record is not the one the winner stored. Do not add a create path to report-IP, and do not drop the `cf_a_record_id IS NULL` guard on the claim. See ADR-0003.
 
 21. **Every API request/response DTO lives in `wardnet_common::contract`, shared by producer and consumer.** A DTO defined in the producing service and re-declared (a "deserialize twin") in the consumer drifts silently; instead both crates depend on the one type in `common::contract`, so a producer change is a compile error on the consumer (`ErrorBody` is the original precedent). This covers the whole wire surface — bootstrap/daemon/account/mesh DTOs alike — including the embedded value objects (`ProvisioningState`, `SubscriptionStatus`, `Entitlement`), which also double as Tenants' DB-domain enums (their `as_str`/`from_db` helpers live on the contract type). A resource view (`NetworkView`/`TenantView`/`DaemonView`) is the **full** resource, never trimmed to one caller's current needs; tolerant consumers read only the fields they use. The `impl From<DomainType> for ContractDTO` conversion stays in the owning service crate (orphan-rule-legal, since the domain type is local). Do **not** add a second copy of a DTO in a service crate, and do not narrow a view to a caller.
+
+22. **Entitlement is granted by the current subscription, never the tenant.** The `tenants` row is identity-only; all billing/entitlement state lives on the `subscriptions` aggregate (1:N history, one live row per tenant via the `uq_subscriptions_live` partial unique index; the free trial is itself a `trialing` row). `mint_jwt` / `register_network` read the entitlement + `is_active` (trial / payment grace) via `SubscriptionService::current` — a service method, never the subscription repo. The status enum's `from_db` maps unknown → `Canceled` (**safe-closed**: an unknown billing state must not grant service), and a webhook with missing price metadata **declines to grant** rather than guessing. See `docs/adr/0006`.
+
+23. **A service holds only its own aggregate's repositories; cross-aggregate side-effects flow through domain events + idempotent reactors — never a foreign repository and never a direct cross-aggregate write.** `TenantsService` (tenants/networks/daemons/enrollment) must **never** hold `SubscriptionRepository`; `SubscriptionService` must **never** hold `NetworkRepository`. Reads are direct *service-method* calls (`TenantsService` → `SubscriptionService::current`, a one-way edge); write-side side-effects are published as `DomainEvent`s (`wardnet_common::event`) and applied by reactors that call the **owning** service's method (`TenantCreated` → `create_trial`; `SubscriptionDeactivated` → `deprovision_networks_for`). The broadcast bus is best-effort, so reactors are idempotent and a periodic `TenantsService::reconcile` is the dropped-event safety net (backfill a missing trial / deprovision an unsubscribed tenant). See `docs/adr/0007`.
+
+24. **Stripe is reached behind the `StripeGateway` trait; the webhook is a self-verifying bootstrap endpoint.** `async-stripe` (rustls runtime, openssl-free) is the production gateway; tests use a recording fake, so `SubscriptionService` (and `apply_stripe_event`) never touch `async-stripe`. `POST /v1/billing/stripe/webhook` carries no JWT layer — the **`Stripe-Signature` header is the credential**, verified in the handler (`security(())`), and applies idempotently via the `processed_stripe_events` ledger (Stripe redelivers). Stripe/Resend secrets (`STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` / `RESEND_API_KEY`) arrive in the env via inforge like the DSN, are redacted in `Config`'s `Debug`, and use dummies in dev/test.
 
 ## Test placement
 

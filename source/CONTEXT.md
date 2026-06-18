@@ -5,8 +5,16 @@ details. (See `docs/adr/` for the decisions behind these.)
 
 ## Identity & accounts
 
-- **Tenant** — an account: an email, an [entitlement](#entitlement), and a
-  subscription. The root of ownership. Lives in the global Tenants DB.
+- **Tenant** — an account: just an identity (an email). The root of ownership; its
+  billing/entitlement state lives on its [subscription](#subscription), not on the
+  tenant row. Lives in the global Tenants DB.
+- **Subscription** — the billing aggregate that **grants** a tenant's
+  [entitlement](#entitlement). A tenant has a 1:N history with at most one **live**
+  (non-canceled) row — its *current* subscription. Status is `trialing → active →
+  past_due → canceled` (Stripe-driven once paid). The free [trial](#trial) is itself
+  a subscription row. Owned by `SubscriptionService`; no other service touches it.
+- **Plan** — a purchasable tier, defined as a Stripe Price whose metadata carries the
+  `max_networks` / `max_daemons` it grants. Adding a plan is a Stripe change, no deploy.
 - **Network** — one wardnet network owned by a tenant. Holds a globally-unique
   **vanity slug** and a [provisioning state](#provisioning-state). The DNS record
   belongs to the network, not to any single device. A tenant may own several.
@@ -14,8 +22,20 @@ details. (See `docs/adr/` for the decisions behind these.)
   network may have many daemons (active/active); each authenticates and is issued
   tokens independently.
 - **Vanity / slug** — the network's public name (`<slug>.<zone>`); globally unique.
-- **Entitlement** — the per-tenant limits a subscription grants: at minimum
-  `max_networks` and `max_daemons`. Default for a self-service tenant: 1 / 1.
+- **Entitlement** — the limits a [subscription](#subscription)'s plan grants: at
+  minimum `max_networks` and `max_daemons`. Default for the free trial: 1 / 1.
+- **Trial** — the card-less free [subscription](#subscription) a tenant starts with
+  (`trialing`, `1/1`, `trial_expires_at = now + TRIAL_DAYS`). Service continues
+  through a **grace** window past expiry, after which the reaper cancels it.
+- **Grace** — the extra window a `trialing` (post-`trial_expires_at`) or `past_due`
+  (post-`current_period_end`) subscription keeps service before the subscription
+  reaper cancels it (cascading network deprovisioning). Two configurable windows
+  (trial grace, payment grace), both 15 days by default.
+- **Checkout session** — the Stripe-hosted page a user is redirected to (from the
+  account plane) to subscribe to a plan; on completion the webhook converts the trial
+  to a paid subscription.
+- **Billing portal** — the Stripe-hosted page where a user manages their payment
+  method / subscription; reached via a portal session from the account plane.
 - **Deregister** — the account-closing act: the tenant is **tombstoned**, all its
   networks are cascaded to [deprovisioning](#provisioning-state), and its
   subscription is canceled. Idempotent. Distinct from a subscription cancel (which
@@ -27,8 +47,34 @@ details. (See `docs/adr/` for the decisions behind these.)
   itself lingers until the **sweep** removes it.
 - **Sweep** — the periodic reaper that deletes tombstoned tenants once their
   networks are fully deprovisioned (the DDNS reaper having torn down DNS first),
-  FK-cascading the tenant's daemons, codes, and pending enrollments. N-replica-safe
-  and idempotent.
+  FK-cascading the tenant's subscriptions, daemons, codes, and pending enrollments.
+  N-replica-safe and idempotent.
+- **Deregister** — the account-closing act: the tenant is **tombstoned**, all its
+  networks are cascaded to [deprovisioning](#provisioning-state), and its
+  subscription is canceled. Idempotent. Distinct from a subscription cancel (which
+  is reversible and leaves the account intact). The owning user triggers it
+  (`DELETE /v1/tenants/{id}`).
+- **Tombstone** — the terminal marker (`deregistered_at`) on a deregistered tenant.
+  A tombstoned tenant cannot mint tokens or enroll daemons, and its email is freed
+  for a fresh signup immediately (only *live* tenants reserve their email). The row
+  itself lingers until the **sweep** removes it.
+- **Sweep** — the periodic reaper that deletes tombstoned tenants once their
+  networks are fully deprovisioned (the DDNS reaper having torn down DNS first),
+  FK-cascading the tenant's subscriptions, daemons, codes, and pending enrollments.
+  N-replica-safe and idempotent.
+
+## Eventing & reconciliation
+
+- **Domain event** — an in-process signal a service raises so another aggregate can
+  react, instead of one service reaching into another's repository (`TenantCreated`,
+  `TenantDeregistered`, `SubscriptionDeactivated`). Best-effort delivery (a broadcast
+  bus); the reconcile is the guarantee. See `docs/adr/0007`.
+- **Reactor** — a long-running loop subscribed to the event bus that turns a domain
+  event into a call on the **owning** service's method (e.g. `TenantCreated` →
+  `SubscriptionService::create_trial`; `SubscriptionDeactivated` →
+  `TenantsService::deprovision_networks_for`). Idempotent, so a redelivery is harmless.
+- **Reconcile** — the periodic safety net that re-derives desired state for any dropped
+  event: it backfills a missing trial and deprovisions an unsubscribed tenant's networks.
 
 ## Enrollment credentials
 
