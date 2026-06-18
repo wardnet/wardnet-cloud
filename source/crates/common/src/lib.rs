@@ -12,6 +12,7 @@ pub mod contract;
 pub mod db;
 pub mod dns_provider;
 pub mod error;
+pub mod event;
 pub mod health;
 pub mod mtls;
 pub mod proxy_protocol;
