@@ -235,15 +235,24 @@ impl SubscriptionService {
     /// # Errors
     /// [`SubscriptionError::Internal`] on a repository failure.
     pub async fn apply_stripe_event(&self, event: StripeEvent) -> Result<(), SubscriptionError> {
-        if !self
-            .subscriptions
-            .record_event(&event.id, Utc::now())
-            .await?
-        {
+        // Fast-path dedupe. The id is recorded only AFTER a successful apply (below),
+        // so a failed apply stays un-recorded and Stripe's retry re-applies it — the
+        // ledger must never mark an event done before its effect lands.
+        if self.subscriptions.is_event_processed(&event.id).await? {
             tracing::debug!(event_id = %event.id, "stripe event already processed; skipping");
             return Ok(());
         }
-        match event.kind {
+        self.apply_event_kind(event.kind).await?;
+        self.subscriptions
+            .record_event(&event.id, Utc::now())
+            .await?;
+        Ok(())
+    }
+
+    /// Apply the event's effect. Each branch is idempotent, so an at-least-once
+    /// redelivery (or a retry after a recorded-but-failed apply) is safe.
+    async fn apply_event_kind(&self, kind: StripeEventKind) -> Result<(), SubscriptionError> {
+        match kind {
             StripeEventKind::SubscriptionUpsert(data) => self.apply_upsert(data).await?,
             StripeEventKind::SubscriptionDeleted {
                 stripe_subscription_id,

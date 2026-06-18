@@ -127,9 +127,14 @@ pub trait SubscriptionRepository: Send + Sync {
         payment_cutoff: DateTime<Utc>,
     ) -> anyhow::Result<Vec<String>>;
 
-    /// Record a processed Stripe event id. Returns `true` if newly recorded, `false`
-    /// if it was already present (a redelivery to short-circuit).
-    async fn record_event(&self, event_id: &str, now: DateTime<Utc>) -> anyhow::Result<bool>;
+    /// Whether a Stripe event id has already been processed (the fast-path dedupe
+    /// read). Checked **before** applying; the id is recorded only **after** a
+    /// successful apply, so a failed apply leaves it un-recorded and Stripe's retry
+    /// re-applies it.
+    async fn is_event_processed(&self, event_id: &str) -> anyhow::Result<bool>;
+
+    /// Record a processed Stripe event id (after a successful apply). Idempotent.
+    async fn record_event(&self, event_id: &str, now: DateTime<Utc>) -> anyhow::Result<()>;
 }
 
 /// `PostgreSQL`-backed [`SubscriptionRepository`].
@@ -324,16 +329,25 @@ impl SubscriptionRepository for PgSubscriptionRepository {
         Ok(ids)
     }
 
-    async fn record_event(&self, event_id: &str, now: DateTime<Utc>) -> anyhow::Result<bool> {
-        let affected = sqlx::query(
+    async fn is_event_processed(&self, event_id: &str) -> anyhow::Result<bool> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM processed_stripe_events WHERE event_id = $1)",
+        )
+        .bind(event_id)
+        .fetch_one(&self.pools.read)
+        .await?;
+        Ok(exists)
+    }
+
+    async fn record_event(&self, event_id: &str, now: DateTime<Utc>) -> anyhow::Result<()> {
+        sqlx::query(
             "INSERT INTO processed_stripe_events (event_id, processed_at) VALUES ($1, $2) \
              ON CONFLICT (event_id) DO NOTHING",
         )
         .bind(event_id)
         .bind(now)
         .execute(&self.pools.write)
-        .await?
-        .rows_affected();
-        Ok(affected == 1)
+        .await?;
+        Ok(())
     }
 }

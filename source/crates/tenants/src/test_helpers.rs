@@ -728,13 +728,17 @@ impl SubscriptionRepository for MockStore {
             .collect())
     }
 
-    async fn record_event(&self, event_id: &str, _now: DateTime<Utc>) -> anyhow::Result<bool> {
-        Ok(self
-            .0
+    async fn is_event_processed(&self, event_id: &str) -> anyhow::Result<bool> {
+        Ok(self.0.lock().unwrap().processed_events.contains(event_id))
+    }
+
+    async fn record_event(&self, event_id: &str, _now: DateTime<Utc>) -> anyhow::Result<()> {
+        self.0
             .lock()
             .unwrap()
             .processed_events
-            .insert(event_id.to_string()))
+            .insert(event_id.to_string());
+        Ok(())
     }
 }
 
