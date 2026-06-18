@@ -34,8 +34,10 @@ Conventions and invariants for agents working inside `source/`.
 
 ## Workspace layout
 
-`source/` is a Cargo workspace (`source/Cargo.toml`, `resolver = "3"`, edition 2024) with four members
-(`common`, `tenants`, `ddns`, `tunneller`):
+`source/` is a Cargo workspace (`source/Cargo.toml`, `resolver = "3"`, edition 2024) with six members:
+the four service crates (`common`, `tenants`, `ddns`, `tunneller`) plus two non-published support members
+— `xtask` (dev tooling, incl. the `gen-certs` mesh cert generator) and `end2end-tests/mesh` (a docker-compose
+e2e scenario; see "Cross-service end-to-end tests" below):
 
 - **`crates/common`** (lib `wardnet_common`) — everything genuinely cross-service: `token`, `mtls`,
   `proxy_protocol` (incl. `client_ip`), `replay_cache`, `dns_provider`, `db` (`DbPools` / `connect`),
