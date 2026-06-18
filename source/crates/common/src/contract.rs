@@ -86,13 +86,22 @@ impl Default for Entitlement {
     }
 }
 
-/// Subscription state. Drives the network-deprovisioning cascade on cancel.
+/// Subscription lifecycle. A tenant's **current** subscription is its single
+/// non-`Canceled` row; losing it (or its cancel) cascades the tenant's networks to
+/// `deprovisioning`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SubscriptionStatus {
-    /// Live subscription (or trial).
+    /// Free trial — no card, no Stripe subscription yet. Entitled until
+    /// `trial_expires_at + grace`, after which the reaper cancels it.
+    Trialing,
+    /// Live paid subscription (Stripe `active`/`trialing`).
     Active,
-    /// Cancelled — its networks are cascaded to `deprovisioning`.
+    /// A payment failed (Stripe `past_due`). Entitled through the payment grace
+    /// window (`current_period_end + grace`); the reaper cancels it past that.
+    PastDue,
+    /// Terminal — no longer the current subscription; its networks are cascaded to
+    /// `deprovisioning`.
     Canceled,
 }
 
@@ -101,17 +110,22 @@ impl SubscriptionStatus {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            SubscriptionStatus::Trialing => "trialing",
             SubscriptionStatus::Active => "active",
+            SubscriptionStatus::PastDue => "past_due",
             SubscriptionStatus::Canceled => "canceled",
         }
     }
 
-    /// Parse from the DB/text form (unknown → `Active`, the safe default).
+    /// Parse from the DB/text form. An unrecognized value maps to `Canceled` — the
+    /// **safe-closed** default: an unknown billing state must never grant service.
     #[must_use]
     pub fn from_db(s: &str) -> Self {
         match s {
-            "canceled" => SubscriptionStatus::Canceled,
-            _ => SubscriptionStatus::Active,
+            "trialing" => SubscriptionStatus::Trialing,
+            "active" => SubscriptionStatus::Active,
+            "past_due" => SubscriptionStatus::PastDue,
+            _ => SubscriptionStatus::Canceled,
         }
     }
 }
@@ -133,17 +147,55 @@ pub struct NetworkView {
     pub updated_at: DateTime<Utc>,
 }
 
+/// The full **Subscription** resource — the billing aggregate that grants a
+/// tenant's [`Entitlement`]. Producer: Tenants (account plane + embedded in
+/// [`TenantView`]). A tenant's *current* subscription is its single non-`Canceled`
+/// row; `Canceled` rows are history and are never embedded as current.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SubscriptionView {
+    pub id: String,
+    pub status: SubscriptionStatus,
+    /// The limits this subscription's plan grants.
+    pub entitlement: Entitlement,
+    /// Stripe Customer handle (the tenant's stable billing identity); `None` until
+    /// the tenant first reaches checkout.
+    pub stripe_customer_id: Option<String>,
+    /// Stripe Subscription handle; `None` while still on the card-less trial.
+    pub stripe_subscription_id: Option<String>,
+    /// The purchased Stripe Price id; `None` on the trial.
+    pub price_id: Option<String>,
+    /// When the free trial lapses (a `Trialing` subscription only).
+    pub trial_expires_at: Option<DateTime<Utc>>,
+    /// End of the current paid period (a paid subscription only).
+    pub current_period_end: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl SubscriptionView {
+    /// Whether this subscription currently entitles the tenant to service.
+    ///
+    /// A subscription embedded as a tenant's *current* one is, by construction,
+    /// non-`Canceled` — the grace windows are enforced producer-side (the reaper
+    /// cancels a trial/past-due subscription once its grace lapses, dropping it out
+    /// of "current"). So a consumer (e.g. the Tunneller) treats any current
+    /// subscription as entitling and a *missing* one as not.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        !matches!(self.status, SubscriptionStatus::Canceled)
+    }
+}
+
 /// The full **Tenant** resource. Producer: Tenants (account plane + the mesh
 /// `GET /v1/tenants/{id}` resource read). Consumer: the Tunneller subscription
-/// check.
+/// check (reads the embedded current subscription).
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TenantView {
     pub id: String,
     pub email: String,
-    pub entitlement: Entitlement,
-    pub subscription_status: SubscriptionStatus,
-    /// Provider-agnostic subscription handle; `None` until billing is wired.
-    pub subscription_id: Option<String>,
+    /// The tenant's current (non-`Canceled`) subscription, or `None` if it has no
+    /// live subscription (trial reaped / fully canceled) — i.e. not entitled.
+    pub subscription: Option<SubscriptionView>,
     pub created_at: DateTime<Utc>,
 }
 

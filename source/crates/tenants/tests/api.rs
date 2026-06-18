@@ -15,7 +15,7 @@ use tower::ServiceExt;
 
 use wardnet_common::token::{ClaimsSpec, PrincipalType, canonical_request_payload};
 use wardnet_tenants::api;
-use wardnet_tenants::test_helpers::{build_state, daemon_keypair, test_signer};
+use wardnet_tenants::test_helpers::{build_harness, build_state, daemon_keypair, test_signer};
 
 const SEED: u8 = 5;
 
@@ -95,7 +95,10 @@ async fn health_is_open() {
 
 #[tokio::test]
 async fn full_daemon_flow() {
-    let app = app();
+    // The full flow needs the trial subscription, which the subscription reactor opens
+    // on `TenantCreated`; drive the reactors deterministically with the harness pump.
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
     let (key, cnf) = daemon_keypair(11);
 
     // 1. signup code (public; needs the PROXY-derived ConnectInfo).
@@ -134,6 +137,8 @@ async fn full_daemon_flow() {
         .as_str()
         .unwrap()
         .to_string();
+    // The subscription reactor opens the trial so the daemon can mint a token.
+    h.pump().await;
 
     // 3. token (key PoP) → tenant-scoped JWT.
     let body = serde_json::to_vec(&json!({"public_key": cnf})).unwrap();

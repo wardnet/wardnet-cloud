@@ -13,11 +13,12 @@ use utoipa_axum::routes;
 
 use wardnet_common::auth::{AuthCaller, Caller};
 use wardnet_common::contract::{
-    CodeResponse, DaemonView, NetworkView, RegisterTenantRequest, TenantView, UpdateTenantRequest,
+    CodeResponse, DaemonView, NetworkView, RegisterTenantRequest, SubscriptionView, TenantView,
+    UpdateTenantRequest,
 };
 
 use crate::error::ApiError;
-use crate::repository::{Daemon, Tenant};
+use crate::repository::{Daemon, Subscription, Tenant};
 use crate::state::AppState;
 
 /// Register all account-plane routes.
@@ -34,16 +35,30 @@ pub fn register(router: OpenApiRouter<AppState>) -> OpenApiRouter<AppState> {
 
 // ── Domain → contract conversions (orphan rule OK: the domain type is local) ───
 
-impl From<Tenant> for TenantView {
-    fn from(t: Tenant) -> Self {
+impl From<Subscription> for SubscriptionView {
+    fn from(s: Subscription) -> Self {
         Self {
-            id: t.id,
-            email: t.email,
-            entitlement: t.entitlement,
-            subscription_status: t.subscription_status,
-            subscription_id: t.subscription_id,
-            created_at: t.created_at,
+            id: s.id,
+            status: s.status,
+            entitlement: s.entitlement,
+            stripe_customer_id: s.stripe_customer_id,
+            stripe_subscription_id: s.stripe_subscription_id,
+            price_id: s.price_id,
+            trial_expires_at: s.trial_expires_at,
+            current_period_end: s.current_period_end,
+            created_at: s.created_at,
+            updated_at: s.updated_at,
         }
+    }
+}
+
+/// Build the full [`TenantView`] from a tenant and its current subscription.
+pub(crate) fn tenant_view(tenant: Tenant, subscription: Option<Subscription>) -> TenantView {
+    TenantView {
+        id: tenant.id,
+        email: tenant.email,
+        subscription: subscription.map(Into::into),
+        created_at: tenant.created_at,
     }
 }
 
@@ -87,11 +102,12 @@ async fn register_tenant(
     AuthCaller(_caller): AuthCaller,
     Json(body): Json<RegisterTenantRequest>,
 ) -> Result<Json<TenantView>, ApiError> {
-    let tenant = state
-        .tenants()
-        .register_tenant(&body.email, body.entitlement)
-        .await?;
-    Ok(Json(tenant.into()))
+    let tenant = state.tenants().register_tenant(&body.email).await?;
+    // The trial subscription is opened by the subscription reactor reacting to the
+    // published `TenantCreated`, so it may not be visible yet — read whatever is
+    // current (typically none for a brand-new tenant) and let the SPA refresh.
+    let subscription = state.subscriptions().current(&tenant.id).await?;
+    Ok(Json(tenant_view(tenant, subscription)))
 }
 
 #[utoipa::path(
@@ -187,7 +203,9 @@ async fn update_tenant(
             "only subscription_status=canceled is supported".to_string(),
         ));
     }
-    state.tenants().cancel_subscription(&id).await?;
+    // Cancelling deactivates the subscription; the network-deprovision cascade follows
+    // from the published `SubscriptionDeactivated` event (network reactor).
+    state.subscriptions().cancel(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

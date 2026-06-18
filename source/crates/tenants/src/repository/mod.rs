@@ -8,6 +8,7 @@
 pub mod daemon;
 pub mod enrollment;
 pub mod network;
+pub mod subscription;
 pub mod tenant;
 
 pub use daemon::{Daemon, DaemonRepository, PgDaemonRepository};
@@ -15,7 +16,7 @@ pub use enrollment::{EnrollOutcome, EnrollmentRepository, PgEnrollmentRepository
 pub use network::{
     Network, NetworkRepository, PgNetworkRepository, ProvisioningState, RegisterNetworkOutcome,
 };
-pub use tenant::{
-    CreateTenantOutcome, Entitlement, PgTenantRepository, SubscriptionStatus, Tenant,
-    TenantRepository,
+pub use subscription::{
+    Entitlement, PgSubscriptionRepository, Subscription, SubscriptionRepository, SubscriptionStatus,
 };
+pub use tenant::{CreateTenantOutcome, PgTenantRepository, Tenant, TenantRepository};

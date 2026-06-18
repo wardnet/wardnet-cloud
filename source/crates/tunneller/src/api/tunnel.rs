@@ -18,7 +18,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use wardnet_common::auth::{AuthCaller, Caller};
-use wardnet_common::contract::{ProvisioningState, SubscriptionStatus};
+use wardnet_common::contract::ProvisioningState;
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -87,7 +87,7 @@ async fn tunnel_connect(
         .await
         .map_err(ApiError::Internal)?
         .ok_or_else(|| ApiError::Forbidden("tenant not found".to_string()))?;
-    if tenant.subscription_status != SubscriptionStatus::Active {
+    if tenant.subscription.as_ref().is_none_or(|s| !s.is_active()) {
         return Err(ApiError::Forbidden(
             "tenant subscription is not active".to_string(),
         ));

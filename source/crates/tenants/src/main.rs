@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use wardnet_common::config as common_config;
+use wardnet_common::event::{BroadcastEventBus, EventPublisher};
 use wardnet_common::{mtls, serve, token};
 use wardnet_tenants::{
     api,
@@ -9,12 +10,21 @@ use wardnet_tenants::{
     db, mesh,
     repository::{
         DaemonRepository, EnrollmentRepository, NetworkRepository, PgDaemonRepository,
-        PgEnrollmentRepository, PgNetworkRepository, PgTenantRepository, TenantRepository,
+        PgEnrollmentRepository, PgNetworkRepository, PgSubscriptionRepository, PgTenantRepository,
+        SubscriptionRepository, TenantRepository,
     },
     service::TenantsService,
     state::AppState,
+    subscription::{SubscriptionService, TrialPolicy, reactor},
 };
 
+/// Broadcast channel depth for domain events. Generous so a momentarily-busy reactor
+/// never lags (a dropped event is still recovered by the reconcile loop).
+const EVENT_BUS_CAPACITY: usize = 1024;
+
+// `main` is end-to-end process wiring (repos → services → reactors → listeners);
+// keeping it linear reads better than splintering it into single-call helpers.
+#[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
@@ -39,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
     let tenants_repo = Arc::new(PgTenantRepository::new_pools(pools.clone()));
     let networks_repo = Arc::new(PgNetworkRepository::new_pools(pools.clone()));
     let daemons_repo = Arc::new(PgDaemonRepository::new_pools(pools.clone()));
+    let subscriptions_repo = Arc::new(PgSubscriptionRepository::new_pools(pools.clone()));
     let enrollment_repo = Arc::new(PgEnrollmentRepository::new_pools(pools));
 
     // Tenants signs identity JWTs; the private key is consumed into the signer and
@@ -50,16 +61,47 @@ async fn main() -> anyhow::Result<()> {
     // The auth layer verifies identity JWTs offline with the matching public key.
     let verifier = token::Verifier::from_pem(common_config::load_jwt_verify_key_pem()?.as_bytes())?;
 
+    // Domain-event bus: services publish, reactors react (one-way, never a direct
+    // cross-aggregate write call).
+    let events: Arc<dyn EventPublisher> = Arc::new(BroadcastEventBus::new(EVENT_BUS_CAPACITY));
+
+    // Build the subscription aggregate first (Tenants reads it via a service method).
+    let subscriptions = Arc::new(SubscriptionService::new(
+        subscriptions_repo as Arc<dyn SubscriptionRepository>,
+        Arc::clone(&events),
+        TrialPolicy {
+            trial_days: config.trial_days,
+            trial_grace_days: config.trial_grace_days,
+            payment_grace_days: config.payment_grace_days,
+        },
+    ));
     let service = Arc::new(TenantsService::new(
         tenants_repo as Arc<dyn TenantRepository>,
         networks_repo as Arc<dyn NetworkRepository>,
         daemons_repo as Arc<dyn DaemonRepository>,
         enrollment_repo as Arc<dyn EnrollmentRepository>,
+        Arc::clone(&subscriptions),
+        Arc::clone(&events),
         signer,
         config.known_regions.clone(),
     ));
 
-    let state = AppState::new(config.clone(), service, verifier);
+    // Reactors: turn published events into the owning service's method calls.
+    tokio::spawn(reactor::run_subscription_reactor(
+        Arc::clone(&subscriptions),
+        events.subscribe(),
+    ));
+    tokio::spawn(reactor::run_network_reactor(
+        Arc::clone(&service),
+        events.subscribe(),
+    ));
+
+    let state = AppState::new(
+        config.clone(),
+        Arc::clone(&service),
+        Arc::clone(&subscriptions),
+        verifier,
+    );
     let api_router = api::router(state.clone());
 
     // Mesh listener material (mTLS). inforge re-projects the leaf/key/bundle files in
@@ -103,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let sweep_interval = std::time::Duration::from_secs(config.sweep_interval_secs);
+    let sub_reaper_interval = std::time::Duration::from_secs(config.sub_reaper_interval_secs);
 
     tokio::select! {
         // Public, nginx-fronted control-plane API (daemon + user JWT, bootstrap).
@@ -116,7 +159,14 @@ async fn main() -> anyhow::Result<()> {
         ) => res?,
 
         // Periodic tombstone sweep: delete deregistered tenants whose networks are gone.
-        () = sweep_loop(state, sweep_interval) => {},
+        () = sweep_loop(Arc::clone(&service), sweep_interval) => {},
+
+        // Periodic subscription reaper + reconcile (the dropped-event safety net).
+        () = sub_reaper_loop(
+            Arc::clone(&subscriptions),
+            Arc::clone(&service),
+            sub_reaper_interval,
+        ) => {},
     }
 
     Ok(())
@@ -125,12 +175,32 @@ async fn main() -> anyhow::Result<()> {
 /// Periodically delete tombstoned tenants whose networks are fully deprovisioned. The
 /// first tick fires immediately, then every `interval`. N-replica-safe (the delete is
 /// idempotent), so every node may run it.
-async fn sweep_loop(state: AppState, interval: std::time::Duration) {
+async fn sweep_loop(service: Arc<TenantsService>, interval: std::time::Duration) {
     let mut tick = tokio::time::interval(interval);
     loop {
         tick.tick().await;
-        if let Err(e) = state.tenants().sweep_deregistered().await {
+        if let Err(e) = service.sweep_deregistered().await {
             tracing::error!(error = %e, "tombstone sweep failed");
+        }
+    }
+}
+
+/// Periodically cancel overdue subscriptions (expired trials / past-due past grace)
+/// and reconcile desired state — the safety net for any dropped domain event.
+/// N-replica-safe and idempotent.
+async fn sub_reaper_loop(
+    subscriptions: Arc<SubscriptionService>,
+    service: Arc<TenantsService>,
+    interval: std::time::Duration,
+) {
+    let mut tick = tokio::time::interval(interval);
+    loop {
+        tick.tick().await;
+        if let Err(e) = subscriptions.expire_overdue().await {
+            tracing::error!(error = %e, "subscription reaper failed");
+        }
+        if let Err(e) = service.reconcile().await {
+            tracing::error!(error = %e, "subscription reconcile failed");
         }
     }
 }

@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::SigningKey;
 
 use wardnet_common::contract::{
-    Entitlement, NetworkView, ProvisioningState, SubscriptionStatus, TenantView,
+    Entitlement, NetworkView, ProvisioningState, SubscriptionStatus, SubscriptionView, TenantView,
 };
 use wardnet_common::token::{Signer, Verifier};
 
@@ -89,13 +89,23 @@ pub fn network_view(
 /// Build a [`TenantView`] with the given subscription status.
 #[must_use]
 pub fn tenant_view(id: &str, status: SubscriptionStatus) -> TenantView {
+    let now = Utc::now();
     TenantView {
         id: id.to_string(),
         email: format!("{id}@example.com"),
-        entitlement: Entitlement::DEFAULT,
-        subscription_status: status,
-        subscription_id: None,
-        created_at: Utc::now(),
+        subscription: Some(SubscriptionView {
+            id: format!("sub-{id}"),
+            status,
+            entitlement: Entitlement::DEFAULT,
+            stripe_customer_id: None,
+            stripe_subscription_id: None,
+            price_id: None,
+            trial_expires_at: None,
+            current_period_end: None,
+            created_at: now,
+            updated_at: now,
+        }),
+        created_at: now,
     }
 }
 

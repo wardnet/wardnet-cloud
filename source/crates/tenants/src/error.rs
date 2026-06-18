@@ -52,3 +52,40 @@ impl From<TenantsError> for ApiError {
         }
     }
 }
+
+/// Service-layer domain error for
+/// [`SubscriptionService`](crate::subscription::SubscriptionService).
+#[derive(Debug, thiserror::Error)]
+pub enum SubscriptionError {
+    /// A referenced tenant / subscription does not exist.
+    #[error("{0}")]
+    NotFound(String),
+    /// Malformed input (e.g. an unknown plan / price).
+    #[error("{0}")]
+    BadRequest(String),
+    /// A provider/repository failure (DB, Stripe).
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+impl From<SubscriptionError> for ApiError {
+    fn from(e: SubscriptionError) -> Self {
+        match e {
+            SubscriptionError::NotFound(m) => ApiError::NotFound(m),
+            SubscriptionError::BadRequest(m) => ApiError::BadRequest(m),
+            SubscriptionError::Internal(e) => ApiError::Internal(e),
+        }
+    }
+}
+
+/// Bridge so `TenantsService` can surface a `SubscriptionService` read failure as its
+/// own error when it reads the current subscription on a hot path.
+impl From<SubscriptionError> for TenantsError {
+    fn from(e: SubscriptionError) -> Self {
+        match e {
+            SubscriptionError::NotFound(m) => TenantsError::NotFound(m),
+            SubscriptionError::BadRequest(m) => TenantsError::BadRequest(m),
+            SubscriptionError::Internal(e) => TenantsError::Internal(e),
+        }
+    }
+}

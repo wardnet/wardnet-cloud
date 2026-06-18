@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 
-use wardnet_common::contract::{NetworkView, ProvisioningState, SubscriptionStatus, TenantView};
+use wardnet_common::contract::{NetworkView, ProvisioningState, TenantView};
 
 use crate::mesh::TenantsResolver;
 use crate::repository::TunnelRouteRepository;
@@ -101,7 +101,8 @@ pub fn should_abort(network: Option<&NetworkView>, tenant: Option<&TenantView>) 
         Some(n) if n.provisioning_state == ProvisioningState::Deprovisioning => true,
         Some(_) => match tenant {
             None => true,
-            Some(t) => t.subscription_status != SubscriptionStatus::Active,
+            // Abort unless the tenant has a current, entitling subscription.
+            Some(t) => t.subscription.as_ref().is_none_or(|s| !s.is_active()),
         },
     }
 }

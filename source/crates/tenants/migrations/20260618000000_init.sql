@@ -2,7 +2,9 @@
 -- empty; there is no prior schema to migrate from).
 --
 -- Domain:
---   tenant  (account: email, entitlement, subscription)
+--   tenant  (account: just identity — email)
+--     ├─ subscription  (the billing aggregate that GRANTS entitlement; 1:N history,
+--     │                  one live row per tenant — see below)
 --     └─ network  (one wardnet network: vanity slug + provisioning lifecycle)
 --          └─ daemon  (a device bound to the network; holds an Ed25519 key)
 --
@@ -11,28 +13,65 @@
 --   pending_enrollments   — a TTL'd pubkey↔tenant binding letting a not-yet-registered
 --                            daemon authenticate (mint a tenant-scoped JWT) before it has
 --                            a network/daemon row. Self-cleaning by expiry.
+-- And one billing idempotency ledger:
+--   processed_stripe_events — Stripe redelivers webhooks; this dedupes by event id.
 
 CREATE TABLE tenants (
     id                  TEXT PRIMARY KEY,
     -- Stored lowercased so uniqueness is case-insensitive.
     email               VARCHAR(320) NOT NULL,
-    -- Typed limits, e.g. {"max_networks":1,"max_daemons":1}. JSONB so new limit
-    -- dimensions need no migration.
-    entitlement         JSONB NOT NULL,
-    subscription_status VARCHAR(16) NOT NULL DEFAULT 'active'
-        CHECK (subscription_status IN ('active', 'canceled')),
-    -- Provider-agnostic subscription handle (reserved; populated when billing lands).
-    subscription_id     VARCHAR(255),
     created_at          TIMESTAMPTZ NOT NULL,
     -- Account deregistration tombstone. NULL = live account; set = terminally
-    -- deregistered (distinct from the reversible billing `subscription_status`). A
-    -- tombstoned tenant frees its email for re-signup, is rejected by mint/enroll, and
-    -- is swept once its networks are fully deprovisioned.
+    -- deregistered. A tombstoned tenant frees its email for re-signup, is rejected by
+    -- mint/enroll, and is swept once its networks are fully deprovisioned. All billing
+    -- state lives on `subscriptions`, not here.
     deregistered_at     TIMESTAMPTZ
 );
 -- Email is unique only among LIVE tenants, so deregistering frees the address for a
 -- fresh signup while the tombstoned row lingers until its networks are reaped.
 CREATE UNIQUE INDEX uq_tenants_email_active ON tenants (email) WHERE deregistered_at IS NULL;
+
+-- A tenant's subscriptions, append-only history with at most ONE live row. The free
+-- trial is itself a subscription (status 'trialing', no Stripe ids); converting to a
+-- paid plan cancels the trial row and inserts a paid one. Entitlement is granted by
+-- the plan and stored here, never on the tenant.
+CREATE TABLE subscriptions (
+    id                     TEXT PRIMARY KEY,
+    tenant_id              TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    status                 VARCHAR(16) NOT NULL
+        CHECK (status IN ('trialing', 'active', 'past_due', 'canceled')),
+    -- Typed limits, e.g. {"max_networks":1,"max_daemons":1}. JSONB so new limit
+    -- dimensions need no migration.
+    entitlement            JSONB NOT NULL,
+    -- Stripe Customer: the tenant's stable billing identity, carried forward across
+    -- the subscription history. NULL until the tenant first reaches checkout.
+    stripe_customer_id     VARCHAR(255),
+    -- Stripe Subscription handle; NULL on the card-less trial.
+    stripe_subscription_id VARCHAR(255),
+    -- Purchased Stripe Price id; NULL on the trial.
+    price_id               VARCHAR(255),
+    -- When the free trial lapses (trialing rows only).
+    trial_expires_at       TIMESTAMPTZ,
+    -- End of the current paid period (paid rows only; drives the past-due grace).
+    current_period_end     TIMESTAMPTZ,
+    created_at             TIMESTAMPTZ NOT NULL,
+    updated_at             TIMESTAMPTZ NOT NULL
+);
+-- At most one LIVE (non-canceled) subscription per tenant: "current" is a point
+-- lookup, and trial→paid conversion must cancel the trial row first. Mirrors the
+-- partial-unique pattern used for tenant emails.
+CREATE UNIQUE INDEX uq_subscriptions_live ON subscriptions (tenant_id) WHERE status <> 'canceled';
+-- Webhook lookup by Stripe subscription id.
+CREATE INDEX idx_subscriptions_stripe ON subscriptions (stripe_subscription_id);
+-- Reaper scan for expired trials and past-due rows past their grace.
+CREATE INDEX idx_subscriptions_overdue ON subscriptions (status, trial_expires_at, current_period_end);
+
+-- Stripe webhook idempotency: Stripe redelivers events, so the first apply records
+-- the event id and redeliveries short-circuit.
+CREATE TABLE processed_stripe_events (
+    event_id     TEXT PRIMARY KEY,
+    processed_at TIMESTAMPTZ NOT NULL
+);
 
 CREATE TABLE networks (
     id                 TEXT PRIMARY KEY,

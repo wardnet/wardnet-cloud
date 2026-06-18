@@ -40,6 +40,17 @@ pub struct Config {
     /// Interval (seconds) between sweeps that delete tombstoned tenants whose networks
     /// are fully deprovisioned. Default 3600 (hourly).
     pub sweep_interval_secs: u64,
+
+    /// Free-trial length (days) applied when a tenant's trial subscription is opened.
+    /// Default 60.
+    pub trial_days: i64,
+    /// Extra days a lapsed trial keeps service before the reaper cancels it. Default 15.
+    pub trial_grace_days: i64,
+    /// Extra days a `past_due` subscription keeps service before the reaper cancels it.
+    /// Default 15.
+    pub payment_grace_days: i64,
+    /// Interval (seconds) between subscription-reaper + reconcile passes. Default 3600.
+    pub sub_reaper_interval_secs: u64,
 }
 
 impl std::fmt::Debug for Config {
@@ -55,6 +66,10 @@ impl std::fmt::Debug for Config {
             .field("leaf_cert_path", &self.leaf_cert_path)
             .field("leaf_key_path", &self.leaf_key_path)
             .field("sweep_interval_secs", &self.sweep_interval_secs)
+            .field("trial_days", &self.trial_days)
+            .field("trial_grace_days", &self.trial_grace_days)
+            .field("payment_grace_days", &self.payment_grace_days)
+            .field("sub_reaper_interval_secs", &self.sub_reaper_interval_secs)
             .finish()
     }
 }
@@ -81,6 +96,22 @@ impl Config {
             leaf_cert_path: required("MTLS_LEAF_CERT_PATH")?,
             leaf_key_path: required("MTLS_LEAF_KEY_PATH")?,
             sweep_interval_secs: std::env::var("TENANT_SWEEP_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3600),
+            trial_days: std::env::var("TRIAL_DAYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+            trial_grace_days: std::env::var("TRIAL_GRACE_DAYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(15),
+            payment_grace_days: std::env::var("PAYMENT_GRACE_DAYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(15),
+            sub_reaper_interval_secs: std::env::var("SUB_REAPER_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3600),

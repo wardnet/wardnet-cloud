@@ -10,27 +10,40 @@ use tower::ServiceExt as _;
 
 use wardnet_common::auth::ServiceIdentity;
 use wardnet_tenants::api::{network, reconcile, tenant};
-use wardnet_tenants::repository::tenant::{Entitlement, SubscriptionStatus, Tenant};
+use wardnet_tenants::repository::subscription::{Entitlement, Subscription, SubscriptionStatus};
+use wardnet_tenants::repository::tenant::Tenant;
 use wardnet_tenants::state::AppState;
 use wardnet_tenants::test_helpers::{build_state, daemon_keypair};
 
 const SEED: u8 = 5;
 const REGION: &str = "use1";
 
-/// A state with tenant `t1` and one network it owns; returns `(state, network_id)`.
+/// A state with tenant `t1` (+ an active subscription) and one network it owns;
+/// returns `(state, network_id)`.
 async fn seeded() -> (AppState, String) {
     let (state, store) = build_state(SEED);
+    let now = chrono::Utc::now();
     store.seed_tenant(Tenant {
         id: "t1".to_string(),
         email: "t1@example.com".to_string(),
+        created_at: now,
+        deregistered_at: None,
+    });
+    store.seed_subscription(Subscription {
+        id: "sub-t1".to_string(),
+        tenant_id: "t1".to_string(),
+        status: SubscriptionStatus::Active,
         entitlement: Entitlement {
             max_networks: 5,
             max_daemons: 5,
         },
-        subscription_status: SubscriptionStatus::Active,
-        subscription_id: None,
-        created_at: chrono::Utc::now(),
-        deregistered_at: None,
+        stripe_customer_id: None,
+        stripe_subscription_id: None,
+        price_id: None,
+        trial_expires_at: None,
+        current_period_end: None,
+        created_at: now,
+        updated_at: now,
     });
     let (_key, cnf) = daemon_keypair(11);
     let network = state
@@ -101,7 +114,8 @@ async fn get_tenant_returns_full_view() {
     let body = body_json(resp).await;
     assert_eq!(body["id"], "t1");
     assert_eq!(body["email"], "t1@example.com");
-    assert_eq!(body["subscription_status"], "active");
+    assert_eq!(body["subscription"]["status"], "active");
+    assert_eq!(body["subscription"]["entitlement"]["max_networks"], 5);
 }
 
 #[tokio::test]

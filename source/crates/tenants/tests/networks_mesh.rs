@@ -21,7 +21,8 @@ use wardnet_common::auth::ServiceIdentity;
 use wardnet_common::mtls::ExpectedPeer;
 use wardnet_common::{mtls, serve};
 use wardnet_tenants::api::reconcile;
-use wardnet_tenants::repository::tenant::{Entitlement, SubscriptionStatus, Tenant};
+use wardnet_tenants::repository::subscription::{Entitlement, Subscription, SubscriptionStatus};
+use wardnet_tenants::repository::tenant::Tenant;
 use wardnet_tenants::state::AppState;
 use wardnet_tenants::test_helpers::{build_state, daemon_keypair};
 
@@ -85,17 +86,28 @@ impl MeshCa {
 /// `(state, network_id)`.
 async fn state_with_network() -> (AppState, String) {
     let (state, store) = build_state(SEED);
+    let now = chrono::Utc::now();
     store.seed_tenant(Tenant {
         id: "t1".to_string(),
         email: "t1@example.com".to_string(),
+        created_at: now,
+        deregistered_at: None,
+    });
+    store.seed_subscription(Subscription {
+        id: "sub-t1".to_string(),
+        tenant_id: "t1".to_string(),
+        status: SubscriptionStatus::Active,
         entitlement: Entitlement {
             max_networks: 5,
             max_daemons: 5,
         },
-        subscription_status: SubscriptionStatus::Active,
-        subscription_id: None,
-        created_at: chrono::Utc::now(),
-        deregistered_at: None,
+        stripe_customer_id: None,
+        stripe_subscription_id: None,
+        price_id: None,
+        trial_expires_at: None,
+        current_period_end: None,
+        created_at: now,
+        updated_at: now,
     });
     let (_key, cnf) = daemon_keypair(11);
     let network = state
@@ -201,8 +213,12 @@ async fn reaper_deprovisioned_patch_is_idempotent() {
     let client = ca.leaf(DDNS_SPIFFE, ExtendedKeyUsagePurpose::ClientAuth);
 
     let (state, network_id) = state_with_network().await;
-    // Move the network to `deprovisioning` (subscription cancel cascade).
-    state.tenants().cancel_subscription("t1").await.unwrap();
+    // Move the network to `deprovisioning` (the cancel cascade the network reactor runs).
+    state
+        .tenants()
+        .deprovision_networks_for("t1")
+        .await
+        .unwrap();
 
     let addr = spawn_mesh(state, &server, ca.root_pem()).await;
     let http = mesh_client(&client, ca.root_pem(), addr);

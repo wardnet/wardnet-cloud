@@ -19,6 +19,7 @@ pub mod mesh;
 pub mod repository;
 pub mod service;
 pub mod state;
+pub mod subscription;
 
 // Mocks + fixtures shared by unit and integration tests. Doc-hidden and not
 // `cfg(test)` so the integration tests in `tests/` can reach it too; carries no

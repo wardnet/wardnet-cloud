@@ -12,6 +12,7 @@ use wardnet_common::token::Verifier;
 
 use crate::config::Config;
 use crate::service::TenantsService;
+use crate::subscription::SubscriptionService;
 
 /// Cloneable handle to the service's shared state.
 #[derive(Clone)]
@@ -20,16 +21,23 @@ pub struct AppState(Arc<Inner>);
 struct Inner {
     config: Config,
     tenants: Arc<TenantsService>,
+    subscriptions: Arc<SubscriptionService>,
     verifier: Verifier,
     replay_cache: Arc<ReplayCache>,
 }
 
 impl AppState {
     #[must_use]
-    pub fn new(config: Config, tenants: Arc<TenantsService>, verifier: Verifier) -> Self {
+    pub fn new(
+        config: Config,
+        tenants: Arc<TenantsService>,
+        subscriptions: Arc<SubscriptionService>,
+        verifier: Verifier,
+    ) -> Self {
         Self(Arc::new(Inner {
             config,
             tenants,
+            subscriptions,
             verifier,
             replay_cache: Arc::new(ReplayCache::new()),
         }))
@@ -40,10 +48,16 @@ impl AppState {
         &self.0.config
     }
 
-    /// The business-rule service.
+    /// The tenant business-rule service.
     #[must_use]
     pub fn tenants(&self) -> &TenantsService {
         &self.0.tenants
+    }
+
+    /// The subscription/billing business-rule service.
+    #[must_use]
+    pub fn subscriptions(&self) -> &SubscriptionService {
+        &self.0.subscriptions
     }
 
     /// The replay cache (used by the bootstrap token endpoint's `PoP` check).

@@ -15,11 +15,14 @@ use uuid::Uuid;
 use wardnet_tenants::db::{self, DbPools};
 use wardnet_tenants::repository::{
     DaemonRepository, EnrollmentRepository, NetworkRepository, PgDaemonRepository,
-    PgEnrollmentRepository, PgNetworkRepository, PgTenantRepository, ProvisioningState,
-    TenantRepository,
+    PgEnrollmentRepository, PgNetworkRepository, PgSubscriptionRepository, PgTenantRepository,
+    ProvisioningState, SubscriptionRepository, TenantRepository,
 };
 use wardnet_tenants::service::TenantsService;
-use wardnet_tenants::test_helpers::{daemon_keypair, test_signer};
+use wardnet_tenants::subscription::{SubscriptionService, TrialPolicy};
+use wardnet_tenants::test_helpers::{
+    RecordingEventPublisher, daemon_keypair, pump_events, test_signer,
+};
 
 const SEED: u8 = 5;
 const REGION: &str = "use1";
@@ -47,21 +50,61 @@ async fn test_pool() -> DbPools {
         .expect("init test database")
 }
 
-fn service(pools: DbPools) -> TenantsService {
-    TenantsService::new(
+/// A Postgres-backed harness mirroring the mock one: the tenant + subscription
+/// services over real repos, plus the recording publisher so flows can be pumped
+/// deterministically (the spawned reactors are not running in tests).
+struct PgHarness {
+    events: Arc<RecordingEventPublisher>,
+    subscriptions: Arc<SubscriptionService>,
+    tenants: Arc<TenantsService>,
+}
+
+impl PgHarness {
+    fn tenants(&self) -> &TenantsService {
+        &self.tenants
+    }
+
+    async fn pump(&self) {
+        pump_events(&self.events, &self.subscriptions, &self.tenants).await;
+    }
+}
+
+fn harness(pools: DbPools) -> PgHarness {
+    // Built concretely so the harness keeps the recording handle; the `Arc` coerces
+    // to `Arc<dyn EventPublisher>` at each service call site.
+    let events: Arc<RecordingEventPublisher> = Arc::new(RecordingEventPublisher::new());
+    let subscriptions = Arc::new(SubscriptionService::new(
+        Arc::new(PgSubscriptionRepository::new_pools(pools.clone()))
+            as Arc<dyn SubscriptionRepository>,
+        events.clone(),
+        TrialPolicy {
+            trial_days: 60,
+            trial_grace_days: 15,
+            payment_grace_days: 15,
+        },
+    ));
+    let tenants = Arc::new(TenantsService::new(
         Arc::new(PgTenantRepository::new_pools(pools.clone())) as Arc<dyn TenantRepository>,
         Arc::new(PgNetworkRepository::new_pools(pools.clone())) as Arc<dyn NetworkRepository>,
         Arc::new(PgDaemonRepository::new_pools(pools.clone())) as Arc<dyn DaemonRepository>,
         Arc::new(PgEnrollmentRepository::new_pools(pools)) as Arc<dyn EnrollmentRepository>,
+        subscriptions.clone(),
+        events.clone(),
         test_signer(SEED),
         ["use1".to_string(), "eu1".to_string()],
-    )
+    ));
+    PgHarness {
+        events,
+        subscriptions,
+        tenants,
+    }
 }
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
 async fn enroll_register_reconcile_lifecycle_on_postgres() {
-    let svc = service(test_pool().await);
+    let h = harness(test_pool().await);
+    let svc = h.tenants();
     let (_key, cnf) = daemon_keypair(11);
 
     // Signup → enroll → token (tenant-scoped) → register-network.
@@ -70,6 +113,7 @@ async fn enroll_register_reconcile_lifecycle_on_postgres() {
         .await
         .unwrap();
     let tenant_id = svc.enroll(&code, &cnf).await.unwrap().tenant_id;
+    h.pump().await; // the subscription reactor opens the trial
     assert!(svc.mint_jwt(&cnf).await.is_ok());
     let network = svc
         .register_network(&tenant_id, &cnf, "happy-einstein", None, REGION)
@@ -85,8 +129,10 @@ async fn enroll_register_reconcile_lifecycle_on_postgres() {
     assert_eq!(page.len(), 1);
     assert!(svc.mark_network_active(&network.id).await.unwrap());
 
-    // Cancel cascades → deprovisioning; reaper finishes → row deleted.
-    svc.cancel_subscription(&tenant_id).await.unwrap();
+    // Cancel deactivates the subscription; the network reactor cascades → deprovisioning;
+    // reaper finishes → row deleted.
+    h.subscriptions.cancel(&tenant_id).await.unwrap();
+    h.pump().await;
     let page = svc
         .reconcile_page(ProvisioningState::Deprovisioning, REGION, None, 100)
         .await
@@ -101,11 +147,13 @@ async fn enroll_register_reconcile_lifecycle_on_postgres() {
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
 async fn slug_uniqueness_and_single_use_code_on_postgres() {
-    let svc = service(test_pool().await);
+    let h = harness(test_pool().await);
+    let svc = h.tenants();
     let (_k1, c1) = daemon_keypair(11);
 
     let code = svc.issue_signup_code("a@b.com", "1.2.3.4").await.unwrap();
     let tenant_id = svc.enroll(&code, &c1).await.unwrap().tenant_id;
+    h.pump().await;
     // Single-use: the burned code is rejected on reuse.
     let (_k2, c2) = daemon_keypair(22);
     assert!(svc.enroll(&code, &c2).await.is_err());
@@ -117,6 +165,7 @@ async fn slug_uniqueness_and_single_use_code_on_postgres() {
     let code2 = svc.issue_signup_code("c@d.com", "5.6.7.8").await.unwrap();
     let (_k3, c3) = daemon_keypair(33);
     let tenant2 = svc.enroll(&code2, &c3).await.unwrap().tenant_id;
+    h.pump().await;
     let outcome = svc
         .register_network(&tenant2, &c3, "taken-slug", None, REGION)
         .await;
@@ -126,7 +175,8 @@ async fn slug_uniqueness_and_single_use_code_on_postgres() {
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
 async fn deregister_tombstone_sweep_and_email_reuse_on_postgres() {
-    let svc = service(test_pool().await);
+    let h = harness(test_pool().await);
+    let svc = h.tenants();
     let (_k1, c1) = daemon_keypair(11);
 
     // Signup → enroll → register-network.
@@ -135,13 +185,16 @@ async fn deregister_tombstone_sweep_and_email_reuse_on_postgres() {
         .await
         .unwrap();
     let first_id = svc.enroll(&code, &c1).await.unwrap().tenant_id;
+    h.pump().await;
     let network = svc
         .register_network(&first_id, &c1, "tombstone-net", None, REGION)
         .await
         .unwrap();
 
-    // Deregister tombstones, cascades the network to deprovisioning, and cancels.
+    // Deregister tombstones + publishes TenantDeregistered; pumping cancels the
+    // subscription and cascades the network to deprovisioning.
     assert!(svc.deregister_tenant(&first_id).await.unwrap());
+    h.pump().await;
     assert_eq!(
         svc.find_network(&network.id)
             .await

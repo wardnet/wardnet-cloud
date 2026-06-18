@@ -10,20 +10,22 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use sqlx::types::Json;
 
 use crate::db::DbPools;
-use crate::repository::tenant::Entitlement;
 
 /// Outcome of the [`enroll`](EnrollmentRepository::enroll) saga.
 #[derive(Debug, PartialEq, Eq)]
 pub enum EnrollOutcome {
-    /// The daemon is bound to `tenant_id` via a fresh pending record.
-    Enrolled { tenant_id: String },
+    /// The daemon is bound to `tenant_id` via a fresh pending record. `tenant_created`
+    /// is `true` when this enroll **created** the tenant (a new signup) — the cue for
+    /// the service to publish `TenantCreated` so the subscription reactor opens its
+    /// trial.
+    Enrolled {
+        tenant_id: String,
+        tenant_created: bool,
+    },
     /// The code is unknown, expired, or already used.
     BadCode,
-    /// The (existing) tenant is already at its `max_daemons` limit.
-    DaemonLimit,
 }
 
 /// Data access for the enrollment tables.
@@ -40,16 +42,17 @@ pub trait EnrollmentRepository: Send + Sync {
     ) -> anyhow::Result<()>;
 
     /// The enroll saga (one transaction): validate + **burn** the code; resolve the
-    /// tenant (create with `default_entitlement` for a new-signup code, else the
-    /// code's tenant / the existing tenant for that email); enforce `max_daemons`;
-    /// upsert the TTL'd pending pubkey↔tenant binding. `new_tenant_id` is used only
-    /// when a tenant must be created.
+    /// tenant (create for a new-signup code, else the code's tenant / the existing
+    /// tenant for that email); upsert the TTL'd pending pubkey↔tenant binding.
+    /// `new_tenant_id` is used only when a tenant must be created. The `max_daemons`
+    /// cap is **not** enforced here — it lives on `register_network` (and reads the
+    /// entitlement from the subscription aggregate); this saga never touches
+    /// subscriptions.
     async fn enroll(
         &self,
         code_hash: &str,
         public_key: &str,
         new_tenant_id: &str,
-        default_entitlement: Entitlement,
         now: DateTime<Utc>,
         pending_ttl_secs: i64,
     ) -> anyhow::Result<EnrollOutcome>;
@@ -123,7 +126,6 @@ impl EnrollmentRepository for PgEnrollmentRepository {
         code_hash: &str,
         public_key: &str,
         new_tenant_id: &str,
-        default_entitlement: Entitlement,
         now: DateTime<Utc>,
         pending_ttl_secs: i64,
     ) -> anyhow::Result<EnrollOutcome> {
@@ -145,8 +147,9 @@ impl EnrollmentRepository for PgEnrollmentRepository {
         };
 
         // Resolve the tenant: the code's tenant (add-daemon), or create/reuse by
-        // email (new signup).
-        let tenant_id = if let Some(tid) = code_tenant_id {
+        // email (new signup). `tenant_created` cues the service to publish
+        // `TenantCreated` so the subscription reactor opens the trial.
+        let (tenant_id, tenant_created) = if let Some(tid) = code_tenant_id {
             // Add-daemon into an existing tenant — but never into a deregistered one.
             let live: Option<bool> =
                 sqlx::query_scalar("SELECT deregistered_at IS NULL FROM tenants WHERE id = $1")
@@ -157,61 +160,37 @@ impl EnrollmentRepository for PgEnrollmentRepository {
                 tx.rollback().await?;
                 return Ok(EnrollOutcome::BadCode);
             }
-            tid
+            (tid, false)
         } else {
             // New signup: create the tenant, or reuse the existing LIVE one for this
             // email. The partial unique index only reserves emails of live tenants, so
             // a tombstoned tenant's email is free for a fresh signup.
             let created: Option<String> = sqlx::query_scalar(
-                "INSERT INTO tenants (id, email, entitlement, subscription_status, subscription_id, created_at)
-                 VALUES ($1, $2, $3, 'active', NULL, $4)
+                "INSERT INTO tenants (id, email, created_at)
+                 VALUES ($1, $2, $3)
                  ON CONFLICT (email) WHERE deregistered_at IS NULL DO NOTHING
                  RETURNING id",
             )
             .bind(new_tenant_id)
             .bind(&email)
-            .bind(Json(default_entitlement))
             .bind(now)
             .fetch_optional(&mut *tx)
             .await?;
             if let Some(id) = created {
-                id
+                (id, true)
             } else {
-                sqlx::query_scalar(
+                let id = sqlx::query_scalar(
                     "SELECT id FROM tenants WHERE email = $1 AND deregistered_at IS NULL",
                 )
                 .bind(&email)
                 .fetch_one(&mut *tx)
-                .await?
+                .await?;
+                (id, false)
             }
         };
 
-        // Enforce the resolved tenant's daemon limit.
-        let entitlement: Json<Entitlement> =
-            sqlx::query_scalar("SELECT entitlement FROM tenants WHERE id = $1")
-                .bind(&tenant_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        // Count both registered daemons AND live pending bindings (other keys) so a
-        // burst of enrolls cannot over-subscribe `max_daemons` before any of them
-        // reaches register-network. The current key is excluded so a re-enroll
-        // (refresh) of an already-pending key does not count itself.
-        let used: i64 = sqlx::query_scalar(
-            "SELECT (SELECT COUNT(*) FROM daemons WHERE tenant_id = $1) \
-                  + (SELECT COUNT(*) FROM pending_enrollments \
-                     WHERE tenant_id = $1 AND public_key <> $2 AND expires_at > $3)",
-        )
-        .bind(&tenant_id)
-        .bind(public_key)
-        .bind(now)
-        .fetch_one(&mut *tx)
-        .await?;
-        if used >= i64::from(entitlement.0.max_daemons) {
-            tx.rollback().await?;
-            return Ok(EnrollOutcome::DaemonLimit);
-        }
-
-        // Upsert the TTL'd pending binding (a re-enroll refreshes it).
+        // Upsert the TTL'd pending binding (a re-enroll refreshes it). The `max_daemons`
+        // cap is enforced later at register-network, not here.
         let expires_at = now + Duration::seconds(pending_ttl_secs);
         sqlx::query(
             "INSERT INTO pending_enrollments (public_key, tenant_id, expires_at)
@@ -226,7 +205,10 @@ impl EnrollmentRepository for PgEnrollmentRepository {
         .await?;
 
         tx.commit().await?;
-        Ok(EnrollOutcome::Enrolled { tenant_id })
+        Ok(EnrollOutcome::Enrolled {
+            tenant_id,
+            tenant_created,
+        })
     }
 
     async fn find_pending_tenant(

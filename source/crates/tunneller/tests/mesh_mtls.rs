@@ -203,9 +203,18 @@ async fn spawn_tenants(server: &Leaf, ca_pem: &str) -> SocketAddr {
                     Json(serde_json::json!({
                         "id": "t1",
                         "email": "t1@example.com",
-                        "entitlement": { "max_networks": 1, "max_daemons": 1 },
-                        "subscription_status": "active",
-                        "subscription_id": null,
+                        "subscription": {
+                            "id": "sub-t1",
+                            "status": "active",
+                            "entitlement": { "max_networks": 1, "max_daemons": 1 },
+                            "stripe_customer_id": null,
+                            "stripe_subscription_id": null,
+                            "price_id": null,
+                            "trial_expires_at": null,
+                            "current_period_end": null,
+                            "created_at": "2026-06-16T00:00:00Z",
+                            "updated_at": "2026-06-16T00:00:00Z"
+                        },
                         "created_at": "2026-06-16T00:00:00Z"
                     }))
                     .into_response()

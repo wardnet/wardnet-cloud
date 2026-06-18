@@ -3,14 +3,16 @@
 //! [`AppState`] builder. Doc-hidden; used by both unit tests and the integration
 //! tests in `tests/`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use base64::Engine as _;
 use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::SigningKey;
+use tokio::sync::broadcast;
 
+use wardnet_common::event::{BroadcastEventBus, DomainEvent, EventPublisher};
 use wardnet_common::token::{Signer, Verifier};
 
 use crate::config::Config;
@@ -19,11 +21,13 @@ use crate::repository::enrollment::{EnrollOutcome, EnrollmentRepository};
 use crate::repository::network::{
     Network, NetworkRepository, ProvisioningState, RegisterNetworkOutcome,
 };
-use crate::repository::tenant::{
-    CreateTenantOutcome, Entitlement, SubscriptionStatus, Tenant, TenantRepository,
+use crate::repository::subscription::{
+    Entitlement, Subscription, SubscriptionRepository, SubscriptionStatus,
 };
+use crate::repository::tenant::{CreateTenantOutcome, Tenant, TenantRepository};
 use crate::service::TenantsService;
 use crate::state::AppState;
+use crate::subscription::{SubscriptionService, TrialPolicy};
 
 // ── Key material ────────────────────────────────────────────────────────────────
 
@@ -74,11 +78,13 @@ struct PendingRow {
 #[derive(Default)]
 struct Data {
     tenants: HashMap<String, Tenant>,
+    subscriptions: HashMap<String, Subscription>,
     networks: HashMap<String, Network>,
     daemons: HashMap<String, Daemon>,
     codes: HashMap<String, CodeRow>,
     pending: HashMap<String, PendingRow>,
     code_log: Vec<(String, DateTime<Utc>)>,
+    processed_events: HashSet<String>,
 }
 
 /// A shared mock backing store. All mock repositories built from one
@@ -99,6 +105,39 @@ impl MockStore {
             .unwrap()
             .tenants
             .insert(tenant.id.clone(), tenant);
+    }
+
+    /// Seed a subscription directly (e.g. an active paid sub with a custom entitlement).
+    pub fn seed_subscription(&self, sub: Subscription) {
+        self.0
+            .lock()
+            .unwrap()
+            .subscriptions
+            .insert(sub.id.clone(), sub);
+    }
+
+    /// The tenant's current (non-canceled) subscription, if any.
+    #[must_use]
+    pub fn current_subscription(&self, tenant_id: &str) -> Option<Subscription> {
+        self.0
+            .lock()
+            .unwrap()
+            .subscriptions
+            .values()
+            .find(|s| s.tenant_id == tenant_id && s.status != SubscriptionStatus::Canceled)
+            .cloned()
+    }
+
+    /// Number of subscription rows stored for a tenant (history included).
+    #[must_use]
+    pub fn subscription_count(&self, tenant_id: &str) -> usize {
+        self.0
+            .lock()
+            .unwrap()
+            .subscriptions
+            .values()
+            .filter(|s| s.tenant_id == tenant_id)
+            .count()
     }
 
     /// Number of networks currently stored.
@@ -182,18 +221,16 @@ impl TenantRepository for MockStore {
             .cloned())
     }
 
-    async fn set_subscription_status(
-        &self,
-        id: &str,
-        status: SubscriptionStatus,
-    ) -> anyhow::Result<bool> {
-        let mut d = self.0.lock().unwrap();
-        if let Some(t) = d.tenants.get_mut(id) {
-            t.subscription_status = status;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+    async fn list_live_ids(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .tenants
+            .values()
+            .filter(|t| t.deregistered_at.is_none())
+            .map(|t| t.id.clone())
+            .collect())
     }
 
     async fn set_deregistered(&self, id: &str) -> anyhow::Result<bool> {
@@ -446,15 +483,12 @@ impl EnrollmentRepository for MockStore {
         code_hash: &str,
         public_key: &str,
         new_tenant_id: &str,
-        default_entitlement: Entitlement,
         now: DateTime<Utc>,
         pending_ttl_secs: i64,
     ) -> anyhow::Result<EnrollOutcome> {
         let mut d = self.0.lock().unwrap();
 
-        // Validate the code WITHOUT burning yet — mirror the Pg impl, which burns
-        // inside the tx and rolls back on DaemonLimit, so a limit rejection leaves
-        // the code reusable.
+        // Validate the code without burning until the tenant resolves.
         let Some(code) = d.codes.get(code_hash) else {
             return Ok(EnrollOutcome::BadCode);
         };
@@ -464,11 +498,11 @@ impl EnrollmentRepository for MockStore {
         let email = code.email.clone();
         let code_tenant_id = code.tenant_id.clone();
 
-        // Resolve the tenant.
-        let tenant_id = if let Some(tid) = code_tenant_id {
+        // Resolve the tenant; the saga does not touch subscriptions or enforce limits.
+        let (tenant_id, tenant_created) = if let Some(tid) = code_tenant_id {
             // Add-daemon — never into a deregistered tenant.
             match d.tenants.get(&tid) {
-                Some(t) if t.deregistered_at.is_none() => tid,
+                Some(t) if t.deregistered_at.is_none() => (tid, false),
                 _ => return Ok(EnrollOutcome::BadCode),
             }
         } else if let Some(t) = d
@@ -476,44 +510,19 @@ impl EnrollmentRepository for MockStore {
             .values()
             .find(|t| t.email == email && t.deregistered_at.is_none())
         {
-            t.id.clone()
+            (t.id.clone(), false)
         } else {
             let tenant = Tenant {
                 id: new_tenant_id.to_string(),
                 email,
-                entitlement: default_entitlement,
-                subscription_status: SubscriptionStatus::Active,
-                subscription_id: None,
                 created_at: now,
                 deregistered_at: None,
             };
             d.tenants.insert(tenant.id.clone(), tenant);
-            new_tenant_id.to_string()
+            (new_tenant_id.to_string(), true)
         };
 
-        // Enforce the daemon limit over registered daemons + live pending bindings
-        // (excluding this key), before burning — matches the Pg query.
-        let max_daemons = d
-            .tenants
-            .get(&tenant_id)
-            .map_or(0, |t| t.entitlement.max_daemons);
-        let daemon_count = d
-            .daemons
-            .values()
-            .filter(|x| x.tenant_id == tenant_id)
-            .count();
-        let pending_count = d
-            .pending
-            .iter()
-            .filter(|(pk, p)| {
-                p.tenant_id == tenant_id && pk.as_str() != public_key && p.expires_at > now
-            })
-            .count();
-        if daemon_count + pending_count >= max_daemons as usize {
-            return Ok(EnrollOutcome::DaemonLimit);
-        }
-
-        // Limit passed — now burn the code and write the pending binding.
+        // Burn the code and write the pending binding.
         if let Some(code) = d.codes.get_mut(code_hash) {
             code.used_at = Some(now);
         }
@@ -524,7 +533,10 @@ impl EnrollmentRepository for MockStore {
                 expires_at: now + Duration::seconds(pending_ttl_secs),
             },
         );
-        Ok(EnrollOutcome::Enrolled { tenant_id })
+        Ok(EnrollOutcome::Enrolled {
+            tenant_id,
+            tenant_created,
+        })
     }
 
     async fn find_pending_tenant(
@@ -572,6 +584,210 @@ impl EnrollmentRepository for MockStore {
     }
 }
 
+#[async_trait]
+impl SubscriptionRepository for MockStore {
+    async fn create_trial(&self, sub: &Subscription) -> anyhow::Result<bool> {
+        let mut d = self.0.lock().unwrap();
+        // Only when the tenant has NO subscription history (mirrors the SQL guard).
+        if d.subscriptions
+            .values()
+            .any(|s| s.tenant_id == sub.tenant_id)
+        {
+            return Ok(false);
+        }
+        d.subscriptions.insert(sub.id.clone(), sub.clone());
+        Ok(true)
+    }
+
+    async fn find_current(&self, tenant_id: &str) -> anyhow::Result<Option<Subscription>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .subscriptions
+            .values()
+            .find(|s| s.tenant_id == tenant_id && s.status != SubscriptionStatus::Canceled)
+            .cloned())
+    }
+
+    async fn find_by_stripe_subscription_id(
+        &self,
+        stripe_subscription_id: &str,
+    ) -> anyhow::Result<Option<Subscription>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .subscriptions
+            .values()
+            .find(|s| s.stripe_subscription_id.as_deref() == Some(stripe_subscription_id))
+            .cloned())
+    }
+
+    async fn latest_customer_id(&self, tenant_id: &str) -> anyhow::Result<Option<String>> {
+        let d = self.0.lock().unwrap();
+        Ok(d.subscriptions
+            .values()
+            .filter(|s| s.tenant_id == tenant_id && s.stripe_customer_id.is_some())
+            .max_by_key(|s| s.created_at)
+            .and_then(|s| s.stripe_customer_id.clone()))
+    }
+
+    async fn stamp_customer_id(
+        &self,
+        tenant_id: &str,
+        stripe_customer_id: &str,
+    ) -> anyhow::Result<bool> {
+        let mut d = self.0.lock().unwrap();
+        if let Some(s) = d
+            .subscriptions
+            .values_mut()
+            .find(|s| s.tenant_id == tenant_id && s.status != SubscriptionStatus::Canceled)
+        {
+            s.stripe_customer_id = Some(stripe_customer_id.to_string());
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn convert_trial_to_paid(
+        &self,
+        tenant_id: &str,
+        paid: &Subscription,
+    ) -> anyhow::Result<()> {
+        let mut d = self.0.lock().unwrap();
+        for s in d.subscriptions.values_mut() {
+            if s.tenant_id == tenant_id && s.status != SubscriptionStatus::Canceled {
+                s.status = SubscriptionStatus::Canceled;
+            }
+        }
+        d.subscriptions.insert(paid.id.clone(), paid.clone());
+        Ok(())
+    }
+
+    async fn update_from_stripe(
+        &self,
+        stripe_subscription_id: &str,
+        status: SubscriptionStatus,
+        entitlement: Entitlement,
+        current_period_end: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<bool> {
+        let mut d = self.0.lock().unwrap();
+        if let Some(s) = d
+            .subscriptions
+            .values_mut()
+            .find(|s| s.stripe_subscription_id.as_deref() == Some(stripe_subscription_id))
+        {
+            s.status = status;
+            s.entitlement = entitlement;
+            s.current_period_end = current_period_end;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn cancel_current(&self, tenant_id: &str) -> anyhow::Result<bool> {
+        let mut d = self.0.lock().unwrap();
+        if let Some(s) = d
+            .subscriptions
+            .values_mut()
+            .find(|s| s.tenant_id == tenant_id && s.status != SubscriptionStatus::Canceled)
+        {
+            s.status = SubscriptionStatus::Canceled;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn list_overdue(
+        &self,
+        trial_cutoff: DateTime<Utc>,
+        payment_cutoff: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .subscriptions
+            .values()
+            .filter(|s| match s.status {
+                SubscriptionStatus::Trialing => {
+                    s.trial_expires_at.is_some_and(|t| t < trial_cutoff)
+                }
+                SubscriptionStatus::PastDue => {
+                    s.current_period_end.is_some_and(|c| c < payment_cutoff)
+                }
+                _ => false,
+            })
+            .map(|s| s.tenant_id.clone())
+            .collect())
+    }
+
+    async fn record_event(&self, event_id: &str, _now: DateTime<Utc>) -> anyhow::Result<bool> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .processed_events
+            .insert(event_id.to_string()))
+    }
+}
+
+// ── Recording event publisher ───────────────────────────────────────────────────
+
+/// An [`EventPublisher`] that records every published event (for `published()`
+/// assertions) and queues them for the deterministic [`Harness::pump`] — while also
+/// forwarding to a real broadcast bus so a test can drive the async reactors if it
+/// wants to.
+pub struct RecordingEventPublisher {
+    bus: BroadcastEventBus,
+    log: Mutex<Vec<DomainEvent>>,
+    pending: Mutex<VecDeque<DomainEvent>>,
+}
+
+impl RecordingEventPublisher {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            bus: BroadcastEventBus::new(256),
+            log: Mutex::new(Vec::new()),
+            pending: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Every event published so far, in order (for assertions).
+    #[must_use]
+    pub fn published(&self) -> Vec<DomainEvent> {
+        self.log.lock().unwrap().clone()
+    }
+
+    /// Drain the not-yet-pumped events.
+    fn take_pending(&self) -> Vec<DomainEvent> {
+        self.pending.lock().unwrap().drain(..).collect()
+    }
+}
+
+impl Default for RecordingEventPublisher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EventPublisher for RecordingEventPublisher {
+    fn publish(&self, event: DomainEvent) {
+        self.log.lock().unwrap().push(event.clone());
+        self.pending.lock().unwrap().push_back(event.clone());
+        self.bus.publish(event);
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<DomainEvent> {
+        self.bus.subscribe()
+    }
+}
+
 // ── Builders ──────────────────────────────────────────────────────────────────
 
 /// A throwaway [`Config`] (no real listeners/PEM are opened in mock-backed tests).
@@ -587,6 +803,10 @@ pub fn test_config() -> Config {
         leaf_cert_path: "/dev/null".to_string(),
         leaf_key_path: "/dev/null".to_string(),
         sweep_interval_secs: 3600,
+        trial_days: 60,
+        trial_grace_days: 15,
+        payment_grace_days: 15,
+        sub_reaper_interval_secs: 3600,
     }
 }
 
@@ -597,21 +817,90 @@ pub fn test_signer(seed: u8) -> Signer {
     Signer::from_pem(jwt_keypair_pem(seed).0.as_bytes(), None).unwrap()
 }
 
-/// Build an [`AppState`] backed by a fresh [`MockStore`], plus the store handle for
-/// assertions. The service signer and the state verifier share `seed`'s keypair.
+/// A fully-wired test context over a shared [`MockStore`]: the [`AppState`] plus the
+/// service + event handles needed to drive the event-driven flows deterministically.
+pub struct Harness {
+    pub state: AppState,
+    pub store: MockStore,
+    pub events: Arc<RecordingEventPublisher>,
+    pub subscriptions: Arc<SubscriptionService>,
+    pub tenants: Arc<TenantsService>,
+}
+
+impl Harness {
+    /// Apply every queued domain event through the reactor handlers, to a fixpoint.
+    pub async fn pump(&self) {
+        pump_events(&self.events, &self.subscriptions, &self.tenants).await;
+    }
+}
+
+/// Apply every queued domain event through the reactor handlers, to a fixpoint (a
+/// cancel publishes a further `SubscriptionDeactivated`, etc.). The synchronous
+/// stand-in for the spawned reactors, so tests stay deterministic. Shared by the
+/// mock-backed [`Harness`] and the Postgres integration harness.
+pub async fn pump_events(
+    events: &RecordingEventPublisher,
+    subscriptions: &SubscriptionService,
+    tenants: &TenantsService,
+) {
+    loop {
+        let batch = events.take_pending();
+        if batch.is_empty() {
+            break;
+        }
+        for event in &batch {
+            crate::subscription::reactor::apply_to_subscription(subscriptions, event).await;
+            crate::subscription::reactor::apply_to_network(tenants, event).await;
+        }
+    }
+}
+
+/// Build a full [`Harness`]. The service signer and the state verifier share `seed`'s
+/// keypair. The trial policy is the default 60/15/15.
 #[must_use]
-pub fn build_state(seed: u8) -> (AppState, MockStore) {
+pub fn build_harness(seed: u8) -> Harness {
     let store = MockStore::new();
+    let events: Arc<RecordingEventPublisher> = Arc::new(RecordingEventPublisher::new());
     let signer = test_signer(seed);
     let verifier = Verifier::from_pem(jwt_keypair_pem(seed).1.as_bytes()).unwrap();
-    let service = Arc::new(TenantsService::new(
+
+    let subscriptions = Arc::new(SubscriptionService::new(
+        Arc::new(store.clone()),
+        events.clone(),
+        TrialPolicy {
+            trial_days: 60,
+            trial_grace_days: 15,
+            payment_grace_days: 15,
+        },
+    ));
+    let tenants = Arc::new(TenantsService::new(
         Arc::new(store.clone()),
         Arc::new(store.clone()),
         Arc::new(store.clone()),
         Arc::new(store.clone()),
+        subscriptions.clone(),
+        events.clone(),
         signer,
         ["use1".to_string(), "eu1".to_string()],
     ));
-    let state = AppState::new(test_config(), service, verifier);
-    (state, store)
+    let state = AppState::new(
+        test_config(),
+        tenants.clone(),
+        subscriptions.clone(),
+        verifier,
+    );
+    Harness {
+        state,
+        store,
+        events,
+        subscriptions,
+        tenants,
+    }
+}
+
+/// Convenience for tests that only need the [`AppState`] + store (no event pumping).
+#[must_use]
+pub fn build_state(seed: u8) -> (AppState, MockStore) {
+    let h = build_harness(seed);
+    (h.state, h.store)
 }

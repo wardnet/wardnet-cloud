@@ -1,11 +1,15 @@
-//! Unit tests for [`TenantsService`] over the shared mock store.
+//! Unit tests for [`TenantsService`] over the shared mock store + recording event
+//! publisher. Flows that depend on the event-driven trial run [`Harness::pump`] to
+//! apply the reactors deterministically.
+
+use chrono::Utc;
 
 use wardnet_common::token::{PrincipalType, Verifier};
 
 use crate::error::TenantsError;
-use crate::repository::ProvisioningState;
-use crate::repository::tenant::{Entitlement, SubscriptionStatus, Tenant};
-use crate::test_helpers::{build_state, daemon_keypair, jwt_keypair_pem};
+use crate::repository::subscription::{Entitlement, Subscription, SubscriptionStatus};
+use crate::repository::{ProvisioningState, Tenant};
+use crate::test_helpers::{Harness, build_harness, build_state, daemon_keypair, jwt_keypair_pem};
 
 const SEED: u8 = 5;
 const REGION: &str = "use1";
@@ -14,48 +18,86 @@ fn verifier() -> Verifier {
     Verifier::from_pem(jwt_keypair_pem(SEED).1.as_bytes()).unwrap()
 }
 
-/// Run the full wizard flow up to a registered network, returning
-/// `(state, store, tenant_id, daemon_cnf, slug)`.
-async fn enrolled_and_registered() -> (
-    crate::state::AppState,
-    crate::test_helpers::MockStore,
-    String,
-    String,
-    String,
-) {
-    let (state, store) = build_state(SEED);
+/// Seed a tenant + an active (paid) subscription granting `max_networks`/`max_daemons`.
+fn seed_tenant_with_entitlement(h: &Harness, id: &str, max_networks: u32, max_daemons: u32) {
+    let now = Utc::now();
+    h.store.seed_tenant(Tenant {
+        id: id.to_string(),
+        email: format!("{id}@b.com"),
+        created_at: now,
+        deregistered_at: None,
+    });
+    h.store.seed_subscription(Subscription {
+        id: format!("sub-{id}"),
+        tenant_id: id.to_string(),
+        status: SubscriptionStatus::Active,
+        entitlement: Entitlement {
+            max_networks,
+            max_daemons,
+        },
+        stripe_customer_id: None,
+        stripe_subscription_id: None,
+        price_id: None,
+        trial_expires_at: None,
+        current_period_end: None,
+        created_at: now,
+        updated_at: now,
+    });
+}
+
+/// Run the full wizard flow up to a registered network, pumping the trial into being.
+/// Returns `(harness, tenant_id, daemon_cnf, slug)`.
+async fn enrolled_and_registered() -> (Harness, String, String, String) {
+    let h = build_harness(SEED);
     let (_key, cnf) = daemon_keypair(11);
 
-    let code = state
+    let code = h
+        .state
         .tenants()
         .issue_signup_code("user@example.com", "1.2.3.4")
         .await
         .unwrap();
-    let enroll = state.tenants().enroll(&code, &cnf).await.unwrap();
-    let tenant_id = enroll.tenant_id;
+    let tenant_id = h
+        .state
+        .tenants()
+        .enroll(&code, &cnf)
+        .await
+        .unwrap()
+        .tenant_id;
+    // The subscription reactor opens the trial.
+    h.pump().await;
 
-    let network = state
+    let network = h
+        .state
         .tenants()
         .register_network(&tenant_id, &cnf, "happy-einstein", None, REGION)
         .await
         .unwrap();
     assert_eq!(network.provisioning_state, ProvisioningState::Provisioning);
-    (state, store, tenant_id, cnf, "happy-einstein".to_string())
+    (h, tenant_id, cnf, "happy-einstein".to_string())
 }
 
 #[tokio::test]
 async fn enroll_then_token_is_tenant_scoped_then_network_scoped() {
-    let (state, _store) = build_state(SEED);
+    let h = build_harness(SEED);
     let (_key, cnf) = daemon_keypair(11);
-    let code = state
+    let code = h
+        .state
         .tenants()
         .issue_signup_code("a@b.com", "1.2.3.4")
         .await
         .unwrap();
-    let tenant_id = state.tenants().enroll(&code, &cnf).await.unwrap().tenant_id;
+    let tenant_id = h
+        .state
+        .tenants()
+        .enroll(&code, &cnf)
+        .await
+        .unwrap()
+        .tenant_id;
+    h.pump().await; // open the trial
 
     // Before a network exists: a tenant-scoped token (no `net`).
-    let token = state.tenants().mint_jwt(&cnf).await.unwrap();
+    let token = h.state.tenants().mint_jwt(&cnf).await.unwrap();
     let claims = verifier().verify(&token).unwrap();
     assert_eq!(claims.pt, PrincipalType::Daemon);
     assert_eq!(claims.tid, tenant_id);
@@ -64,12 +106,13 @@ async fn enroll_then_token_is_tenant_scoped_then_network_scoped() {
     assert_eq!(claims.cnf.unwrap().ed25519, cnf);
 
     // After register-network: a network-scoped token (`net` set).
-    let network = state
+    let network = h
+        .state
         .tenants()
         .register_network(&tenant_id, &cnf, "my-net", None, REGION)
         .await
         .unwrap();
-    let token = state.tenants().mint_jwt(&cnf).await.unwrap();
+    let token = h.state.tenants().mint_jwt(&cnf).await.unwrap();
     let claims = verifier().verify(&token).unwrap();
     assert_eq!(claims.net.as_deref(), Some(network.id.as_str()));
 }
@@ -81,6 +124,26 @@ async fn mint_jwt_unknown_key_is_rejected() {
     assert!(matches!(
         state.tenants().mint_jwt(&cnf).await,
         Err(TenantsError::BadCode(_))
+    ));
+}
+
+#[tokio::test]
+async fn mint_jwt_denied_without_a_subscription() {
+    // A daemon enrolled but whose trial was never opened (event dropped, not yet
+    // reconciled) has no active subscription, so cannot mint a token.
+    let h = build_harness(SEED);
+    let (_key, cnf) = daemon_keypair(11);
+    let code = h
+        .state
+        .tenants()
+        .issue_signup_code("a@b.com", "1.2.3.4")
+        .await
+        .unwrap();
+    h.state.tenants().enroll(&code, &cnf).await.unwrap();
+    // No pump → no trial subscription yet.
+    assert!(matches!(
+        h.state.tenants().mint_jwt(&cnf).await,
+        Err(TenantsError::Forbidden(_))
     ));
 }
 
@@ -112,47 +175,112 @@ async fn enroll_is_single_use() {
 }
 
 #[tokio::test]
+async fn enroll_publishes_tenant_created_only_for_a_new_tenant() {
+    use wardnet_common::event::DomainEvent;
+    let h = build_harness(SEED);
+    let (_k1, c1) = daemon_keypair(11);
+    let code = h
+        .state
+        .tenants()
+        .issue_signup_code("new@b.com", "1.2.3.4")
+        .await
+        .unwrap();
+    let tenant_id = h
+        .state
+        .tenants()
+        .enroll(&code, &c1)
+        .await
+        .unwrap()
+        .tenant_id;
+    assert!(h.events.published().contains(&DomainEvent::TenantCreated {
+        tenant_id: tenant_id.clone()
+    }));
+    h.pump().await;
+
+    // An add-daemon enroll into the same tenant does NOT re-publish TenantCreated.
+    let before = h.events.published().len();
+    let (_k2, c2) = daemon_keypair(12);
+    let code2 = h
+        .state
+        .tenants()
+        .issue_tenant_code(&tenant_id)
+        .await
+        .unwrap();
+    h.state.tenants().enroll(&code2, &c2).await.unwrap();
+    let new_events = &h.events.published()[before..];
+    assert!(
+        !new_events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::TenantCreated { .. }))
+    );
+}
+
+#[tokio::test]
 async fn register_network_default_entitlement_blocks_second_daemon() {
-    // Default entitlement is 1 network / 1 daemon: a second daemon for the same
-    // tenant is rejected at enroll (daemon limit).
-    let (state, _store, tenant_id, _cnf, _slug) = enrolled_and_registered().await;
+    // Trial entitlement is 1 network / 1 daemon: the wizard registers one network +
+    // daemon, and a second daemon is rejected at register-network (the daemon limit's
+    // new home — enroll no longer caps it).
+    let (h, tenant_id, _cnf, _slug) = enrolled_and_registered().await;
     let (_key2, cnf2) = daemon_keypair(22);
-    let code = state.tenants().issue_tenant_code(&tenant_id).await.unwrap();
+    let code = h
+        .state
+        .tenants()
+        .issue_tenant_code(&tenant_id)
+        .await
+        .unwrap();
+    // Enroll succeeds now (no cap at enroll)…
+    h.state.tenants().enroll(&code, &cnf2).await.unwrap();
+    // …but register-network is rejected on the entitlement.
     assert!(matches!(
-        state.tenants().enroll(&code, &cnf2).await,
+        h.state
+            .tenants()
+            .register_network(&tenant_id, &cnf2, "second-net", None, REGION)
+            .await,
+        Err(TenantsError::EntitlementExceeded(_))
+    ));
+}
+
+#[tokio::test]
+async fn register_network_enforces_daemon_limit() {
+    // Generous networks, capped at one daemon: a second daemon (in a second network)
+    // is rejected.
+    let h = build_harness(SEED);
+    seed_tenant_with_entitlement(&h, "t-dae", 5, 1);
+    let (_k1, c1) = daemon_keypair(31);
+    let (_k2, c2) = daemon_keypair(32);
+    assert!(
+        h.state
+            .tenants()
+            .register_network("t-dae", &c1, "net-a", None, REGION)
+            .await
+            .is_ok()
+    );
+    assert!(matches!(
+        h.state
+            .tenants()
+            .register_network("t-dae", &c2, "net-b", None, REGION)
+            .await,
         Err(TenantsError::EntitlementExceeded(_))
     ));
 }
 
 #[tokio::test]
 async fn register_network_enforces_network_limit() {
-    let (state, store) = build_state(SEED);
+    let h = build_harness(SEED);
     // A tenant generous on daemons but capped at one network.
-    let tenant = Tenant {
-        id: "t-net".to_string(),
-        email: "n@b.com".to_string(),
-        entitlement: Entitlement {
-            max_networks: 1,
-            max_daemons: 5,
-        },
-        subscription_status: SubscriptionStatus::Active,
-        subscription_id: None,
-        created_at: chrono::Utc::now(),
-        deregistered_at: None,
-    };
-    store.seed_tenant(tenant);
-    let (_k1, c1) = daemon_keypair(31);
-    let (_k2, c2) = daemon_keypair(32);
+    seed_tenant_with_entitlement(&h, "t-net", 1, 5);
+    let (_k1, c1) = daemon_keypair(33);
+    let (_k2, c2) = daemon_keypair(34);
 
     assert!(
-        state
+        h.state
             .tenants()
             .register_network("t-net", &c1, "net-a", None, REGION)
             .await
             .is_ok()
     );
     assert!(matches!(
-        state
+        h.state
             .tenants()
             .register_network("t-net", &c2, "net-b", None, REGION)
             .await,
@@ -162,28 +290,17 @@ async fn register_network_enforces_network_limit() {
 
 #[tokio::test]
 async fn register_network_rejects_taken_slug() {
-    let (state, store) = build_state(SEED);
-    store.seed_tenant(Tenant {
-        id: "t1".to_string(),
-        email: "t1@b.com".to_string(),
-        entitlement: Entitlement {
-            max_networks: 5,
-            max_daemons: 5,
-        },
-        subscription_status: SubscriptionStatus::Active,
-        subscription_id: None,
-        created_at: chrono::Utc::now(),
-        deregistered_at: None,
-    });
+    let h = build_harness(SEED);
+    seed_tenant_with_entitlement(&h, "t1", 5, 5);
     let (_k1, c1) = daemon_keypair(41);
     let (_k2, c2) = daemon_keypair(42);
-    state
+    h.state
         .tenants()
         .register_network("t1", &c1, "taken", None, REGION)
         .await
         .unwrap();
     assert!(matches!(
-        state
+        h.state
             .tenants()
             .register_network("t1", &c2, "taken", None, REGION)
             .await,
@@ -192,40 +309,45 @@ async fn register_network_rejects_taken_slug() {
 }
 
 #[tokio::test]
-async fn mint_jwt_denied_after_subscription_canceled() {
-    let (state, _store, tenant_id, cnf, _slug) = enrolled_and_registered().await;
-    // Active tenant mints fine.
-    assert!(state.tenants().mint_jwt(&cnf).await.is_ok());
-    // After cancel, the daemon's key can no longer mint a token (revocation at refresh).
-    state
-        .tenants()
-        .cancel_subscription(&tenant_id)
-        .await
-        .unwrap();
+async fn register_network_denied_without_a_subscription() {
+    // A tenant with no subscription (only identity seeded) cannot register a network.
+    let h = build_harness(SEED);
+    h.store.seed_tenant(Tenant {
+        id: "lonely".to_string(),
+        email: "lonely@b.com".to_string(),
+        created_at: Utc::now(),
+        deregistered_at: None,
+    });
+    let (_k, c) = daemon_keypair(43);
     assert!(matches!(
-        state.tenants().mint_jwt(&cnf).await,
+        h.state
+            .tenants()
+            .register_network("lonely", &c, "net", None, REGION)
+            .await,
+        Err(TenantsError::Forbidden(_))
+    ));
+}
+
+#[tokio::test]
+async fn mint_jwt_denied_after_subscription_canceled() {
+    let (h, tenant_id, cnf, _slug) = enrolled_and_registered().await;
+    // Active (trialing) tenant mints fine.
+    assert!(h.state.tenants().mint_jwt(&cnf).await.is_ok());
+    // After cancel, the daemon's key can no longer mint a token (revocation at refresh).
+    h.state.subscriptions().cancel(&tenant_id).await.unwrap();
+    assert!(matches!(
+        h.state.tenants().mint_jwt(&cnf).await,
         Err(TenantsError::Forbidden(_))
     ));
 }
 
 #[tokio::test]
 async fn register_network_rejects_unknown_region() {
-    let (state, store) = build_state(SEED);
-    store.seed_tenant(Tenant {
-        id: "t1".to_string(),
-        email: "t1@b.com".to_string(),
-        entitlement: Entitlement {
-            max_networks: 5,
-            max_daemons: 5,
-        },
-        subscription_status: SubscriptionStatus::Active,
-        subscription_id: None,
-        created_at: chrono::Utc::now(),
-        deregistered_at: None,
-    });
+    let h = build_harness(SEED);
+    seed_tenant_with_entitlement(&h, "t1", 5, 5);
     let (_k, c) = daemon_keypair(51);
     assert!(matches!(
-        state
+        h.state
             .tenants()
             .register_network("t1", &c, "net-x", None, "mars")
             .await,
@@ -234,113 +356,119 @@ async fn register_network_rejects_unknown_region() {
 }
 
 #[tokio::test]
-async fn enroll_pending_bindings_count_against_daemon_limit() {
-    // Default entitlement 1 daemon: a first key may enroll (pending), but a second
-    // key for the same tenant is rejected even before either registers a network.
-    let (state, _store) = build_state(SEED);
-    let (_k1, c1) = daemon_keypair(11);
-    let code = state
-        .tenants()
-        .issue_signup_code("p@b.com", "1.2.3.4")
-        .await
-        .unwrap();
-    let tenant_id = state.tenants().enroll(&code, &c1).await.unwrap().tenant_id;
-
-    let (_k2, c2) = daemon_keypair(12);
-    let code2 = state.tenants().issue_tenant_code(&tenant_id).await.unwrap();
-    assert!(matches!(
-        state.tenants().enroll(&code2, &c2).await,
-        Err(TenantsError::EntitlementExceeded(_))
-    ));
-}
-
-#[tokio::test]
 async fn availability_reflects_validity_and_use() {
-    let (state, _store, _tid, _cnf, slug) = enrolled_and_registered().await;
-    assert!(!state.tenants().check_availability(&slug).await.unwrap()); // taken
+    let (h, _tid, _cnf, slug) = enrolled_and_registered().await;
+    assert!(!h.state.tenants().check_availability(&slug).await.unwrap()); // taken
     assert!(
-        state
+        h.state
             .tenants()
             .check_availability("free-name")
             .await
             .unwrap()
     ); // free
-    assert!(!state.tenants().check_availability("api").await.unwrap()); // reserved
-    assert!(!state.tenants().check_availability("A_B").await.unwrap()); // invalid
+    assert!(!h.state.tenants().check_availability("api").await.unwrap()); // reserved
+    assert!(!h.state.tenants().check_availability("A_B").await.unwrap()); // invalid
 }
 
 #[tokio::test]
 async fn reconcile_provisioner_then_reaper_lifecycle() {
-    let (state, store, tenant_id, _cnf, slug) = enrolled_and_registered().await;
+    let (h, tenant_id, _cnf, slug) = enrolled_and_registered().await;
 
     // Provisioner sees it in `provisioning`, marks it active.
-    let page = state
+    let page = h
+        .state
         .tenants()
         .reconcile_page(ProvisioningState::Provisioning, REGION, None, 100)
         .await
         .unwrap();
     assert_eq!(page.len(), 1);
     let id = page[0].id.clone();
-    assert!(state.tenants().mark_network_active(&id).await.unwrap());
-    assert_eq!(store.network_state(&slug), Some(ProvisioningState::Active));
-
-    // Cancel cascades the network to deprovisioning.
-    state
-        .tenants()
-        .cancel_subscription(&tenant_id)
-        .await
-        .unwrap();
+    assert!(h.state.tenants().mark_network_active(&id).await.unwrap());
     assert_eq!(
-        store.network_state(&slug),
+        h.store.network_state(&slug),
+        Some(ProvisioningState::Active)
+    );
+
+    // Cancel deactivates the subscription; the network reactor cascades the network
+    // to deprovisioning.
+    h.state.subscriptions().cancel(&tenant_id).await.unwrap();
+    h.pump().await;
+    assert_eq!(
+        h.store.network_state(&slug),
         Some(ProvisioningState::Deprovisioning)
     );
 
     // Reaper sees it, finishes deprovision → row deleted.
-    let page = state
+    let page = h
+        .state
         .tenants()
         .reconcile_page(ProvisioningState::Deprovisioning, REGION, None, 100)
         .await
         .unwrap();
     assert_eq!(page.len(), 1);
-    assert!(state.tenants().finish_deprovision(&id).await.unwrap());
-    assert_eq!(store.network_count(), 0);
+    assert!(h.state.tenants().finish_deprovision(&id).await.unwrap());
+    assert_eq!(h.store.network_count(), 0);
     // Idempotent: a second finish is a no-op (false).
-    assert!(!state.tenants().finish_deprovision(&id).await.unwrap());
+    assert!(!h.state.tenants().finish_deprovision(&id).await.unwrap());
 }
 
 #[tokio::test]
-async fn deregister_tombstones_cascades_cancels_and_is_idempotent() {
-    let (state, store, tenant_id, cnf, slug) = enrolled_and_registered().await;
+async fn deregister_tombstones_cancels_cascades_and_is_idempotent() {
+    let (h, tenant_id, cnf, slug) = enrolled_and_registered().await;
 
-    // First deregister tombstones, cascades the network to deprovisioning, and cancels.
-    assert!(state.tenants().deregister_tenant(&tenant_id).await.unwrap());
-    let tenant = store.find_tenant(&tenant_id).unwrap();
+    // Deregister tombstones + publishes TenantDeregistered; pumping cancels the
+    // subscription and cascades the network to deprovisioning.
+    assert!(
+        h.state
+            .tenants()
+            .deregister_tenant(&tenant_id)
+            .await
+            .unwrap()
+    );
+    h.pump().await;
+    let tenant = h.store.find_tenant(&tenant_id).unwrap();
     assert!(tenant.deregistered_at.is_some());
-    assert_eq!(tenant.subscription_status, SubscriptionStatus::Canceled);
+    assert!(h.store.current_subscription(&tenant_id).is_none());
     assert_eq!(
-        store.network_state(&slug),
+        h.store.network_state(&slug),
         Some(ProvisioningState::Deprovisioning)
     );
 
     // A tombstoned tenant's daemon key can no longer mint a token.
     assert!(matches!(
-        state.tenants().mint_jwt(&cnf).await,
+        h.state.tenants().mint_jwt(&cnf).await,
         Err(TenantsError::Forbidden(_))
     ));
 
     // Idempotent: a second deregister is a no-op (false), not an error.
-    assert!(!state.tenants().deregister_tenant(&tenant_id).await.unwrap());
+    assert!(
+        !h.state
+            .tenants()
+            .deregister_tenant(&tenant_id)
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
 async fn issue_tenant_code_rejected_after_deregister() {
-    let (state, _store, tenant_id, _cnf, _slug) = enrolled_and_registered().await;
+    let (h, tenant_id, _cnf, _slug) = enrolled_and_registered().await;
     // A live tenant can issue an add-daemon code.
-    assert!(state.tenants().issue_tenant_code(&tenant_id).await.is_ok());
+    assert!(
+        h.state
+            .tenants()
+            .issue_tenant_code(&tenant_id)
+            .await
+            .is_ok()
+    );
     // After deregister, the tombstoned tenant cannot grow daemons.
-    state.tenants().deregister_tenant(&tenant_id).await.unwrap();
+    h.state
+        .tenants()
+        .deregister_tenant(&tenant_id)
+        .await
+        .unwrap();
     assert!(matches!(
-        state.tenants().issue_tenant_code(&tenant_id).await,
+        h.state.tenants().issue_tenant_code(&tenant_id).await,
         Err(TenantsError::Forbidden(_))
     ));
 }
@@ -356,71 +484,106 @@ async fn deregister_unknown_tenant_is_not_found() {
 
 #[tokio::test]
 async fn sweep_deletes_tombstoned_only_after_networks_gone() {
-    let (state, store, tenant_id, _cnf, slug) = enrolled_and_registered().await;
-    let network_id = store.network_id(&slug).unwrap();
+    let (h, tenant_id, _cnf, slug) = enrolled_and_registered().await;
+    let network_id = h.store.network_id(&slug).unwrap();
 
-    state.tenants().deregister_tenant(&tenant_id).await.unwrap();
+    h.state
+        .tenants()
+        .deregister_tenant(&tenant_id)
+        .await
+        .unwrap();
+    h.pump().await;
 
     // While the (deprovisioning) network row still exists, the sweep must not delete it.
-    assert_eq!(state.tenants().sweep_deregistered().await.unwrap(), 0);
-    assert!(store.find_tenant(&tenant_id).is_some());
+    assert_eq!(h.state.tenants().sweep_deregistered().await.unwrap(), 0);
+    assert!(h.store.find_tenant(&tenant_id).is_some());
 
     // Reaper finishes deprovision → the network row is gone.
     assert!(
-        state
+        h.state
             .tenants()
             .finish_deprovision(&network_id)
             .await
             .unwrap()
     );
-    assert_eq!(store.network_count(), 0);
+    assert_eq!(h.store.network_count(), 0);
 
     // Now the sweep deletes the tombstoned, network-less tenant.
-    assert_eq!(state.tenants().sweep_deregistered().await.unwrap(), 1);
-    assert!(store.find_tenant(&tenant_id).is_none());
+    assert_eq!(h.state.tenants().sweep_deregistered().await.unwrap(), 1);
+    assert!(h.store.find_tenant(&tenant_id).is_none());
 }
 
 #[tokio::test]
 async fn deregister_frees_email_for_fresh_signup() {
-    let (state, _store) = build_state(SEED);
+    let h = build_harness(SEED);
     let (_k1, c1) = daemon_keypair(11);
-    let code = state
+    let code = h
+        .state
         .tenants()
         .issue_signup_code("reuse@example.com", "1.2.3.4")
         .await
         .unwrap();
-    let first_id = state.tenants().enroll(&code, &c1).await.unwrap().tenant_id;
+    let first_id = h
+        .state
+        .tenants()
+        .enroll(&code, &c1)
+        .await
+        .unwrap()
+        .tenant_id;
+    h.pump().await;
 
     // Tombstoning frees the email: a fresh signup resolves to a new tenant id.
-    state.tenants().deregister_tenant(&first_id).await.unwrap();
+    h.state
+        .tenants()
+        .deregister_tenant(&first_id)
+        .await
+        .unwrap();
+    h.pump().await;
     let (_k2, c2) = daemon_keypair(12);
-    let code2 = state
+    let code2 = h
+        .state
         .tenants()
         .issue_signup_code("reuse@example.com", "1.2.3.4")
         .await
         .unwrap();
-    let second_id = state.tenants().enroll(&code2, &c2).await.unwrap().tenant_id;
+    let second_id = h
+        .state
+        .tenants()
+        .enroll(&code2, &c2)
+        .await
+        .unwrap()
+        .tenant_id;
     assert_ne!(first_id, second_id);
 }
 
 #[tokio::test]
-async fn reconcile_pagination_is_region_scoped_and_cursored() {
-    let (state, store) = build_state(SEED);
-    store.seed_tenant(Tenant {
-        id: "t".to_string(),
-        email: "t@b.com".to_string(),
-        entitlement: Entitlement {
-            max_networks: 10,
-            max_daemons: 10,
-        },
-        subscription_status: SubscriptionStatus::Active,
-        subscription_id: None,
-        created_at: chrono::Utc::now(),
+async fn reconcile_backfills_a_missing_trial() {
+    // A tenant created without its trial event landing (dropped) is backfilled by the
+    // reconcile pass; a tenant whose trial was reaped is NOT resurrected.
+    let h = build_harness(SEED);
+    h.store.seed_tenant(Tenant {
+        id: "drift".to_string(),
+        email: "drift@b.com".to_string(),
+        created_at: Utc::now(),
         deregistered_at: None,
     });
+    assert!(h.store.current_subscription("drift").is_none());
+    h.state.tenants().reconcile().await.unwrap();
+    assert!(h.store.current_subscription("drift").is_some());
+
+    // Reap it, then reconcile again — no fresh trial (history exists).
+    h.state.subscriptions().cancel("drift").await.unwrap();
+    h.state.tenants().reconcile().await.unwrap();
+    assert!(h.store.current_subscription("drift").is_none());
+}
+
+#[tokio::test]
+async fn reconcile_pagination_is_region_scoped_and_cursored() {
+    let h = build_harness(SEED);
+    seed_tenant_with_entitlement(&h, "t", 10, 10);
     for i in 0..5u8 {
         let (_k, c) = daemon_keypair(60 + i);
-        state
+        h.state
             .tenants()
             .register_network("t", &c, &format!("net-{i}"), None, REGION)
             .await
@@ -428,20 +591,22 @@ async fn reconcile_pagination_is_region_scoped_and_cursored() {
     }
     // Other-region network must not appear.
     let (_ko, co) = daemon_keypair(80);
-    state
+    h.state
         .tenants()
         .register_network("t", &co, "elsewhere", None, "eu1")
         .await
         .unwrap();
 
-    let first = state
+    let first = h
+        .state
         .tenants()
         .reconcile_page(ProvisioningState::Provisioning, REGION, None, 2)
         .await
         .unwrap();
     assert_eq!(first.len(), 2);
     let cursor = first.last().unwrap().id.clone();
-    let second = state
+    let second = h
+        .state
         .tenants()
         .reconcile_page(ProvisioningState::Provisioning, REGION, Some(&cursor), 100)
         .await

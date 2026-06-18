@@ -3,7 +3,7 @@
 //!
 //! SERVICE-plane (mounted on the mesh-mTLS listener, `authenticate(SERVICE)`). No
 //! caller policy — the full resource is returned; the consumer reads what it needs
-//! (the Tunneller checks `subscription_status`).
+//! (the Tunneller checks the embedded subscription).
 
 use axum::Json;
 use axum::Router;
@@ -32,10 +32,10 @@ async fn get_tenant(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<TenantView>, ApiError> {
-    let tenant = state
+    let (tenant, subscription) = state
         .tenants()
         .find_tenant(&id)
         .await?
         .ok_or_else(|| ApiError::NotFound("no such tenant".to_string()))?;
-    Ok(Json(tenant.into()))
+    Ok(Json(crate::api::tenants::tenant_view(tenant, subscription)))
 }

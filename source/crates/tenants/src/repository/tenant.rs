@@ -1,13 +1,10 @@
-//! The **tenant** — an account: email, entitlement, subscription. Root of the
-//! `tenant → network → daemon` model, in the global Tenants DB.
+//! The **tenant** — an account, identity only (email). Root of the
+//! `tenant → {subscription, network → daemon}` model, in the global Tenants DB.
+//! All billing/entitlement state lives on the [`subscription`](super::subscription)
+//! aggregate, never here.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sqlx::types::Json;
-
-// `Entitlement` + `SubscriptionStatus` are part of the shared API contract; they
-// double as the DB-domain types here (their helpers travel with them).
-pub use wardnet_common::contract::{Entitlement, SubscriptionStatus};
 
 use crate::db::DbPools;
 
@@ -17,10 +14,6 @@ pub struct Tenant {
     pub id: String,
     /// Lowercased account email (the account identifier).
     pub email: String,
-    pub entitlement: Entitlement,
-    pub subscription_status: SubscriptionStatus,
-    /// Provider-agnostic subscription handle; `None` until billing is wired.
-    pub subscription_id: Option<String>,
     pub created_at: DateTime<Utc>,
     /// Account-deregistration tombstone: `None` = live; `Some` = terminally
     /// deregistered (its email is freed, and mint/enroll reject it).
@@ -31,9 +24,6 @@ pub struct Tenant {
 struct TenantRow {
     id: String,
     email: String,
-    entitlement: Json<Entitlement>,
-    subscription_status: String,
-    subscription_id: Option<String>,
     created_at: DateTime<Utc>,
     deregistered_at: Option<DateTime<Utc>>,
 }
@@ -43,9 +33,6 @@ impl From<TenantRow> for Tenant {
         Self {
             id: r.id,
             email: r.email,
-            entitlement: r.entitlement.0,
-            subscription_status: SubscriptionStatus::from_db(&r.subscription_status),
-            subscription_id: r.subscription_id,
             created_at: r.created_at,
             deregistered_at: r.deregistered_at,
         }
@@ -70,19 +57,16 @@ pub trait TenantRepository: Send + Sync {
     async fn find_by_id(&self, id: &str) -> anyhow::Result<Option<Tenant>>;
     /// Fetch a tenant by (lowercased) email.
     async fn find_by_email(&self, email: &str) -> anyhow::Result<Option<Tenant>>;
-    /// Set the subscription status. Returns `false` if no such tenant.
-    async fn set_subscription_status(
-        &self,
-        id: &str,
-        status: SubscriptionStatus,
-    ) -> anyhow::Result<bool>;
+    /// Ids of all live (non-tombstoned) tenants — the reconcile scan input.
+    async fn list_live_ids(&self) -> anyhow::Result<Vec<String>>;
     /// Stamp the deregistration tombstone on a live tenant. Returns `true` if it newly
     /// tombstoned the tenant, `false` if it was already tombstoned or no such tenant
     /// (idempotent).
     async fn set_deregistered(&self, id: &str) -> anyhow::Result<bool>;
     /// Delete every tombstoned tenant that no longer owns any networks, returning the
-    /// number of rows deleted. FK `ON DELETE CASCADE` removes the tenant's daemons,
-    /// enrollment codes, and pending enrollments. N-replica-safe and idempotent.
+    /// number of rows deleted. FK `ON DELETE CASCADE` removes the tenant's
+    /// subscriptions, daemons, enrollment codes, and pending enrollments. N-replica-safe
+    /// and idempotent.
     async fn delete_tombstoned_empty(&self) -> anyhow::Result<u64>;
 }
 
@@ -109,15 +93,12 @@ impl PgTenantRepository {
 impl TenantRepository for PgTenantRepository {
     async fn create(&self, tenant: &Tenant) -> anyhow::Result<CreateTenantOutcome> {
         let affected = sqlx::query(
-            "INSERT INTO tenants (id, email, entitlement, subscription_status, subscription_id, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            "INSERT INTO tenants (id, email, created_at)
+             VALUES ($1, $2, $3)
              ON CONFLICT (email) WHERE deregistered_at IS NULL DO NOTHING",
         )
         .bind(&tenant.id)
         .bind(&tenant.email)
-        .bind(Json(tenant.entitlement))
-        .bind(tenant.subscription_status.as_str())
-        .bind(&tenant.subscription_id)
         .bind(tenant.created_at)
         .execute(&self.pools.write)
         .await?
@@ -131,8 +112,7 @@ impl TenantRepository for PgTenantRepository {
 
     async fn find_by_id(&self, id: &str) -> anyhow::Result<Option<Tenant>> {
         let row = sqlx::query_as::<_, TenantRow>(
-            "SELECT id, email, entitlement, subscription_status, subscription_id, created_at, deregistered_at \
-             FROM tenants WHERE id = $1",
+            "SELECT id, email, created_at, deregistered_at FROM tenants WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pools.read)
@@ -142,7 +122,7 @@ impl TenantRepository for PgTenantRepository {
 
     async fn find_by_email(&self, email: &str) -> anyhow::Result<Option<Tenant>> {
         let row = sqlx::query_as::<_, TenantRow>(
-            "SELECT id, email, entitlement, subscription_status, subscription_id, created_at, deregistered_at \
+            "SELECT id, email, created_at, deregistered_at \
              FROM tenants WHERE email = $1 AND deregistered_at IS NULL",
         )
         .bind(email)
@@ -151,18 +131,12 @@ impl TenantRepository for PgTenantRepository {
         Ok(row.map(Into::into))
     }
 
-    async fn set_subscription_status(
-        &self,
-        id: &str,
-        status: SubscriptionStatus,
-    ) -> anyhow::Result<bool> {
-        let affected = sqlx::query("UPDATE tenants SET subscription_status = $2 WHERE id = $1")
-            .bind(id)
-            .bind(status.as_str())
-            .execute(&self.pools.write)
-            .await?
-            .rows_affected();
-        Ok(affected > 0)
+    async fn list_live_ids(&self) -> anyhow::Result<Vec<String>> {
+        let ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM tenants WHERE deregistered_at IS NULL")
+                .fetch_all(&self.pools.read)
+                .await?;
+        Ok(ids)
     }
 
     async fn set_deregistered(&self, id: &str) -> anyhow::Result<bool> {

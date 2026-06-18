@@ -1,8 +1,16 @@
 //! `TenantsService` — the global authority's business rules over the
 //! tenant/network/daemon model: signup-code issuance, the daemon enroll saga,
 //! JWT minting (key-`PoP` authenticated in the handler), network registration with
-//! entitlement enforcement, the subscription-cancel cascade, and the mesh
-//! reconcile transitions consumed by the regional DDNS provisioner/reaper.
+//! entitlement enforcement, and the mesh reconcile transitions consumed by the
+//! regional DDNS provisioner/reaper.
+//!
+//! Billing is a **separate aggregate**: this service never touches the subscription
+//! repository. It *reads* the current subscription by calling
+//! [`SubscriptionService::current`](crate::subscription::SubscriptionService::current),
+//! and drives subscription side-effects by **publishing domain events** (a reactor
+//! reacts). Conversely the network-deprovision side-effect of a deactivated
+//! subscription is [`deprovision_networks_for`](Self::deprovision_networks_for),
+//! invoked by the network reactor.
 
 use std::sync::Arc;
 
@@ -10,15 +18,17 @@ use chrono::{Duration, Utc};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use wardnet_common::event::{DomainEvent, EventPublisher};
 use wardnet_common::token::{ClaimsSpec, PrincipalType, Signer};
 use wardnet_common::validation::{is_valid_name, validate_public_key};
 
 use crate::error::TenantsError;
-use crate::repository::tenant::{CreateTenantOutcome, Entitlement};
 use crate::repository::{
-    Daemon, DaemonRepository, EnrollOutcome, EnrollmentRepository, Network, NetworkRepository,
-    ProvisioningState, RegisterNetworkOutcome, SubscriptionStatus, Tenant, TenantRepository,
+    CreateTenantOutcome, Daemon, DaemonRepository, EnrollOutcome, EnrollmentRepository, Network,
+    NetworkRepository, ProvisioningState, RegisterNetworkOutcome, Subscription, Tenant,
+    TenantRepository,
 };
+use crate::subscription::SubscriptionService;
 
 /// Identity JWT lifetime (seconds). Offline revocation is bounded by this.
 const IDENTITY_JWT_TTL_SECS: i64 = 3600;
@@ -42,6 +52,11 @@ pub struct TenantsService {
     networks: Arc<dyn NetworkRepository>,
     daemons: Arc<dyn DaemonRepository>,
     enrollment: Arc<dyn EnrollmentRepository>,
+    /// The subscription aggregate — **read-only** access (`current`) plus the
+    /// `is_active` policy. All subscription *writes* happen via events.
+    subscriptions: Arc<SubscriptionService>,
+    /// Domain-event sink for cross-aggregate side-effects.
+    events: Arc<dyn EventPublisher>,
     signer: Signer,
     /// The fleet's real regions; a network may only be created in one of these
     /// (otherwise no DDNS provisioner would ever pick it up).
@@ -49,12 +64,17 @@ pub struct TenantsService {
 }
 
 impl TenantsService {
+    // The service composes four repositories plus the subscription aggregate, the
+    // event sink, the JWT signer, and the region set — wiring, not a smell.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         tenants: Arc<dyn TenantRepository>,
         networks: Arc<dyn NetworkRepository>,
         daemons: Arc<dyn DaemonRepository>,
         enrollment: Arc<dyn EnrollmentRepository>,
+        subscriptions: Arc<SubscriptionService>,
+        events: Arc<dyn EventPublisher>,
         signer: Signer,
         regions: impl IntoIterator<Item = String>,
     ) -> Self {
@@ -63,6 +83,8 @@ impl TenantsService {
             networks,
             daemons,
             enrollment,
+            subscriptions,
+            events,
             signer,
             regions: regions.into_iter().collect(),
         }
@@ -70,66 +92,60 @@ impl TenantsService {
 
     // ── Account plane ────────────────────────────────────────────────────────────
 
-    /// Create a tenant (management plane). Entitlement defaults to
-    /// [`Entitlement::DEFAULT`] when not supplied.
+    /// Create a tenant (management plane) and signal its trial.
+    ///
+    /// The tenant is created here; its **trial subscription** is opened by the
+    /// subscription reactor reacting to the published `TenantCreated` event (so the
+    /// returned view may show no subscription yet — it lands a moment later). The
+    /// reconcile loop backfills the trial if the event is ever dropped.
     ///
     /// # Errors
     /// [`TenantsError::BadRequest`] on a malformed email; [`TenantsError::Conflict`]
     /// if the email is already taken.
-    pub async fn register_tenant(
-        &self,
-        email: &str,
-        entitlement: Option<Entitlement>,
-    ) -> Result<Tenant, TenantsError> {
+    pub async fn register_tenant(&self, email: &str) -> Result<Tenant, TenantsError> {
         let email = normalize_email(email)?;
         let tenant = Tenant {
             id: Uuid::new_v4().to_string(),
             email,
-            entitlement: entitlement.unwrap_or(Entitlement::DEFAULT),
-            subscription_status: SubscriptionStatus::Active,
-            subscription_id: None,
             created_at: Utc::now(),
             deregistered_at: None,
         };
         match self.tenants.create(&tenant).await? {
-            CreateTenantOutcome::Created => Ok(tenant),
+            CreateTenantOutcome::Created => {
+                self.events.publish(DomainEvent::TenantCreated {
+                    tenant_id: tenant.id.clone(),
+                });
+                Ok(tenant)
+            }
             CreateTenantOutcome::EmailTaken => Err(TenantsError::Conflict(
                 "a tenant already exists for that email".to_string(),
             )),
         }
     }
 
-    /// Cancel a tenant's subscription and cascade its `{active, provisioning}`
-    /// networks to `deprovisioning` (the reaper then tears down DNS).
+    /// Deprovision all of a tenant's `{active, provisioning}` networks (the DDNS
+    /// reaper then tears down DNS and the rows). Invoked by the **network reactor**
+    /// on `SubscriptionDeactivated`, and by the reconcile safety net. Idempotent.
     ///
     /// # Errors
-    /// [`TenantsError::NotFound`] if no such tenant.
-    pub async fn cancel_subscription(&self, tenant_id: &str) -> Result<(), TenantsError> {
-        if !self
-            .tenants
-            .set_subscription_status(tenant_id, SubscriptionStatus::Canceled)
-            .await?
-        {
-            return Err(TenantsError::NotFound("no such tenant".to_string()));
-        }
+    /// [`TenantsError::Internal`] on a repository failure.
+    pub async fn deprovision_networks_for(&self, tenant_id: &str) -> Result<(), TenantsError> {
         let n = self
             .networks
             .set_deprovisioning_for_tenant(tenant_id)
             .await?;
-        tracing::info!(
-            tenant_id,
-            networks = n,
-            "subscription canceled; networks deprovisioning"
-        );
+        if n > 0 {
+            tracing::info!(tenant_id, networks = n, "deprovisioning tenant networks");
+        }
         Ok(())
     }
 
-    /// Deregister (tombstone) a tenant account: stamp `deregistered_at`, cascade its
-    /// `{active, provisioning}` networks to `deprovisioning` (the DDNS reaper then tears
-    /// down DNS and the row), and cancel its subscription. The tombstone is terminal and
-    /// distinct from the reversible `subscription_status`; it frees the email for a fresh
-    /// signup and makes `mint_jwt`/`enroll` reject the tenant. Idempotent — a second call
-    /// on an already-tombstoned tenant is a no-op. Returns `true` if it newly tombstoned.
+    /// Deregister (tombstone) a tenant account: stamp `deregistered_at` and publish
+    /// `TenantDeregistered` so the subscription reactor cancels its subscription
+    /// (which in turn deprovisions its networks via the network reactor). The
+    /// tombstone is terminal; it frees the email for a fresh signup and makes
+    /// `mint_jwt`/`enroll` reject the tenant. Idempotent — a second call on an
+    /// already-tombstoned tenant is a no-op. Returns `true` if it newly tombstoned.
     ///
     /// # Errors
     /// [`TenantsError::NotFound`] if no such tenant.
@@ -142,19 +158,37 @@ impl TenantsService {
             // Already tombstoned — idempotent no-op.
             return Ok(false);
         }
-        let n = self
-            .networks
-            .set_deprovisioning_for_tenant(tenant_id)
-            .await?;
-        self.tenants
-            .set_subscription_status(tenant_id, SubscriptionStatus::Canceled)
-            .await?;
+        self.events.publish(DomainEvent::TenantDeregistered {
+            tenant_id: tenant_id.to_string(),
+        });
         tracing::info!(
             tenant_id,
-            networks = n,
-            "tenant deregistered; networks deprovisioning, subscription canceled"
+            "tenant deregistered; subscription cancel signalled"
         );
         Ok(true)
+    }
+
+    /// Reconcile desired state — the safety net for any dropped domain event. For
+    /// every live tenant: open a missing trial (only when the tenant has *no*
+    /// subscription history, so a reaped trial is never resurrected); and if the
+    /// tenant has no current subscription, deprovision its networks. Idempotent;
+    /// driven by the periodic reconcile loop.
+    ///
+    /// # Errors
+    /// [`TenantsError::Internal`] on a repository failure.
+    pub async fn reconcile(&self) -> Result<(), TenantsError> {
+        for tenant_id in self.tenants.list_live_ids().await? {
+            if self.subscriptions.current(&tenant_id).await?.is_some() {
+                continue;
+            }
+            // No live subscription: either the trial event was dropped (no history →
+            // create it), or the subscription lapsed (history exists → ensure the
+            // networks are deprovisioning).
+            if !self.subscriptions.create_trial(&tenant_id).await? {
+                self.deprovision_networks_for(&tenant_id).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Delete tombstoned tenants whose networks are fully deprovisioned (FK-cascading
@@ -187,12 +221,21 @@ impl TenantsService {
         Ok(self.networks.find_by_id(network_id).await?)
     }
 
-    /// Fetch the full [`Tenant`] resource by id (the mesh-plane resource read).
+    /// Fetch a tenant plus its current subscription (the mesh-plane resource read).
+    /// The subscription is read via the `SubscriptionService` method — this service
+    /// never touches the subscription repository.
     ///
     /// # Errors
     /// [`TenantsError::Internal`] on a repository failure.
-    pub async fn find_tenant(&self, tenant_id: &str) -> Result<Option<Tenant>, TenantsError> {
-        Ok(self.tenants.find_by_id(tenant_id).await?)
+    pub async fn find_tenant(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<(Tenant, Option<Subscription>)>, TenantsError> {
+        let Some(tenant) = self.tenants.find_by_id(tenant_id).await? else {
+            return Ok(None);
+        };
+        let subscription = self.subscriptions.current(tenant_id).await?;
+        Ok(Some((tenant, subscription)))
     }
 
     /// List a tenant's daemons.
@@ -310,11 +353,14 @@ impl TenantsService {
     }
 
     /// Enroll a daemon: validate + burn the code, create/resolve the tenant, write
-    /// the TTL'd pending binding. Returns the tenant the daemon is bound to.
+    /// the TTL'd pending binding. Returns the tenant the daemon is bound to. When the
+    /// enroll **created** the tenant (a new signup), publishes `TenantCreated` so the
+    /// subscription reactor opens its trial. The `max_daemons` cap is enforced at
+    /// register-network, not here.
     ///
     /// # Errors
     /// [`TenantsError::BadRequest`] on a malformed key; [`TenantsError::BadCode`] on
-    /// a bad code; [`TenantsError::EntitlementExceeded`] at the daemon limit.
+    /// a bad code.
     pub async fn enroll(&self, code: &str, public_key: &str) -> Result<EnrollResult, TenantsError> {
         // Validate the key shape up front (the enroll saga stores the string form).
         validate_public_key(public_key)
@@ -326,18 +372,24 @@ impl TenantsService {
                 &code_hash,
                 public_key,
                 &Uuid::new_v4().to_string(),
-                Entitlement::DEFAULT,
                 Utc::now(),
                 PENDING_TTL_SECS,
             )
             .await?
         {
-            EnrollOutcome::Enrolled { tenant_id } => Ok(EnrollResult { tenant_id }),
+            EnrollOutcome::Enrolled {
+                tenant_id,
+                tenant_created,
+            } => {
+                if tenant_created {
+                    self.events.publish(DomainEvent::TenantCreated {
+                        tenant_id: tenant_id.clone(),
+                    });
+                }
+                Ok(EnrollResult { tenant_id })
+            }
             EnrollOutcome::BadCode => Err(TenantsError::BadCode(
                 "enrollment code is invalid, expired, or already used".to_string(),
-            )),
-            EnrollOutcome::DaemonLimit => Err(TenantsError::EntitlementExceeded(
-                "tenant has reached its daemon limit".to_string(),
             )),
         }
     }
@@ -366,9 +418,10 @@ impl TenantsService {
                 ));
             };
 
-        // Revocation at refresh: a token is never minted for a tenant whose
-        // subscription is not active (a canceled tenant's daemons stop getting
-        // fresh credentials immediately, not just once the reaper deletes rows).
+        // Revocation at refresh: a token is never minted for a deregistered tenant or
+        // one whose current subscription does not currently entitle it (a lapsed
+        // trial / cancelled sub stops fresh credentials immediately, not just once the
+        // reaper deletes rows). The subscription is read via the SubscriptionService.
         let tenant = self
             .tenants
             .find_by_id(&tenant_id)
@@ -379,7 +432,12 @@ impl TenantsService {
                 "tenant is deregistered".to_string(),
             ));
         }
-        if tenant.subscription_status != SubscriptionStatus::Active {
+        let entitled = self
+            .subscriptions
+            .current(&tenant_id)
+            .await?
+            .is_some_and(|sub| self.subscriptions.is_active(&sub, now));
+        if !entitled {
             return Err(TenantsError::Forbidden(
                 "tenant subscription is not active".to_string(),
             ));
@@ -442,11 +500,21 @@ impl TenantsService {
             )));
         }
 
-        let tenant = self
-            .tenants
+        self.tenants
             .find_by_id(tenant_id)
             .await?
             .ok_or_else(|| TenantsError::NotFound("no such tenant".to_string()))?;
+
+        // Entitlement is granted by the current subscription, not the tenant. Reading
+        // it via the SubscriptionService keeps Tenants off the subscription repo.
+        let entitlement = self
+            .subscriptions
+            .current(tenant_id)
+            .await?
+            .ok_or_else(|| {
+                TenantsError::Forbidden("tenant has no active subscription".to_string())
+            })?
+            .entitlement;
 
         let now = Utc::now();
         let display_name = display_name
@@ -477,8 +545,8 @@ impl TenantsService {
             .register_network(
                 &network,
                 &daemon,
-                tenant.entitlement.max_networks,
-                tenant.entitlement.max_daemons,
+                entitlement.max_networks,
+                entitlement.max_daemons,
             )
             .await?
         {
