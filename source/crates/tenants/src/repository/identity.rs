@@ -73,8 +73,7 @@ pub trait TenantIdentityRepository: Send + Sync {
 
     /// Insert a login method. Returns [`InsertIdentityOutcome::AlreadyExists`] if a row
     /// with that `(provider, subject)` is already present (idempotent re-link).
-    async fn insert(&self, identity: &TenantIdentity)
-    -> anyhow::Result<InsertIdentityOutcome>;
+    async fn insert(&self, identity: &TenantIdentity) -> anyhow::Result<InsertIdentityOutcome>;
 
     /// Set (or replace) the `secret_hash` of an existing `(provider, subject)` row —
     /// the password-reset write. Returns whether a row was updated.
@@ -137,10 +136,7 @@ impl TenantIdentityRepository for PgTenantIdentityRepository {
         Ok(row.map(Into::into))
     }
 
-    async fn insert(
-        &self,
-        identity: &TenantIdentity,
-    ) -> anyhow::Result<InsertIdentityOutcome> {
+    async fn insert(&self, identity: &TenantIdentity) -> anyhow::Result<InsertIdentityOutcome> {
         let affected = sqlx::query(INSERT)
             .bind(&identity.tenant_id)
             .bind(&identity.provider)

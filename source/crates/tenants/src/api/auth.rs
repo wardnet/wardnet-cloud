@@ -220,10 +220,7 @@ async fn oidc_start(
         verifier: authorize.verifier,
     })
     .map_err(|e| ApiError::Internal(anyhow::anyhow!("serialize oauth stash: {e}")))?;
-    Ok((
-        jar.add(oauth_cookie(stash)),
-        Redirect::to(&authorize.url),
-    ))
+    Ok((jar.add(oauth_cookie(stash)), Redirect::to(&authorize.url)))
 }
 
 #[utoipa::path(
@@ -279,10 +276,7 @@ async fn token(
     let session = jar
         .get(SESSION_COOKIE)
         .ok_or_else(|| ApiError::Unauthorized("not logged in".to_string()))?;
-    let token = state
-        .identities()
-        .exchange_session(session.value())
-        .await?;
+    let token = state.identities().exchange_session(session.value()).await?;
     Ok(Json(TokenResponse { token }))
 }
 

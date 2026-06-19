@@ -629,10 +629,7 @@ impl TenantIdentityRepository for MockStore {
             .cloned())
     }
 
-    async fn insert(
-        &self,
-        identity: &TenantIdentity,
-    ) -> anyhow::Result<InsertIdentityOutcome> {
+    async fn insert(&self, identity: &TenantIdentity) -> anyhow::Result<InsertIdentityOutcome> {
         let mut d = self.0.lock().unwrap();
         let key = (identity.provider.clone(), identity.subject.clone());
         if d.identities.contains_key(&key) {
@@ -1060,7 +1057,8 @@ pub fn test_config() -> Config {
         account_base_url: "https://account.wardnet.test".to_string(),
         resend_api_key: None,
         email_from: "wardnet <noreply@wardnet.test>".to_string(),
-        cookie_key: "test-cookie-key-at-least-sixty-four-bytes-of-entropy-for-the-jar!!".to_string(),
+        cookie_key: "test-cookie-key-at-least-sixty-four-bytes-of-entropy-for-the-jar!!"
+            .to_string(),
         user_jwt_ttl_secs: 300,
         oauth_redirect_base: "https://account.wardnet.test".to_string(),
         google_client_id: None,

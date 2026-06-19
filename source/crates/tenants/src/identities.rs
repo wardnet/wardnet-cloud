@@ -235,7 +235,10 @@ impl IdentitiesService {
     ///
     /// # Errors
     /// [`IdentitiesError::BadRequest`] if `provider` is unknown/unconfigured.
-    pub fn oidc_start(&self, provider: &str) -> Result<provider::AuthorizeRequest, IdentitiesError> {
+    pub fn oidc_start(
+        &self,
+        provider: &str,
+    ) -> Result<provider::AuthorizeRequest, IdentitiesError> {
         Ok(self.provider(provider)?.authorize_url())
     }
 
@@ -339,7 +342,10 @@ impl IdentitiesService {
             .delete_for_tenant(tenant_id)
             .await
             .map_err(IdentitiesError::Internal)?;
-        tracing::info!(tenant_id, "purged identities + sessions for deregistered tenant");
+        tracing::info!(
+            tenant_id,
+            "purged identities + sessions for deregistered tenant"
+        );
         Ok(())
     }
 

@@ -40,7 +40,10 @@ pub async fn run_identities_reactor(
         match events.recv().await {
             Ok(event) => apply_to_identities(&service, &event).await,
             Err(RecvError::Lagged(skipped)) => {
-                tracing::warn!(skipped, "identities reactor lagged; FK cascade is the safety net");
+                tracing::warn!(
+                    skipped,
+                    "identities reactor lagged; FK cascade is the safety net"
+                );
             }
             Err(RecvError::Closed) => break,
         }

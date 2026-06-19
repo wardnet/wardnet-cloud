@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
+use std::collections::HashMap;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use wardnet_common::config as common_config;
 use wardnet_common::event::{BroadcastEventBus, EventPublisher};
 use wardnet_common::{mtls, serve, token};
-use std::collections::HashMap;
 
 use wardnet_tenants::{
     api,
@@ -237,7 +237,12 @@ async fn build_identity_providers(
     config: &Config,
 ) -> anyhow::Result<HashMap<String, Arc<dyn ExternalIdentityProvider>>> {
     let mut providers: HashMap<String, Arc<dyn ExternalIdentityProvider>> = HashMap::new();
-    let redirect = |provider: &str| format!("{}/v1/auth/oidc/{provider}/callback", config.oauth_redirect_base);
+    let redirect = |provider: &str| {
+        format!(
+            "{}/v1/auth/oidc/{provider}/callback",
+            config.oauth_redirect_base
+        )
+    };
 
     if let (Some(id), Some(secret)) = (&config.google_client_id, &config.google_client_secret) {
         let google = OidcProvider::discover(

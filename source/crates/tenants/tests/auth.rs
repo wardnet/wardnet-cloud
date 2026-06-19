@@ -24,7 +24,10 @@ const SEED: u8 = 5;
 /// Build a router + harness with the given mock OIDC provider registered as `google`.
 fn app_with_google(identity: VerifiedIdentity) -> (Router, Harness) {
     let mut providers: HashMap<String, Arc<dyn ExternalIdentityProvider>> = HashMap::new();
-    providers.insert("google".to_string(), Arc::new(MockIdentityProvider::new(identity)));
+    providers.insert(
+        "google".to_string(),
+        Arc::new(MockIdentityProvider::new(identity)),
+    );
     let h = build_harness_with_providers(SEED, providers);
     (api::router(h.state.clone()), h)
 }
@@ -48,7 +51,9 @@ fn post_json(uri: &str, body: &Value) -> Request<Body> {
 }
 
 async fn json_body(resp: axum::response::Response) -> Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
 
@@ -229,7 +234,10 @@ async fn password_reset_changes_the_password() {
         .unwrap();
 
     // Request a reset code (dev echoes it), then reset.
-    let mut req = post_json("/v1/auth/password/reset-code", &json!({ "email": "dave@example.com" }));
+    let mut req = post_json(
+        "/v1/auth/password/reset-code",
+        &json!({ "email": "dave@example.com" }),
+    );
     req.extensions_mut().insert(connect_info());
     let resp = app.clone().oneshot(req).await.unwrap();
     let reset_code = json_body(resp).await["code"].as_str().unwrap().to_string();
@@ -286,7 +294,9 @@ async fn oidc_login(app: &Router, code: &str) -> axum::response::Response {
     app.clone()
         .oneshot(
             Request::builder()
-                .uri(format!("/v1/auth/oidc/google/callback?code={code}&state=test-state"))
+                .uri(format!(
+                    "/v1/auth/oidc/google/callback?code={code}&state=test-state"
+                ))
                 .header(header::COOKIE, &oauth)
                 .body(Body::empty())
                 .unwrap(),
@@ -373,10 +383,7 @@ async fn oidc_callback_auto_links_daemon_born_tenant() {
     let jwt = json_body(resp).await["token"].as_str().unwrap().to_string();
     // sub == the daemon-born tenant id (the auto-link target).
     let payload = jwt.split('.').nth(1).unwrap();
-    let claims: Value = serde_json::from_slice(
-        &base64_url_decode(payload),
-    )
-    .unwrap();
+    let claims: Value = serde_json::from_slice(&base64_url_decode(payload)).unwrap();
     assert_eq!(claims["sub"], "tenant-daemon-born");
 }
 

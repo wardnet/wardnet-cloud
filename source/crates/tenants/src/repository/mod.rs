@@ -24,10 +24,10 @@ pub use enrollment::{EnrollOutcome, EnrollmentRepository, PgEnrollmentRepository
 pub use identity::{
     InsertIdentityOutcome, PgTenantIdentityRepository, TenantIdentity, TenantIdentityRepository,
 };
-pub use session::{PgSessionRepository, Session, SessionRepository};
 pub use network::{
     Network, NetworkRepository, PgNetworkRepository, ProvisioningState, RegisterNetworkOutcome,
 };
+pub use session::{PgSessionRepository, Session, SessionRepository};
 pub use subscription::{
     Entitlement, PgSubscriptionRepository, Subscription, SubscriptionRepository, SubscriptionStatus,
 };

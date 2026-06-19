@@ -93,7 +93,10 @@ async fn resolve_unverified_email_is_rejected() {
         .resolve_identity(&verified("google", "g-2", "spoof@example.com", false), None)
         .await
         .unwrap_err();
-    assert!(matches!(err, crate::error::IdentitiesError::Unauthorized(_)));
+    assert!(matches!(
+        err,
+        crate::error::IdentitiesError::Unauthorized(_)
+    ));
     // No tenant was created behind the rejected gate.
     assert!(
         h.tenants
@@ -108,7 +111,10 @@ async fn resolve_unverified_email_is_rejected() {
 
 /// Issue a real signup code through the tenant aggregate (the gate-1 primitive).
 async fn signup_code(h: &crate::test_helpers::Harness, email: &str) -> String {
-    h.tenants.issue_signup_code(email, "203.0.113.7").await.unwrap()
+    h.tenants
+        .issue_signup_code(email, "203.0.113.7")
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
