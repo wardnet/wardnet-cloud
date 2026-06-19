@@ -75,7 +75,10 @@ jobs:
           tool: clippy-sarif,sarif-fmt
 
       - name: Format check
-        run: cargo fmt --check --manifest-path source/Cargo.toml
+        # `source/Cargo.toml` is a virtual workspace (no `[package]`), so a bare
+        # `cargo fmt --manifest-path` resolves it as a package, finds no targets, and
+        # bails ("Failed to find targets"). `--all` formats every workspace member.
+        run: cargo fmt --all --check --manifest-path source/Cargo.toml
 
       - name: Clippy
         # Lint this service crate + the shared common lib. Pipe clippy JSON
