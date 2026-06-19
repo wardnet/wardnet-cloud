@@ -117,6 +117,16 @@ are redacted in `Config` `Debug` (invariant #24 pattern).
   (+ httpOnly keeping the cookie unreadable, + TLS). The 5-min JWT TTL narrowly bounds a token
   *leaked without the cookie* (logs, referrer, paste). 5 min is chosen over 2–3 min for margin
   against the verifier's `leeway = 0` clock-skew (ADR-0002).
+- **A deregistered tenant is barred from the USER plane** at two points: `create_session`
+  pre-checks `TenantsService::tenant_is_live` (fast-fail on login / OIDC callback), and the
+  `touch_and_get_tenant` SQL adds `deregistered_at IS NULL` (live-tenant-only exchange). Together
+  these close the reactor-lag gap between deregister and the identities reactor purging the session
+  row — a tombstoned account can never mint a new USER JWT, even momentarily.
+- **Per-IP password-login throttle:** `IdentitiesService` maintains an in-memory map of
+  `(window_start, count)` per source IP (pruned on each check), capping password-login to
+  `LOGIN_ATTEMPTS_PER_IP` per `LOGIN_WINDOW_SECS`-second window. Excess attempts get
+  `IdentitiesError::RateLimited` → HTTP 429. Best-effort per replica (defence in depth, not a
+  distributed quota); reset-code requests reuse the tenant aggregate's existing rate limit.
 - New persistent state in the global Tenants DB: `tenant_identities` and `sessions` (both
   FK-cascade from `tenants`, so the existing tombstone sweep reaps them). New deps:
   `argon2`, `axum-extra` (cookies), `openidconnect`, `time` (cookie Max-Age).
