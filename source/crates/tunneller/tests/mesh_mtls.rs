@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::Path;
 use axum::http::StatusCode;
@@ -19,9 +20,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
-use wardnet_common::mtls::{self, ExpectedPeer, MeshClient};
+use wardnet_common::mtls::{self, ExpectedPeer, MeshClient, ReloadableServerConfig};
 use wardnet_common::serve;
-use wardnet_tunneller::mesh::forward::read_preamble;
+use wardnet_tunneller::mesh::forward::{read_preamble, serve_forward_on};
 use wardnet_tunneller::mesh::{InterNodeForwarder, MtlsForwarder, TenantsClient, TenantsResolver};
 use wardnet_tunneller::tunnel::{ForwardRequest, TunnelRegistry};
 
@@ -407,5 +408,92 @@ async fn forwarder_dial_rejects_wrong_service_peer() {
             .await
             .is_err(),
         "dialing a forward peer whose leaf is not `tunneller` must fail at the handshake"
+    );
+}
+
+// ── Acceptor-side scope-direction rule (the real serve_forward loop) ────────────
+//
+// The initiator-pin tests above protect the dialer. This drives the **real**
+// `serve_forward_on` accept loop on an ephemeral port and proves the acceptor side:
+// a chain-valid `ddns` client (handshake succeeds — same CA, same region) is dropped
+// by the scope-direction rule before any forward lands, while an in-scope `tunneller`
+// client is admitted. Without this, a regression that deleted/negated the rule inside
+// `serve_forward` would pass every other test (the round-trip harness inlines its own
+// loop that never runs the rule).
+
+/// Dial the forward listener at `node_addr` as a client presenting `client_spiffe`,
+/// announce slug `alice`, and run the splice in a background task. Returns nothing — the
+/// caller observes the outcome via the owning node's registry.
+async fn dial_forward(ca: &MeshCa, node_addr: &str, client_spiffe: &str) {
+    let client = ca.leaf(
+        SanType::URI(client_spiffe.try_into().unwrap()),
+        ExtendedKeyUsagePurpose::ClientAuth,
+    );
+    let forwarder = MtlsForwarder::new(
+        client.cert_pem.as_bytes(),
+        client.key_pem.as_bytes(),
+        ca.root_pem.as_bytes(),
+        ExpectedPeer::new("tunneller", "use1"),
+    )
+    .expect("build forwarder");
+
+    let pair_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pair_addr = pair_listener.local_addr().unwrap();
+    let client_near = TcpStream::connect(pair_addr).await.unwrap();
+    let (_client_far, _) = pair_listener.accept().await.unwrap();
+
+    let node_addr = node_addr.to_string();
+    tokio::spawn(async move {
+        let _ = forwarder
+            .forward(&node_addr, "alice", 443, client_near)
+            .await;
+    });
+}
+
+#[tokio::test]
+#[ignore = "binds a TCP listener + completes a TLS handshake"]
+async fn serve_forward_enforces_scope_direction_rule() {
+    mtls::install_crypto_provider();
+    let ca = MeshCa::new();
+    let server = ca.leaf(
+        SanType::URI(TUNNELLER_SPIFFE.try_into().unwrap()),
+        ExtendedKeyUsagePurpose::ServerAuth,
+    );
+
+    // Drive the REAL serve_forward_on accept loop (with its scope-direction authorization)
+    // on an ephemeral port — not the simplified `spawn_forward_listener` mimic.
+    let registry = Arc::new(TunnelRegistry::new());
+    let mut registration = registry.register("alice");
+    let server_config = ReloadableServerConfig::new(
+        server.cert_pem.as_bytes(),
+        server.key_pem.as_bytes(),
+        ca.root_pem.as_bytes(),
+    )
+    .expect("build forward server config");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(serve_forward_on(
+        listener,
+        server_config,
+        Arc::clone(&registry),
+        "use1".to_string(),
+    ));
+
+    // A chain-valid `ddns` client (wrong service) must be rejected by the rule: no forward
+    // should ever reach the registry.
+    dial_forward(&ca, &node_addr, DDNS_USE1_SPIFFE).await;
+    let landed = tokio::time::timeout(Duration::from_millis(500), registration.rx.recv()).await;
+    assert!(
+        landed.is_err(),
+        "a chain-valid but wrong-service (ddns) client must be dropped by serve_forward"
+    );
+
+    // Positive control: an in-scope `tunneller` client IS admitted — proving the silence
+    // above is the rule firing, not a broken handshake/harness.
+    dial_forward(&ca, &node_addr, TUNNELLER_SPIFFE).await;
+    let landed = tokio::time::timeout(Duration::from_secs(2), registration.rx.recv()).await;
+    assert!(
+        matches!(landed, Ok(Some(_))),
+        "an in-scope tunneller client must be admitted by serve_forward"
     );
 }

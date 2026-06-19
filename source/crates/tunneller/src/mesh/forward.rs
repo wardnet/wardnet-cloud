@@ -169,7 +169,23 @@ pub async fn serve_forward(
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(forward_listen_addr).await?;
     tracing::info!(addr = %forward_listen_addr, "inter-node forward listener (mTLS) listening");
+    serve_forward_on(listener, server_config, registry, own_scope).await
+}
 
+/// The forward accept loop over a **pre-bound** `listener` — the real authorization path
+/// (handshake → parse peer SPIFFE id → [`peer_allowed_on_forward`] scope-direction rule →
+/// preamble → splice). Split out from [`serve_forward`] so an integration test can drive
+/// this exact loop on an ephemeral port and assert a chain-valid-but-wrong-service/scope
+/// client is dropped before any forward lands.
+///
+/// # Errors
+/// Diverges (loops forever); the `Result` is for `select!` ergonomics at the call site.
+pub async fn serve_forward_on(
+    listener: TcpListener,
+    server_config: Arc<ReloadableServerConfig>,
+    registry: Arc<TunnelRegistry>,
+    own_scope: String,
+) -> anyhow::Result<()> {
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FORWARD));
 
     loop {
