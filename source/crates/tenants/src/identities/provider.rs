@@ -1,7 +1,7 @@
 //! External identity providers behind one trait (ADR-0009).
 //!
 //! Federated login differs by protocol — **Google is full OIDC** (discovery +
-//! `id_token` + JWKS, via `openidconnect`), **GitHub is plain OAuth2** (no
+//! `id_token` + JWKS, via `openidconnect`), **GitHub is plain `OAuth2`** (no
 //! `id_token`; call the user/emails API, via `reqwest`) — so both sit behind
 //! [`ExternalIdentityProvider`]. Each yields a [`VerifiedIdentity`] the
 //! [`IdentitiesService`](super::IdentitiesService) resolves to a tenant by the
@@ -190,14 +190,14 @@ impl ExternalIdentityProvider for OidcProvider {
     }
 }
 
-// ── GitHub (plain OAuth2, no id_token) ──────────────────────────────────────────
+// ── GitHub (plain `OAuth2`, no id_token) ──────────────────────────────────────────
 
-/// GitHub OAuth2 endpoints (overridable for tests against a mock server).
+/// GitHub `OAuth2` endpoints (overridable for tests against a mock server).
 const GITHUB_AUTHORIZE_URL: &str = "https://github.com/login/oauth/authorize";
 const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const GITHUB_API_BASE: &str = "https://api.github.com";
 
-/// A GitHub OAuth2 provider. GitHub issues no `id_token`, so the verified identity is
+/// A GitHub `OAuth2` provider. GitHub issues no `id_token`, so the verified identity is
 /// assembled from the `user` + `user/emails` API.
 pub struct GitHubProvider {
     client_id: String,

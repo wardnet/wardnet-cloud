@@ -254,12 +254,12 @@ impl IdentitiesService {
         code: &str,
         verifier: &str,
     ) -> Result<String, IdentitiesError> {
-        let verified = self
+        let identity = self
             .provider(provider)?
             .exchange(code, verifier)
             .await
             .map_err(IdentitiesError::Internal)?;
-        let (tenant_id, _existed) = self.resolve_identity(&verified, None).await?;
+        let (tenant_id, _existed) = self.resolve_identity(&identity, None).await?;
         self.create_session(&tenant_id).await
     }
 

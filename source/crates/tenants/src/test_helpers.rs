@@ -1129,6 +1129,7 @@ pub fn build_harness(seed: u8) -> Harness {
 /// service signer and the state verifier share `seed`'s keypair; the trial policy is
 /// the default 60/15/15.
 #[must_use]
+#[allow(clippy::implicit_hasher)] // test helper; the default hasher is the only caller
 pub fn build_harness_with_providers(
     seed: u8,
     providers: HashMap<String, Arc<dyn ExternalIdentityProvider>>,

@@ -44,6 +44,7 @@ rand = { workspace = true }
 argon2 = { workspace = true }
 axum-extra = { workspace = true }
 openidconnect = { workspace = true }
+time = { workspace = true }
 
 utoipa = { workspace = true }
 utoipa-axum = { workspace = true }

@@ -92,7 +92,7 @@ fn harness(pools: DbPools) -> PgHarness {
         subscriptions.clone(),
         events.clone(),
         Arc::new(wardnet_tenants::email::NoopEmailSender),
-        test_signer(SEED),
+        Arc::new(test_signer(SEED)),
         ["use1".to_string(), "eu1".to_string()],
     ));
     PgHarness {

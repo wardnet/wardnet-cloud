@@ -81,6 +81,8 @@ utoipa-axum = "0.2"
 # GitHub OAuth2 is hand-rolled over `reqwest` (no id_token).
 argon2 = "0.5"
 axum-extra = { version = "0.10", features = ["cookie", "cookie-private", "cookie-signed"] }
+# `time` (same crate the cookie jar uses) for cookie Max-Age durations.
+time = "0.3"
 # rustls only — keep the workspace openssl-free (matches `reqwest`/`async-stripe`).
 openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
 

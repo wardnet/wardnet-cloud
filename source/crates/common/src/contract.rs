@@ -285,15 +285,6 @@ pub struct RegisterNetworkRequest {
 
 // ── Tenants — account plane ─────────────────────────────────────────────────────
 
-/// Request body for `POST /v1/tenants`.
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct RegisterTenantRequest {
-    pub email: String,
-    /// Optional entitlement; defaults to 1 network / 1 daemon.
-    #[serde(default)]
-    pub entitlement: Option<Entitlement>,
-}
-
 /// Response body for the add-daemon code endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CodeResponse {
@@ -307,6 +298,46 @@ pub struct CodeResponse {
 pub struct UpdateTenantRequest {
     /// Only `"canceled"` is accepted (cancels the subscription + cascades networks).
     pub subscription_status: String,
+}
+
+// ── Tenants — web/human auth (WS-F, ADR-0009) ───────────────────────────────────
+
+/// Request body for `POST /v1/auth/password/signup`. The `code` is the one-time email
+/// proof (gate 1); on success a session cookie is set.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PasswordSignupRequest {
+    pub email: String,
+    /// The one-time signup code issued to `email` (via `POST /v1/enrollment-codes`).
+    pub code: String,
+    /// Plaintext password (hashed server-side; never stored or logged).
+    pub password: String,
+}
+
+/// Request body for `POST /v1/auth/password/login`. On success a session cookie is set.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PasswordLoginRequest {
+    pub email: String,
+    pub password: String,
+}
+
+/// Request body for `POST /v1/auth/password/reset`. The `code` is the one-time email
+/// proof; the new password replaces (or sets) the account's password and force-logs-out
+/// every session.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PasswordResetRequest {
+    pub code: String,
+    pub password: String,
+}
+
+/// Account profile for the SPA (`GET /v1/me`, auth = `USER`). The full current-user
+/// view: the tenant identity + its current subscription.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct MeView {
+    /// The user's tenant id (`sub`).
+    pub tenant_id: String,
+    pub email: String,
+    /// The tenant's current (non-`Canceled`) subscription, or `None` if not entitled.
+    pub subscription: Option<SubscriptionView>,
 }
 
 // ── Tenants — account-plane billing (Stripe) ────────────────────────────────────

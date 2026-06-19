@@ -14,8 +14,7 @@ use utoipa_axum::routes;
 use wardnet_common::auth::{AuthCaller, Caller};
 use wardnet_common::contract::{
     BillingPortalResponse, CheckoutSessionResponse, CodeResponse, CreateCheckoutSessionRequest,
-    DaemonView, NetworkView, RegisterTenantRequest, SubscriptionView, TenantView,
-    UpdateTenantRequest,
+    DaemonView, MeView, NetworkView, SubscriptionView, TenantView, UpdateTenantRequest,
 };
 
 use crate::error::ApiError;
@@ -25,7 +24,7 @@ use crate::state::AppState;
 /// Register all account-plane routes.
 pub fn register(router: OpenApiRouter<AppState>) -> OpenApiRouter<AppState> {
     router
-        .routes(routes!(register_tenant))
+        .routes(routes!(me))
         .routes(routes!(issue_tenant_code))
         .routes(routes!(list_networks))
         .routes(routes!(list_tenant_daemons))
@@ -90,27 +89,31 @@ fn require_owner<'a>(caller: &'a Caller, tenant_id: &str) -> Result<&'a str, Api
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 #[utoipa::path(
-    post, path = "/v1/tenants", tag = "tenants",
-    description = "Create a tenant (management plane). Entitlement defaults to 1/1.",
-    request_body = RegisterTenantRequest,
+    get, path = "/v1/me", tag = "tenants",
+    description = "The current user's account profile (the SPA's identity bootstrap).",
     responses(
-        (status = 200, description = "Tenant created", body = TenantView),
-        (status = 400, description = "Invalid email"),
-        (status = 409, description = "Email already taken"),
+        (status = 200, description = "Account profile", body = MeView),
         (status = 401, description = "Unauthenticated"),
+        (status = 404, description = "Account no longer exists"),
     ),
 )]
-async fn register_tenant(
+async fn me(
     State(state): State<AppState>,
-    AuthCaller(_caller): AuthCaller,
-    Json(body): Json<RegisterTenantRequest>,
-) -> Result<Json<TenantView>, ApiError> {
-    let tenant = state.tenants().register_tenant(&body.email).await?;
-    // The trial subscription is opened by the subscription reactor reacting to the
-    // published `TenantCreated`, so it may not be visible yet — read whatever is
-    // current (typically none for a brand-new tenant) and let the SPA refresh.
-    let subscription = state.subscriptions().current(&tenant.id).await?;
-    Ok(Json(tenant_view(tenant, subscription)))
+    AuthCaller(caller): AuthCaller,
+) -> Result<Json<MeView>, ApiError> {
+    let Caller::User(user) = &caller else {
+        return Err(ApiError::Forbidden("user credential required".to_string()));
+    };
+    let (tenant, subscription) = state
+        .tenants()
+        .find_tenant(&user.tenant_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("no such tenant".to_string()))?;
+    Ok(Json(MeView {
+        tenant_id: tenant.id,
+        email: tenant.email,
+        subscription: subscription.map(Into::into),
+    }))
 }
 
 #[utoipa::path(
