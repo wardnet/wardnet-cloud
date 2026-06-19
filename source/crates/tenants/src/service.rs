@@ -60,7 +60,8 @@ pub struct TenantsService {
     events: Arc<dyn EventPublisher>,
     /// Transactional email for enrollment codes (Resend in prod, no-op in dev/test).
     email: Arc<dyn EmailSender>,
-    signer: Signer,
+    /// Shared signing capability (also held by `IdentitiesService` to mint USER JWTs).
+    signer: Arc<Signer>,
     /// The fleet's real regions; a network may only be created in one of these
     /// (otherwise no DDNS provisioner would ever pick it up).
     regions: std::collections::HashSet<String>,
@@ -79,7 +80,7 @@ impl TenantsService {
         subscriptions: Arc<SubscriptionService>,
         events: Arc<dyn EventPublisher>,
         email: Arc<dyn EmailSender>,
-        signer: Signer,
+        signer: Arc<Signer>,
         regions: impl IntoIterator<Item = String>,
     ) -> Self {
         Self {

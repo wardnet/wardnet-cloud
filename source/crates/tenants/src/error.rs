@@ -54,6 +54,61 @@ impl From<TenantsError> for ApiError {
 }
 
 /// Service-layer domain error for
+/// [`IdentitiesService`](crate::identities::IdentitiesService) — the human/web auth
+/// aggregate (ADR-0009).
+#[derive(Debug, thiserror::Error)]
+pub enum IdentitiesError {
+    /// Malformed input (invalid email, password too weak, unknown provider).
+    #[error("{0}")]
+    BadRequest(String),
+    /// The one-time signup/reset code is unknown, expired, or already used.
+    #[error("{0}")]
+    BadCode(String),
+    /// Bad credentials, an unverified provider email, a CSRF/state mismatch, or an
+    /// absent/expired session — anything that fails authentication.
+    #[error("{0}")]
+    Unauthorized(String),
+    /// The email already has this kind of login method (e.g. password signup when a
+    /// password already exists).
+    #[error("{0}")]
+    Conflict(String),
+    /// A provider/repository failure (DB, OAuth provider, hashing).
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+impl From<IdentitiesError> for ApiError {
+    fn from(e: IdentitiesError) -> Self {
+        match e {
+            IdentitiesError::BadRequest(m) => ApiError::BadRequest(m),
+            IdentitiesError::BadCode(m) | IdentitiesError::Unauthorized(m) => {
+                ApiError::Unauthorized(m)
+            }
+            IdentitiesError::Conflict(m) => ApiError::Conflict(m),
+            IdentitiesError::Internal(e) => ApiError::Internal(e),
+        }
+    }
+}
+
+/// Bridge so the Identities aggregate can surface a `TenantsService` edge-call failure
+/// (`find_tenant_by_email` / `register_tenant` / `consume_signup_code`) as its own
+/// error without leaking the tenant aggregate's error type.
+impl From<TenantsError> for IdentitiesError {
+    fn from(e: TenantsError) -> Self {
+        match e {
+            TenantsError::BadRequest(m) => IdentitiesError::BadRequest(m),
+            TenantsError::BadCode(m) => IdentitiesError::BadCode(m),
+            TenantsError::Forbidden(m) | TenantsError::Conflict(m) => IdentitiesError::Conflict(m),
+            TenantsError::NotFound(m) => IdentitiesError::Unauthorized(m),
+            TenantsError::EntitlementExceeded(m) | TenantsError::RateLimited(m) => {
+                IdentitiesError::BadRequest(m)
+            }
+            TenantsError::Internal(e) => IdentitiesError::Internal(e),
+        }
+    }
+}
+
+/// Service-layer domain error for
 /// [`SubscriptionService`](crate::subscription::SubscriptionService).
 #[derive(Debug, thiserror::Error)]
 pub enum SubscriptionError {

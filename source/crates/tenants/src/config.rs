@@ -66,6 +66,26 @@ pub struct Config {
     pub resend_api_key: Option<String>,
     /// The verified `from` address for enrollment-code emails.
     pub email_from: String,
+
+    // ── Human/web auth (WS-F, ADR-0009) ──────────────────────────────────────────
+    /// Symmetric key for the encrypted/signed cookie jar (`axum-extra` private jar);
+    /// inforge-injected like the DSN. Must be ≥ 64 bytes of entropy. Redacted in
+    /// `Debug`.
+    pub cookie_key: String,
+    /// `USER` JWT lifetime (seconds). Default 300 (5 min) — see ADR-0009.
+    pub user_jwt_ttl_secs: i64,
+    /// Base URL the OAuth callbacks redirect back to (the account SPA); the per-
+    /// provider `redirect_uri` is `<oauth_redirect_base>/v1/auth/oidc/<provider>/callback`.
+    /// Defaults to [`Self::account_base_url`] when unset.
+    pub oauth_redirect_base: String,
+    /// Google OAuth credentials. `None` (either unset) disables Google login. The
+    /// secret is redacted in `Debug`.
+    pub google_client_id: Option<String>,
+    pub google_client_secret: Option<String>,
+    /// GitHub OAuth credentials. `None` (either unset) disables GitHub login. The
+    /// secret is redacted in `Debug`.
+    pub github_client_id: Option<String>,
+    pub github_client_secret: Option<String>,
 }
 
 impl std::fmt::Debug for Config {
@@ -93,6 +113,19 @@ impl std::fmt::Debug for Config {
                 &self.resend_api_key.as_ref().map(|_| "<redacted>"),
             )
             .field("email_from", &self.email_from)
+            .field("cookie_key", &"<redacted>")
+            .field("user_jwt_ttl_secs", &self.user_jwt_ttl_secs)
+            .field("oauth_redirect_base", &self.oauth_redirect_base)
+            .field("google_client_id", &self.google_client_id)
+            .field(
+                "google_client_secret",
+                &self.google_client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("github_client_id", &self.github_client_id)
+            .field(
+                "github_client_secret",
+                &self.github_client_secret.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -103,6 +136,8 @@ impl Config {
     /// # Errors
     /// Returns an error if any required variable is absent.
     pub fn from_env() -> anyhow::Result<Self> {
+        let account_base_url = required("ACCOUNT_BASE_URL")?;
+        let opt = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
         Ok(Self {
             global_database_url: required("GLOBAL_DATABASE_URL")?,
             region: required("INFORGE_DEPLOYMENT_REGION_SLUG")?,
@@ -140,12 +175,23 @@ impl Config {
                 .unwrap_or(3600),
             stripe_secret_key: required("STRIPE_SECRET_KEY")?,
             stripe_webhook_secret: required("STRIPE_WEBHOOK_SECRET")?,
-            account_base_url: required("ACCOUNT_BASE_URL")?,
             resend_api_key: std::env::var("RESEND_API_KEY")
                 .ok()
                 .filter(|s| !s.is_empty()),
             email_from: std::env::var("EMAIL_FROM")
                 .unwrap_or_else(|_| "wardnet <noreply@wardnet.io>".to_string()),
+            cookie_key: required("COOKIE_KEY")?,
+            user_jwt_ttl_secs: std::env::var("USER_JWT_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(crate::identities::DEFAULT_USER_JWT_TTL_SECS),
+            oauth_redirect_base: opt("OAUTH_REDIRECT_BASE")
+                .unwrap_or_else(|| account_base_url.clone()),
+            google_client_id: opt("GOOGLE_CLIENT_ID"),
+            google_client_secret: opt("GOOGLE_CLIENT_SECRET"),
+            github_client_id: opt("GITHUB_CLIENT_ID"),
+            github_client_secret: opt("GITHUB_CLIENT_SECRET"),
+            account_base_url,
         })
     }
 }

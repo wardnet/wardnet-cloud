@@ -17,6 +17,8 @@ use wardnet_common::token::{Signer, Verifier};
 
 use crate::config::Config;
 use crate::email::EmailSender;
+use crate::identities::IdentitiesService;
+use crate::identities::provider::ExternalIdentityProvider;
 use crate::repository::daemon::{Daemon, DaemonRepository};
 use crate::repository::enrollment::{EnrollOutcome, EnrollmentRepository};
 use crate::repository::identity::{
@@ -1058,6 +1060,13 @@ pub fn test_config() -> Config {
         account_base_url: "https://account.wardnet.test".to_string(),
         resend_api_key: None,
         email_from: "wardnet <noreply@wardnet.test>".to_string(),
+        cookie_key: "test-cookie-key-at-least-sixty-four-bytes-of-entropy-for-the-jar!!".to_string(),
+        user_jwt_ttl_secs: 300,
+        oauth_redirect_base: "https://account.wardnet.test".to_string(),
+        google_client_id: None,
+        google_client_secret: None,
+        github_client_id: None,
+        github_client_secret: None,
     }
 }
 
@@ -1078,6 +1087,7 @@ pub struct Harness {
     pub email: Arc<RecordingEmailSender>,
     pub subscriptions: Arc<SubscriptionService>,
     pub tenants: Arc<TenantsService>,
+    pub identities: Arc<IdentitiesService>,
 }
 
 impl Harness {
@@ -1108,15 +1118,26 @@ pub async fn pump_events(
     }
 }
 
-/// Build a full [`Harness`]. The service signer and the state verifier share `seed`'s
-/// keypair. The trial policy is the default 60/15/15.
+/// Build a full [`Harness`] with no federated providers.
 #[must_use]
 pub fn build_harness(seed: u8) -> Harness {
+    build_harness_with_providers(seed, HashMap::new())
+}
+
+/// Build a full [`Harness`], registering the given federated `providers` on the
+/// Identities aggregate (e.g. a [`MockIdentityProvider`] for OIDC-callback tests). The
+/// service signer and the state verifier share `seed`'s keypair; the trial policy is
+/// the default 60/15/15.
+#[must_use]
+pub fn build_harness_with_providers(
+    seed: u8,
+    providers: HashMap<String, Arc<dyn ExternalIdentityProvider>>,
+) -> Harness {
     let store = MockStore::new();
     let events: Arc<RecordingEventPublisher> = Arc::new(RecordingEventPublisher::new());
     let stripe: Arc<MockStripeGateway> = Arc::new(MockStripeGateway::new());
     let email: Arc<RecordingEmailSender> = Arc::new(RecordingEmailSender::new());
-    let signer = test_signer(seed);
+    let signer = Arc::new(test_signer(seed));
     let verifier = Verifier::from_pem(jwt_keypair_pem(seed).1.as_bytes(), "tenants").unwrap();
 
     let subscriptions = Arc::new(SubscriptionService::new(
@@ -1137,13 +1158,22 @@ pub fn build_harness(seed: u8) -> Harness {
         subscriptions.clone(),
         events.clone(),
         email.clone(),
-        signer,
+        Arc::clone(&signer),
         ["use1".to_string(), "eu1".to_string()],
+    ));
+    let identities = Arc::new(IdentitiesService::new(
+        Arc::new(store.clone()),
+        Arc::new(store.clone()),
+        tenants.clone(),
+        providers,
+        signer,
+        300,
     ));
     let state = AppState::new(
         test_config(),
         tenants.clone(),
         subscriptions.clone(),
+        identities.clone(),
         verifier,
     );
     Harness {
@@ -1154,6 +1184,40 @@ pub fn build_harness(seed: u8) -> Harness {
         email,
         subscriptions,
         tenants,
+        identities,
+    }
+}
+
+/// A mock [`ExternalIdentityProvider`] returning a preset [`VerifiedIdentity`] from
+/// `exchange` (and a fixed authorize URL) — drives the OIDC-callback tests without a
+/// real provider.
+pub struct MockIdentityProvider {
+    identity: crate::identities::provider::VerifiedIdentity,
+}
+
+impl MockIdentityProvider {
+    #[must_use]
+    pub fn new(identity: crate::identities::provider::VerifiedIdentity) -> Self {
+        Self { identity }
+    }
+}
+
+#[async_trait]
+impl ExternalIdentityProvider for MockIdentityProvider {
+    fn authorize_url(&self) -> crate::identities::provider::AuthorizeRequest {
+        crate::identities::provider::AuthorizeRequest {
+            url: "https://provider.test/authorize".to_string(),
+            csrf_state: "test-state".to_string(),
+            verifier: String::new(),
+        }
+    }
+
+    async fn exchange(
+        &self,
+        _code: &str,
+        _verifier: &str,
+    ) -> anyhow::Result<crate::identities::provider::VerifiedIdentity> {
+        Ok(self.identity.clone())
     }
 }
 

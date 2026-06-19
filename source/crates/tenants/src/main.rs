@@ -4,16 +4,24 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use wardnet_common::config as common_config;
 use wardnet_common::event::{BroadcastEventBus, EventPublisher};
 use wardnet_common::{mtls, serve, token};
+use std::collections::HashMap;
+
 use wardnet_tenants::{
     api,
     config::Config,
     db,
     email::{EmailSender, NoopEmailSender, ResendEmailSender},
+    identities::{
+        IdentitiesService,
+        provider::{ExternalIdentityProvider, GitHubProvider, OidcProvider},
+        reactor as identities_reactor,
+    },
     mesh,
     repository::{
         DaemonRepository, EnrollmentRepository, NetworkRepository, PgDaemonRepository,
-        PgEnrollmentRepository, PgNetworkRepository, PgSubscriptionRepository, PgTenantRepository,
-        SubscriptionRepository, TenantRepository,
+        PgEnrollmentRepository, PgNetworkRepository, PgSessionRepository, PgSubscriptionRepository,
+        PgTenantIdentityRepository, PgTenantRepository, SessionRepository, SubscriptionRepository,
+        TenantIdentityRepository, TenantRepository,
     },
     service::TenantsService,
     state::AppState,
@@ -53,12 +61,16 @@ async fn main() -> anyhow::Result<()> {
     let networks_repo = Arc::new(PgNetworkRepository::new_pools(pools.clone()));
     let daemons_repo = Arc::new(PgDaemonRepository::new_pools(pools.clone()));
     let subscriptions_repo = Arc::new(PgSubscriptionRepository::new_pools(pools.clone()));
+    // Identities aggregate repos (WS-F).
+    let identity_repo = Arc::new(PgTenantIdentityRepository::new_pools(pools.clone()));
+    let session_repo = Arc::new(PgSessionRepository::new_pools(pools.clone()));
     let enrollment_repo = Arc::new(PgEnrollmentRepository::new_pools(pools));
 
-    // Tenants signs identity JWTs; the private key is consumed into the signer and
-    // never seated in the shared state.
+    // Tenants signs both daemon (TenantsService) and user (IdentitiesService) JWTs; the
+    // signing key is a shared capability behind an `Arc`. The private key PEM is
+    // consumed into the signer and never seated in the shared state.
     let signing_key_pem = common_config::load_jwt_signing_key_pem()?;
-    let signer = token::Signer::from_pem(signing_key_pem.as_bytes(), None)?;
+    let signer = Arc::new(token::Signer::from_pem(signing_key_pem.as_bytes(), None)?);
     drop(signing_key_pem);
 
     // The auth layer verifies identity JWTs offline with the matching public key,
@@ -108,8 +120,21 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&subscriptions),
         Arc::clone(&events),
         email,
-        signer,
+        Arc::clone(&signer),
         config.known_regions.clone(),
+    ));
+
+    // The Identities aggregate (WS-F): human/web login. Holds only its own repos +
+    // the tenant aggregate (read/create edge) + the shared signer + the federated
+    // providers (built from config; absent ones simply disable that login button).
+    let providers = build_identity_providers(&config).await?;
+    let identities = Arc::new(IdentitiesService::new(
+        identity_repo as Arc<dyn TenantIdentityRepository>,
+        session_repo as Arc<dyn SessionRepository>,
+        Arc::clone(&service),
+        providers,
+        Arc::clone(&signer),
+        config.user_jwt_ttl_secs,
     ));
 
     // Reactors: turn published events into the owning service's method calls.
@@ -121,11 +146,17 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&service),
         events.subscribe(),
     ));
+    // Identities reactor: TenantDeregistered → purge sessions + login methods.
+    tokio::spawn(identities_reactor::run_identities_reactor(
+        Arc::clone(&identities),
+        events.subscribe(),
+    ));
 
     let state = AppState::new(
         config.clone(),
         Arc::clone(&service),
         Arc::clone(&subscriptions),
+        Arc::clone(&identities),
         verifier,
     );
     let api_router = api::router(state.clone());
@@ -196,6 +227,36 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Build the configured federated login providers (WS-F). Each provider is enabled
+/// only when both halves of its credential are present; Google performs OIDC discovery
+/// here (one network call at boot). The per-provider `redirect_uri` hangs off
+/// `oauth_redirect_base`.
+async fn build_identity_providers(
+    config: &Config,
+) -> anyhow::Result<HashMap<String, Arc<dyn ExternalIdentityProvider>>> {
+    let mut providers: HashMap<String, Arc<dyn ExternalIdentityProvider>> = HashMap::new();
+    let redirect = |provider: &str| format!("{}/v1/auth/oidc/{provider}/callback", config.oauth_redirect_base);
+
+    if let (Some(id), Some(secret)) = (&config.google_client_id, &config.google_client_secret) {
+        let google = OidcProvider::discover(
+            "google",
+            "https://accounts.google.com",
+            id.clone(),
+            secret.clone(),
+            redirect("google"),
+        )
+        .await?;
+        providers.insert("google".to_string(), Arc::new(google));
+        tracing::info!("google login enabled");
+    }
+    if let (Some(id), Some(secret)) = (&config.github_client_id, &config.github_client_secret) {
+        let github = GitHubProvider::new(id.clone(), secret.clone(), redirect("github"))?;
+        providers.insert("github".to_string(), Arc::new(github));
+        tracing::info!("github login enabled");
+    }
+    Ok(providers)
 }
 
 /// Periodically delete tombstoned tenants whose networks are fully deprovisioned. The

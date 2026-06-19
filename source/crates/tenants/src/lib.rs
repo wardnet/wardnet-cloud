@@ -16,6 +16,7 @@ pub mod config;
 pub mod db;
 pub mod email;
 pub mod error;
+pub mod identities;
 pub mod mesh;
 pub mod repository;
 pub mod service;
