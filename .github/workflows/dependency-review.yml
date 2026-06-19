@@ -35,4 +35,8 @@ jobs:
           #   GHSA-965h-392x-2mh5 = RUSTSEC-2026-0098 (rustls-webpki URI name constraints)
           #   GHSA-xgp8-3hg3-c2mh = RUSTSEC-2026-0099 (rustls-webpki wildcard name)
           #   GHSA-c38w-74pg-36hr = RUSTSEC-2023-0071 (rsa Marvin timing sidechannel)
-          allow-ghsas: GHSA-82j2-j2ch-gfr8, GHSA-965h-392x-2mh5, GHSA-xgp8-3hg3-c2mh, GHSA-c38w-74pg-36hr
+          # GitHub's advisory DB is broader than RustSec, so it also flags one cargo-audit
+          # does not — same root cause (the async-stripe 0.41 transitive chain), cleared
+          # only by the async-stripe 1.0 migration, so it is GitHub-side only:
+          #   GHSA-cq8v-f236-94qc = rand 0.7.3 unsoundness (via async-stripe → http-types)
+          allow-ghsas: GHSA-82j2-j2ch-gfr8, GHSA-965h-392x-2mh5, GHSA-xgp8-3hg3-c2mh, GHSA-c38w-74pg-36hr, GHSA-cq8v-f236-94qc
