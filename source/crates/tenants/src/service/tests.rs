@@ -15,7 +15,7 @@ const SEED: u8 = 5;
 const REGION: &str = "use1";
 
 fn verifier() -> Verifier {
-    Verifier::from_pem(jwt_keypair_pem(SEED).1.as_bytes()).unwrap()
+    Verifier::from_pem(jwt_keypair_pem(SEED).1.as_bytes(), "tenants").unwrap()
 }
 
 /// Seed a tenant + an active (paid) subscription granting `max_networks`/`max_daemons`.

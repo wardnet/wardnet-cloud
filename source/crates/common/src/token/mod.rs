@@ -14,9 +14,12 @@
 //! - `cnf` — an **optional** RFC 7800 proof-of-possession key (the daemon's Ed25519
 //!   public key). Present for daemons (the request signature is checked against it),
 //!   absent for users.
-//!
-//! There is **no `aud`** claim — per-service grant scoping is a deferred design
-//! question; caller-type authorization is handled separately by the auth layer.
+//! - `aud` — the **grant-scoping** claim (ADR-0008): the set of mesh service names
+//!   (`tenants` / `ddns` / `tunneller`) the token is valid at. A user token is
+//!   `[tenants]`; a daemon token is `[tenants]` while tenant-scoped and
+//!   `[tenants, ddns, tunneller]` once network-scoped. Each service's [`Verifier`]
+//!   validates its own name is present, so a token is accepted only at the services
+//!   it was minted for.
 
 use base64::Engine as _;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
@@ -64,6 +67,9 @@ pub struct Claims {
     /// Optional proof-of-possession key (daemons only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cnf: Option<Confirmation>,
+    /// Audience — the set of mesh service names this token is valid at (ADR-0008).
+    /// Each [`Verifier`] requires its own name to be present.
+    pub aud: Vec<String>,
     /// Issued-at (Unix seconds).
     pub iat: i64,
     /// Expiry (Unix seconds).
@@ -103,6 +109,10 @@ pub struct ClaimsSpec<'a> {
     pub network: Option<&'a str>,
     /// Optional `cnf` `PoP` key — standard-base64 of the daemon's 32-byte public key.
     pub cnf_ed25519_b64: Option<&'a str>,
+    /// Audience — the mesh service names this token is minted for (ADR-0008). A user
+    /// or tenant-scoped daemon token is `["tenants"]`; a network-scoped daemon token
+    /// is `["tenants", "ddns", "tunneller"]`.
+    pub audience: Vec<&'a str>,
 }
 
 /// Mints JWTs. Held only by the Tenants service.
@@ -141,6 +151,7 @@ impl Signer {
             cnf: spec.cnf_ed25519_b64.map(|c| Confirmation {
                 ed25519: c.to_owned(),
             }),
+            aud: spec.audience.iter().map(|s| (*s).to_owned()).collect(),
             iat: issued_at,
             exp: issued_at + ttl_secs,
         };
@@ -156,21 +167,27 @@ pub struct Verifier {
 }
 
 impl Verifier {
-    /// Build a verifier from the `EdDSA` public key PEM (SPKI `BEGIN PUBLIC KEY`).
+    /// Build a verifier from the `EdDSA` public key PEM (SPKI `BEGIN PUBLIC KEY`),
+    /// scoped to `expected_audience` — this service's own mesh name (`tenants` /
+    /// `ddns` / `tunneller`).
     ///
-    /// Verification requires `EdDSA`, a matching [`ISSUER`], and an unexpired `exp`
-    /// with **zero** leeway (offline revocation is bounded by the token TTL, so the
-    /// default leeway would silently widen it). Audience validation is disabled.
+    /// Verification requires `EdDSA`, a matching [`ISSUER`], an unexpired `exp` with
+    /// **zero** leeway (offline revocation is bounded by the token TTL, so the
+    /// default leeway would silently widen it), and an `aud` that **includes
+    /// `expected_audience`** (ADR-0008). Audience validation is *enabled*, so a token
+    /// carrying no `aud` — or one for other services only — is rejected: the grant
+    /// fails closed.
     ///
     /// # Errors
     /// Returns an error if the PEM is not a valid `EdDSA` public key.
-    pub fn from_pem(public_key_pem: &[u8]) -> anyhow::Result<Self> {
+    pub fn from_pem(public_key_pem: &[u8], expected_audience: &str) -> anyhow::Result<Self> {
         let key = DecodingKey::from_ed_pem(public_key_pem)
             .map_err(|e| anyhow::anyhow!("invalid JWT verify key PEM: {e}"))?;
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.set_issuer(&[ISSUER]);
+        validation.set_audience(&[expected_audience]);
         validation.validate_exp = true;
-        validation.validate_aud = false;
+        validation.validate_aud = true;
         validation.leeway = 0;
         Ok(Self { key, validation })
     }

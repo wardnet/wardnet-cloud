@@ -998,7 +998,7 @@ pub fn build_harness(seed: u8) -> Harness {
     let stripe: Arc<MockStripeGateway> = Arc::new(MockStripeGateway::new());
     let email: Arc<RecordingEmailSender> = Arc::new(RecordingEmailSender::new());
     let signer = test_signer(seed);
-    let verifier = Verifier::from_pem(jwt_keypair_pem(seed).1.as_bytes()).unwrap();
+    let verifier = Verifier::from_pem(jwt_keypair_pem(seed).1.as_bytes(), "tenants").unwrap();
 
     let subscriptions = Arc::new(SubscriptionService::new(
         Arc::new(store.clone()),

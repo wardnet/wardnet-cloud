@@ -73,8 +73,13 @@ async fn main() -> anyhow::Result<()> {
         config.forward_advertise_addr.clone(),
     ));
 
-    // Offline JWT verification (Tenants-signed daemon tokens).
-    let verifier = token::Verifier::from_pem(common_config::load_jwt_verify_key_pem()?.as_bytes())?;
+    // Offline JWT verification (Tenants-signed daemon tokens), scoped to this
+    // service's own audience (ADR-0008): only a network-scoped daemon token (whose
+    // `aud` includes `tunneller`) is accepted at `GET /v1/tunnel`.
+    let verifier = token::Verifier::from_pem(
+        common_config::load_jwt_verify_key_pem()?.as_bytes(),
+        "tunneller",
+    )?;
 
     // Values captured before `config` is cloned into the AppState.
     let https_listen_addr = config.https_listen_addr.clone();

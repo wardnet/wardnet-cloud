@@ -77,6 +77,13 @@ hyper-util = { version = "0.1", features = ["server", "tokio", "service"] }
 utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
 utoipa-axum = "0.2"
 
+# Human/web auth (WS-F): password hashing, cookie jars, and OIDC (Google + discovery).
+# GitHub OAuth2 is hand-rolled over `reqwest` (no id_token).
+argon2 = "0.5"
+axum-extra = { version = "0.10", features = ["cookie", "cookie-private", "cookie-signed"] }
+# rustls only — keep the workspace openssl-free (matches `reqwest`/`async-stripe`).
+openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
+
 # Dev
 http-body-util = "0.1"
 wiremock = "0.6"

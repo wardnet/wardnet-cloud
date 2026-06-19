@@ -68,6 +68,7 @@ fn user_token(tenant_id: &str) -> String {
                 subject: "user-1",
                 network: None,
                 cnf_ed25519_b64: None,
+                audience: vec!["tenants"],
             },
             now(),
             300,

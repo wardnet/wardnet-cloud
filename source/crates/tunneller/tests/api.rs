@@ -37,8 +37,15 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-/// Mint a daemon JWT. `network` is the `net` claim (None ⇒ tenant-scoped).
+/// Mint a daemon JWT. `network` is the `net` claim (None ⇒ tenant-scoped). `aud`
+/// follows the lifecycle (ADR-0008): tenant-scoped → `[tenants]` (rejected here, as
+/// `tunneller` is absent), network-scoped → the full mesh.
 fn daemon_token(cnf: &str, network: Option<&str>) -> String {
+    let audience = if network.is_some() {
+        vec!["tenants", "ddns", "tunneller"]
+    } else {
+        vec!["tenants"]
+    };
     test_signer(SEED)
         .sign(
             &ClaimsSpec {
@@ -47,6 +54,7 @@ fn daemon_token(cnf: &str, network: Option<&str>) -> String {
                 subject: cnf,
                 network,
                 cnf_ed25519_b64: Some(cnf),
+                audience,
             },
             now(),
             300,
@@ -152,10 +160,12 @@ async fn tunnel_requires_auth() {
 async fn tunnel_rejects_tenant_scoped_token() {
     let addr = spawn(app_with(eligible_tenants())).await;
     let (key, cnf) = daemon_keypair(11);
-    let token = daemon_token(&cnf, None); // no `net`
+    let token = daemon_token(&cnf, None); // no `net` → aud = [tenants], omits `tunneller`
+    // `aud` closes it at the verifier (401) before the handler's network-scope check
+    // (ADR-0008): a not-yet-network-bound daemon has no reach into the data plane.
     assert_eq!(
         get_status(addr, "/v1/tunnel", &tunnel_headers(&key, Some(&token))).await,
-        403
+        401
     );
 }
 

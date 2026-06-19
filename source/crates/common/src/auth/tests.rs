@@ -41,7 +41,8 @@ impl AuthContext for TestState {
 fn state() -> (TestState, Signer) {
     let (priv_pem, pub_pem) = jwt_keypair_pem(1);
     let signer = Signer::from_pem(priv_pem.as_bytes(), None).unwrap();
-    let verifier = Verifier::from_pem(pub_pem.as_bytes()).unwrap();
+    // Scope the verifier to `tenants`; every token minted below carries it in `aud`.
+    let verifier = Verifier::from_pem(pub_pem.as_bytes(), "tenants").unwrap();
     (
         TestState {
             verifier: Arc::new(verifier),
@@ -86,6 +87,7 @@ fn signed_daemon_request(signer: &Signer, seed: u8, timestamp: i64, body: &[u8])
                 subject: "daemon-1",
                 network: Some("n1"),
                 cnf_ed25519_b64: Some(&cnf),
+                audience: vec!["tenants", "ddns", "tunneller"],
             },
             now(),
             TTL,
@@ -138,6 +140,7 @@ fn user_request(signer: &Signer) -> Request<Body> {
                 subject: "user-1",
                 network: None,
                 cnf_ed25519_b64: None,
+                audience: vec!["tenants"],
             },
             now(),
             TTL,

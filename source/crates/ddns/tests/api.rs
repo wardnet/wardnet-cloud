@@ -25,8 +25,15 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-/// Mint a daemon JWT. `network` is the `net` claim (None ⇒ tenant-scoped).
+/// Mint a daemon JWT. `network` is the `net` claim (None ⇒ tenant-scoped). `aud`
+/// follows the lifecycle (ADR-0008): tenant-scoped → `[tenants]` (rejected here, as
+/// `ddns` is absent), network-scoped → the full mesh.
 fn daemon_token(cnf: &str, network: Option<&str>) -> String {
+    let audience = if network.is_some() {
+        vec!["tenants", "ddns", "tunneller"]
+    } else {
+        vec!["tenants"]
+    };
     test_signer(SEED)
         .sign(
             &ClaimsSpec {
@@ -35,6 +42,7 @@ fn daemon_token(cnf: &str, network: Option<&str>) -> String {
                 subject: cnf,
                 network,
                 cnf_ed25519_b64: Some(cnf),
+                audience,
             },
             now(),
             300,
@@ -118,16 +126,17 @@ async fn report_ip_rejects_reserved_address() {
 }
 
 #[tokio::test]
-async fn report_ip_with_tenant_scoped_token_is_forbidden() {
+async fn report_ip_with_tenant_scoped_token_is_rejected() {
     let app = app_with(InMemoryOperational::new(), MockDnsProvider::new());
     let (key, cnf) = daemon_keypair(11);
-    // No `net` claim → tenant-scoped → 403.
+    // No `net` claim → tenant-scoped → `aud = [tenants]`, which omits `ddns`, so the
+    // verifier rejects it (401) before any handler-level network-scope check (ADR-0008).
     let token = daemon_token(&cnf, None);
     let body = serde_json::to_vec(&json!({ "ip": "203.0.113.42" })).unwrap();
     let req = daemon_request("PUT", "/v1/ip", &body, &key, Some(&token));
 
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

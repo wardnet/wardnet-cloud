@@ -47,8 +47,11 @@ async fn main() -> anyhow::Result<()> {
 
     let ddns = Arc::new(DdnsService::new(operational.clone(), dns_provider));
 
-    // Offline JWT verification (Tenants-signed daemon tokens).
-    let verifier = token::Verifier::from_pem(common_config::load_jwt_verify_key_pem()?.as_bytes())?;
+    // Offline JWT verification (Tenants-signed daemon tokens), scoped to this
+    // service's own audience (ADR-0008): a token whose `aud` omits `ddns` — e.g. a
+    // user token or a tenant-scoped daemon token — is rejected.
+    let verifier =
+        token::Verifier::from_pem(common_config::load_jwt_verify_key_pem()?.as_bytes(), "ddns")?;
 
     // Mesh client (mTLS) consuming the Tenants work-queue. inforge re-projects the
     // leaf/key/bundle files in place on rotation; we file-watch + hot-reload.

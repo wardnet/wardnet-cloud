@@ -221,6 +221,7 @@ fn mint_user_token(signing_key_path: &str, tenant_id: &str) -> String {
                 subject: "e2e-user",
                 network: None,
                 cnf_ed25519_b64: None,
+                audience: vec!["tenants"],
             },
             now,
             300,

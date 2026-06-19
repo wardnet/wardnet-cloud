@@ -464,12 +464,21 @@ impl TenantsService {
             ));
         }
 
+        // Grant-scope the token (ADR-0008): a tenant-scoped daemon (still enrolling,
+        // no network) reaches only `tenants`; a network-scoped daemon additionally
+        // reaches the regional data plane (`ddns` + `tunneller`).
+        let audience = if network.is_some() {
+            vec!["tenants", "ddns", "tunneller"]
+        } else {
+            vec!["tenants"]
+        };
         let spec = ClaimsSpec {
             tenant_id: &tenant_id,
             principal_type: PrincipalType::Daemon,
             subject: public_key,
             network: network.as_deref(),
             cnf_ed25519_b64: Some(public_key),
+            audience,
         };
         self.signer
             .sign(&spec, now.timestamp(), IDENTITY_JWT_TTL_SECS)

@@ -19,14 +19,15 @@ fn daemon_key(seed: u8) -> (SigningKey, String) {
     (key, cnf)
 }
 
+/// A verifier scoped to `tenants` — every spec below carries `tenants` in its `aud`.
 fn signer() -> (Signer, Verifier) {
     let (priv_pem, pub_pem) = jwt_keypair_pem(1);
     let signer = Signer::from_pem(priv_pem.as_bytes(), Some("k1".to_owned())).unwrap();
-    let verifier = Verifier::from_pem(pub_pem.as_bytes()).unwrap();
+    let verifier = Verifier::from_pem(pub_pem.as_bytes(), "tenants").unwrap();
     (signer, verifier)
 }
 
-/// A daemon, network-scoped token spec.
+/// A daemon, network-scoped token spec (`aud` spans the full mesh).
 fn daemon_spec(cnf: &str) -> ClaimsSpec<'_> {
     ClaimsSpec {
         tenant_id: "tenant-1",
@@ -34,6 +35,7 @@ fn daemon_spec(cnf: &str) -> ClaimsSpec<'_> {
         subject: "daemon-123",
         network: Some("net-1"),
         cnf_ed25519_b64: Some(cnf),
+        audience: vec!["tenants", "ddns", "tunneller"],
     }
 }
 
@@ -70,12 +72,14 @@ fn user_token_has_no_cnf_or_network() {
         subject: "user-7",
         network: None,
         cnf_ed25519_b64: None,
+        audience: vec!["tenants"],
     };
 
     let token = signer.sign(&spec, iat, TTL).unwrap();
     let claims = verifier.verify(&token).unwrap();
 
     assert_eq!(claims.pt, PrincipalType::User);
+    assert_eq!(claims.aud, vec!["tenants".to_string()]);
     assert_eq!(claims.sub, "user-7");
     assert!(claims.net.is_none());
     assert!(claims.cnf.is_none());
@@ -109,6 +113,7 @@ fn wrong_issuer_is_rejected() {
         sub: "daemon-123".to_owned(),
         net: Some("net-1".to_owned()),
         cnf: Some(Confirmation { ed25519: cnf }),
+        aud: vec!["tenants".to_owned()],
         iat,
         exp: iat + TTL,
     };
@@ -143,12 +148,46 @@ fn token_from_a_different_signer_is_rejected() {
 
     // A verifier built from an unrelated keypair must reject the token.
     let (_other_priv, other_pub) = jwt_keypair_pem(2);
-    let foreign = Verifier::from_pem(other_pub.as_bytes()).unwrap();
+    let foreign = Verifier::from_pem(other_pub.as_bytes(), "tenants").unwrap();
     assert!(foreign.verify(&token).is_err());
+}
+
+#[test]
+fn token_audience_mismatch_is_rejected() {
+    // A network-scoped daemon token (aud = [tenants, ddns, tunneller]) is accepted by
+    // a `tenants`-scoped verifier but rejected by one scoped to a name it omits.
+    let (signer, _verifier) = signer();
+    let (_daemon, cnf) = daemon_key(9);
+    let token = signer.sign(&daemon_spec(&cnf), now(), TTL).unwrap();
+
+    let (_priv, pub_pem) = jwt_keypair_pem(1);
+    let tenants_v = Verifier::from_pem(pub_pem.as_bytes(), "tenants").unwrap();
+    let unknown_v = Verifier::from_pem(pub_pem.as_bytes(), "billing").unwrap();
+    assert!(tenants_v.verify(&token).is_ok());
+    assert!(unknown_v.verify(&token).is_err());
+}
+
+#[test]
+fn user_token_is_rejected_at_a_data_plane_verifier() {
+    // A user token (aud = [tenants]) must never be accepted at ddns/tunneller.
+    let (signer, _verifier) = signer();
+    let spec = ClaimsSpec {
+        tenant_id: "tenant-1",
+        principal_type: PrincipalType::User,
+        subject: "tenant-1",
+        network: None,
+        cnf_ed25519_b64: None,
+        audience: vec!["tenants"],
+    };
+    let token = signer.sign(&spec, now(), TTL).unwrap();
+
+    let (_priv, pub_pem) = jwt_keypair_pem(1);
+    let ddns_v = Verifier::from_pem(pub_pem.as_bytes(), "ddns").unwrap();
+    assert!(ddns_v.verify(&token).is_err());
 }
 
 #[test]
 fn signer_rejects_garbage_pem() {
     assert!(Signer::from_pem(b"not a pem", None).is_err());
-    assert!(Verifier::from_pem(b"not a pem").is_err());
+    assert!(Verifier::from_pem(b"not a pem", "tenants").is_err());
 }

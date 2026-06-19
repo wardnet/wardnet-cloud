@@ -61,8 +61,13 @@ async fn main() -> anyhow::Result<()> {
     let signer = token::Signer::from_pem(signing_key_pem.as_bytes(), None)?;
     drop(signing_key_pem);
 
-    // The auth layer verifies identity JWTs offline with the matching public key.
-    let verifier = token::Verifier::from_pem(common_config::load_jwt_verify_key_pem()?.as_bytes())?;
+    // The auth layer verifies identity JWTs offline with the matching public key,
+    // scoped to this service's own audience (ADR-0008): a token whose `aud` omits
+    // `tenants` is rejected.
+    let verifier = token::Verifier::from_pem(
+        common_config::load_jwt_verify_key_pem()?.as_bytes(),
+        "tenants",
+    )?;
 
     // Domain-event bus: services publish, reactors react (one-way, never a direct
     // cross-aggregate write call).

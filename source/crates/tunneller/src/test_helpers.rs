@@ -292,6 +292,6 @@ pub fn build_state(
     routes: Arc<dyn TunnelRouteRepository>,
     tenants: Arc<dyn TenantsResolver>,
 ) -> AppState {
-    let verifier = Verifier::from_pem(jwt_keypair_pem(seed).1.as_bytes()).unwrap();
+    let verifier = Verifier::from_pem(jwt_keypair_pem(seed).1.as_bytes(), "tunneller").unwrap();
     AppState::new(test_config(), registry, routes, tenants, verifier)
 }

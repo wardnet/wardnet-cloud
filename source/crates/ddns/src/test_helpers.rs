@@ -419,6 +419,6 @@ pub fn test_config() -> Config {
 #[must_use]
 pub fn build_state(seed: u8, op: InMemoryOperational, dns: MockDnsProvider) -> AppState {
     let service = Arc::new(DdnsService::new(Arc::new(op), Arc::new(dns)));
-    let verifier = Verifier::from_pem(jwt_keypair_pem(seed).1.as_bytes()).unwrap();
+    let verifier = Verifier::from_pem(jwt_keypair_pem(seed).1.as_bytes(), "ddns").unwrap();
     AppState::new(test_config(), service, verifier)
 }
