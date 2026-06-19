@@ -150,6 +150,43 @@ async fn token_exchange_without_cookie_is_unauthorized() {
 }
 
 #[tokio::test]
+async fn session_cookie_is_httponly_secure_samesite() {
+    // The browser-durable credential must be unreadable to JS (HttpOnly), TLS-only
+    // (Secure), and SameSite-scoped — dropping any of these widens hijack/CSRF exposure.
+    let (app, _h) = plain_app();
+    let code = signup_code(&app, "carol@example.com").await;
+    let resp = app
+        .oneshot(post_json(
+            "/v1/auth/password/signup",
+            &json!({ "email": "carol@example.com", "code": code, "password": "hunter2hunter2" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let raw = resp
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|c| c.starts_with("wardnet_session="))
+        .expect("a wardnet_session Set-Cookie header")
+        .to_string();
+    assert!(
+        raw.contains("HttpOnly"),
+        "session cookie must be HttpOnly: {raw}"
+    );
+    assert!(
+        raw.contains("Secure"),
+        "session cookie must be Secure: {raw}"
+    );
+    assert!(
+        raw.contains("SameSite=Lax"),
+        "session cookie must be SameSite=Lax: {raw}"
+    );
+}
+
+#[tokio::test]
 async fn login_after_signup_succeeds_and_logout_revokes() {
     let (app, _h) = plain_app();
     let code = signup_code(&app, "bob@example.com").await;

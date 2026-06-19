@@ -319,3 +319,28 @@ fn is_active_respects_status_and_grace() {
     // Canceled is never entitling.
     assert!(!svc.is_active(&sub("t", SubscriptionStatus::Canceled), now));
 }
+
+#[test]
+fn is_active_grace_boundary_is_exclusive() {
+    // The grace check is `now < expiry + grace` (strict): at the exact cutoff the
+    // subscription is already inactive. Pins the operator so a `<` → `<=` regression
+    // (a free extra moment of service past grace) is caught.
+    let store = MockStore::new();
+    let events = Arc::new(RecordingEventPublisher::new());
+    let svc = SubscriptionService::new(
+        Arc::new(store) as Arc<dyn SubscriptionRepository>,
+        events,
+        Arc::new(MockStripeGateway::new()),
+        POLICY,
+    );
+    let now = Utc::now();
+
+    let mut trial = sub("t", SubscriptionStatus::Trialing);
+    // One second inside the 15-day grace window → still active.
+    trial.trial_expires_at =
+        Some(now - Duration::days(POLICY.trial_grace_days) + Duration::seconds(1));
+    assert!(svc.is_active(&trial, now));
+    // Exactly at the cutoff (now == expiry + grace) → no longer active.
+    trial.trial_expires_at = Some(now - Duration::days(POLICY.trial_grace_days));
+    assert!(!svc.is_active(&trial, now));
+}
