@@ -289,6 +289,28 @@ cargo test --workspace          # Postgres-backed tests are #[ignore]'d unless `
 
 The cloud services have no Linux-specific dependencies and build natively on macOS.
 
+Postgres-backed `#[ignore]` tests are gated on per-service env vars — set the one(s) you need:
+
+```sh
+TENANTS_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432
+DDNS_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432
+TUNNELLER_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432
+```
+
+Only the env var for the crate under test is consulted; the others are harmless no-ops.
+
+CI requires the **`All checks passed`** aggregator job (defined in `ci.yml`/`pr.yml`) — this is the single required branch-protection check; per-service leaves gate under it.
+
+## Releasing a service
+
+Each service has its own tag-triggered release pipeline. To cut a release for a service:
+
+1. Bump `version` in `source/crates/<service>/Cargo.toml` and commit.
+2. Tag and push: `git tag <service>-v<version> && git push origin <service>-v<version>`
+   — where `<service>` is one of `tenants`, `ddns`, or `tunneller`.
+
+The release workflow validates that the tag version matches the crate's `Cargo.toml` version and aborts if they diverge. A `workflow_dispatch` on any ref is a dry run (builds + signs, never publishes).
+
 ## Local dev
 
 Point `DATABASE_URL` at a local/Neon dev Postgres and set the Cloudflare values (and the other secrets)
