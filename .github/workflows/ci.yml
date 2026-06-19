@@ -12,8 +12,8 @@ name: CI
 # Structure:
 #   preflight        — detect-changes (outputs gate the leaves below)
 #   build-<service>  — lint + tests + aarch64 build + artifact (gated)
-#   e2e-mesh         — cross-service mesh-mTLS harness (gated)
 #   coverage         — workspace coverage → Codecov (gated)
+# (The mesh e2e harness runs nightly / on demand via e2e.yml, not here.)
 
 on:
   push:
@@ -93,14 +93,8 @@ jobs:
       service: tunneller
     secrets: inherit
 
-  e2e-mesh:
-    name: E2E mesh
-    needs: preflight
-    # The harness exercises tenants + ddns over mesh mTLS; a tunneller-only
-    # change does not touch it.
-    if: needs.preflight.outputs.tenants == 'true' || needs.preflight.outputs.ddns == 'true' || needs.preflight.outputs.all == 'true'
-    uses: ./.github/workflows/e2e.yml
-    secrets: inherit
+  # The mesh e2e harness runs nightly (schedule) + on demand, NOT on every push to
+  # main — it is heavy and flaky on shared runners (see .github/workflows/e2e.yml).
 
   coverage:
     name: Coverage

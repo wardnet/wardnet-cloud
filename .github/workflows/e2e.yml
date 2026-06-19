@@ -6,11 +6,18 @@ name: E2E Mesh
 # Drives the full tombstone lifecycle (provision → USER deregister → reaper →
 # sweep). See source/end2end-tests/mesh/README.md.
 #
-# Callers: ci.yml (push to main), pr.yml (PRs). Gated on a tenants/ddns/shared
-# change — a tunneller-only change does not exercise this harness.
+# Triggers: a nightly `schedule`, manual `workflow_dispatch`, and `workflow_call`
+# (so another workflow can still invoke it). It is deliberately NOT a required PR
+# gate: the harness is heavy (multi-minute container build + a timing-sensitive
+# tombstone flow) and flaky on shared CI runners, so it runs OUT of the merge path
+# and is monitored via the nightly run / on demand. Re-promote it to a PR gate once
+# it is hardened (explicit readiness gating + container-log capture on failure).
 
 on:
   workflow_call:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * *" # nightly at 04:00 UTC (runs on the default branch)
 
 permissions:
   contents: read

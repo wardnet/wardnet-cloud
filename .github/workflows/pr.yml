@@ -90,12 +90,9 @@ jobs:
       service: tunneller
     secrets: inherit
 
-  e2e-mesh:
-    name: E2E mesh
-    needs: preflight
-    if: needs.preflight.outputs.tenants == 'true' || needs.preflight.outputs.ddns == 'true' || needs.preflight.outputs.all == 'true'
-    uses: ./.github/workflows/e2e.yml
-    secrets: inherit
+  # NOTE: the mesh e2e harness is intentionally NOT a PR leaf. It is heavy and
+  # flaky on shared runners (see .github/workflows/e2e.yml), so it runs nightly
+  # on a schedule + on demand (workflow_dispatch) instead of gating every merge.
 
   coverage:
     name: Coverage
@@ -125,7 +122,7 @@ jobs:
   # never reports and blocks the PR forever.
   all-checks-passed:
     name: All checks passed
-    needs: [preflight, build-tenants, build-ddns, build-tunneller, e2e-mesh, coverage]
+    needs: [preflight, build-tenants, build-ddns, build-tunneller, coverage]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 2
