@@ -1,9 +1,19 @@
 name: CI
 
-# Continuous integration for pushes to the default branch. The whole repo is a
-# single cloud service, so every push is in scope — no change-detection gating.
-# The actual lint + test + aarch64 build lives in the reusable build-cloud.yml
-# leaf (shared with pr.yml and release-cloud.yml).
+# Orchestrator for pushes to `main`.
+#
+# Composes the same per-service reusable leaves as pr.yml, gated by
+# detect-changes so only affected services build/test. Coverage ALSO runs here
+# (push-to-main) so Codecov records a report for the merged main commit — that
+# default-branch upload is what advances the coverage number/badge. main is
+# squash-merged, so PR-head reports are never main ancestors; without this the
+# default-branch number would freeze.
+#
+# Structure:
+#   preflight        — detect-changes (outputs gate the leaves below)
+#   build-<service>  — lint + tests + aarch64 build + artifact (gated)
+#   e2e-mesh         — cross-service mesh-mTLS harness (gated)
+#   coverage         — workspace coverage → Codecov (gated)
 
 on:
   push:
@@ -14,16 +24,91 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Workflow-level permissions stay read-only. Each job/leaf elevates to the
+# writes it actually needs via its own `permissions:` block — Scorecard's
+# Token-Permissions check rewards this scoping.
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
 jobs:
-  build-cloud:
-    name: Build Cloud
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      all: ${{ steps.detect.outputs.all }}
+      tenants: ${{ steps.detect.outputs.tenants }}
+      ddns: ${{ steps.detect.outputs.ddns }}
+      tunneller: ${{ steps.detect.outputs.tunneller }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: ./.github/actions/detect-changes
+        id: detect
+
+  build-tenants:
+    name: Build tenants
+    needs: preflight
+    if: needs.preflight.outputs.tenants == 'true' || needs.preflight.outputs.all == 'true'
     permissions:
-      # check-cloud uploads clippy SARIF to Code Scanning.
-      security-events: write
-      actions: read
       contents: read
-    uses: ./.github/workflows/build-cloud.yml
+      actions: read
+      security-events: write
+    uses: ./.github/workflows/build-service.yml
+    with:
+      service: tenants
+    secrets: inherit
+
+  build-ddns:
+    name: Build ddns
+    needs: preflight
+    if: needs.preflight.outputs.ddns == 'true' || needs.preflight.outputs.all == 'true'
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    uses: ./.github/workflows/build-service.yml
+    with:
+      service: ddns
+    secrets: inherit
+
+  build-tunneller:
+    name: Build tunneller
+    needs: preflight
+    if: needs.preflight.outputs.tunneller == 'true' || needs.preflight.outputs.all == 'true'
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    uses: ./.github/workflows/build-service.yml
+    with:
+      service: tunneller
+    secrets: inherit
+
+  e2e-mesh:
+    name: E2E mesh
+    needs: preflight
+    # The harness exercises tenants + ddns over mesh mTLS; a tunneller-only
+    # change does not touch it.
+    if: needs.preflight.outputs.tenants == 'true' || needs.preflight.outputs.ddns == 'true' || needs.preflight.outputs.all == 'true'
+    uses: ./.github/workflows/e2e.yml
+    secrets: inherit
+
+  coverage:
+    name: Coverage
+    needs: preflight
+    if: >
+      needs.preflight.outputs.tenants == 'true' ||
+      needs.preflight.outputs.ddns == 'true' ||
+      needs.preflight.outputs.tunneller == 'true' ||
+      needs.preflight.outputs.all == 'true'
+    uses: ./.github/workflows/coverage.yml
     secrets: inherit

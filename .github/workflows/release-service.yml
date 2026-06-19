@@ -1,22 +1,29 @@
-name: Release Cloud
+name: Release Service
 
-# Tag-driven cloud release: build the aarch64 binary, package it with the
-# inforge `run` entrypoint into a signed tarball, publish a GitHub Release, then
-# hand off to deploy-cloud.yml (which dispatches the inforge raw-service deploy
-# on wardnet-infrastructure and blocks on it).
+# Reusable per-service release pipeline, parameterised by `service`. Invoked by
+# the thin tag-triggered callers (release-tenants.yml / release-ddns.yml /
+# release-tunneller.yml): push a `<service>-v*` tag and that caller runs this
+# pipeline for its service.
 #
-# The cloud releases INDEPENDENTLY of the daemon: its tag prefix is `cloud-v*`
-# and its version source of truth is source/Cargo.toml (pure SemVer), so
-# cloud releases never collide with the daemon's `v*.*.*` CalVer tags.
+# The three services release INDEPENDENTLY of each other and of the daemon.
+# Each has its own SemVer tag prefix (`tenants-v*` / `ddns-v*` / `tunneller-v*`)
+# and its own version source of truth — the `version` in its crate's
+# Cargo.toml. The tag is validated against that crate version, so a tag can
+# never disagree with what was built.
 #
-# `workflow_dispatch` is a dry run on any ref: it builds + signs but stops short
-# of publishing (release is gated on a `cloud-v*` tag) and never deploys.
+# Pipeline: resolve+validate version → build (build-service.yml) →
+# preflight-deploy → publish GitHub Release → deploy (deploy-service.yml).
+#
+# A non-tag invocation (the caller's `workflow_dispatch` dry run) builds + signs
+# but stops before publishing and never deploys.
 
 on:
-  push:
-    tags:
-      - "cloud-v*"
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      service:
+        description: Service name — tenants | ddns | tunneller.
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -34,6 +41,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
       prerelease: ${{ steps.version.outputs.prerelease }}
+      publish: ${{ steps.version.outputs.publish }}
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -44,40 +52,44 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Resolve version from ref and guard against Cargo.toml
+      - name: Resolve version from ref and guard against the crate Cargo.toml
         id: version
+        env:
+          SERVICE: ${{ inputs.service }}
         run: |
           set -euo pipefail
 
-          # The cloud's version source of truth is source/Cargo.toml.
-          # Pure SemVer (no CalVer date segments), so the tag compares directly
-          # against the package version — unlike the daemon, which compares the
-          # tag against ./CALVER because Cargo rejects CalVer's leading zeros.
-          #
-          # Read `version` ONLY from within the [package] table, so a future
-          # [workspace.package] / dependency `version = ` line (or a reorder)
-          # can't make the guard compare against the wrong string.
+          # Read `version` ONLY from within the [package] table of the service
+          # crate's Cargo.toml, so a future [workspace.package] / dependency
+          # `version = ` line (or a reorder) can't make the guard compare
+          # against the wrong string. The cloud services use pure SemVer, so the
+          # tag compares directly against the package version.
+          MANIFEST="source/crates/${SERVICE}/Cargo.toml"
           CARGO_VERSION="$(awk -F' *= *' '
             /^\[/        { in_pkg = ($0 == "[package]") }
             in_pkg && $1 == "version" { gsub(/"/, "", $2); print $2; exit }
-          ' source/Cargo.toml)"
+          ' "${MANIFEST}")"
           if [[ -z "${CARGO_VERSION}" ]]; then
-            echo "::error::could not read [package] version from source/Cargo.toml"
+            echo "::error::could not read [package] version from ${MANIFEST}"
             exit 1
           fi
 
-          if [[ "${GITHUB_REF}" == refs/tags/cloud-v* ]]; then
+          PREFIX="refs/tags/${SERVICE}-v"
+          if [[ "${GITHUB_REF}" == "${PREFIX}"* ]]; then
             TAG="${GITHUB_REF#refs/tags/}"
-            VERSION="${TAG#cloud-v}"
+            VERSION="${TAG#"${SERVICE}"-v}"
+            PUBLISH="true"
 
             if [[ "${VERSION}" != "${CARGO_VERSION}" ]]; then
-              echo "::error::tag ${TAG} (version ${VERSION}) does not agree with source/Cargo.toml (${CARGO_VERSION}). Bump Cargo.toml and re-tag."
+              echo "::error::tag ${TAG} (version ${VERSION}) does not agree with ${MANIFEST} (${CARGO_VERSION}). Bump Cargo.toml and re-tag."
               exit 1
             fi
           else
-            # workflow_dispatch dry run on a non-tag ref — use the Cargo version.
+            # Non-tag ref (the caller's workflow_dispatch dry run) — use the
+            # Cargo version, build + sign only, no publish/deploy.
             TAG=""
             VERSION="${CARGO_VERSION}"
+            PUBLISH="false"
           fi
 
           if [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+- ]]; then
@@ -90,18 +102,21 @@ jobs:
             echo "tag=${TAG}"
             echo "version=${VERSION}"
             echo "prerelease=${PRERELEASE}"
+            echo "publish=${PUBLISH}"
           } >> "${GITHUB_OUTPUT}"
 
-          echo "Cloud release version: ${VERSION} (tag=${TAG:-<dispatch>}, prerelease=${PRERELEASE})"
+          echo "${SERVICE} release version: ${VERSION} (tag=${TAG:-<dispatch>}, publish=${PUBLISH}, prerelease=${PRERELEASE})"
 
   build:
-    name: Build Cloud
+    name: Build ${{ inputs.service }}
     needs: resolve
     permissions:
       contents: read
       actions: read
       security-events: write
-    uses: ./.github/workflows/build-cloud.yml
+    uses: ./.github/workflows/build-service.yml
+    with:
+      service: ${{ inputs.service }}
     secrets: inherit
 
   # Fail BEFORE publishing if the deploy can't possibly succeed, to avoid a
@@ -112,7 +127,7 @@ jobs:
   preflight-deploy:
     name: Preflight deploy prerequisites
     needs: resolve
-    if: startsWith(github.ref, 'refs/tags/cloud-v')
+    if: needs.resolve.outputs.publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -145,9 +160,7 @@ jobs:
   release:
     name: Publish GitHub Release
     needs: [resolve, build, preflight-deploy]
-    # Publish only on an actual cloud-v* tag. workflow_dispatch exercises the
-    # full build + sign path but stops before `gh release create`.
-    if: startsWith(github.ref, 'refs/tags/cloud-v')
+    if: needs.resolve.outputs.publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -163,47 +176,49 @@ jobs:
 
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
-      - name: Download cloud aarch64
+      - name: Download ${{ inputs.service }} aarch64
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: wardnet-cloud-aarch64-unsigned
+          name: wardnet-${{ inputs.service }}-aarch64-unsigned
           path: release-staging/
 
       - name: Assemble run+binary tarball
         env:
+          SERVICE: ${{ inputs.service }}
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           set -euo pipefail
 
-          # build-cloud.yml ships wardnet-cloud-aarch64.tar.gz containing just
-          # the binary. The inforge raw-service contract requires the deployed
-          # tarball's root to hold an executable `run` entrypoint plus the
-          # binary, so repack with source/deploy/run alongside it.
+          # build-service.yml ships wardnet-<service>-aarch64.tar.gz containing
+          # just the binary. The inforge raw-service contract requires the
+          # deployed tarball's root to hold an executable `run` entrypoint plus
+          # the binary, so repack with the per-service run script as `run`.
+          BIN="wardnet-${SERVICE}"
           WORK="staged-aarch64"
           mkdir -p "${WORK}"
-          tar -C "${WORK}" -xzf release-staging/wardnet-cloud-aarch64.tar.gz
-          install -m 0755 source/deploy/run "${WORK}/run"
+          tar -C "${WORK}" -xzf "release-staging/${BIN}-aarch64.tar.gz"
+          install -m 0755 "source/deploy/run-${SERVICE}" "${WORK}/run"
 
-          # Sanity-guard the built binary: it must be a valid aarch64 ELF (catches
-          # a wrong-target/corrupt build before it ships). Runtime health — that
-          # the process actually comes up — is verified host-side by inforge's
-          # deploy (unit restart) which deploy-cloud.yml blocks on.
-          DESC="$(file -b "${WORK}/wardnet-cloud")"
+          # Sanity-guard the built binary: it must be a valid aarch64 ELF
+          # (catches a wrong-target/corrupt build before it ships). Runtime
+          # health — that the process actually comes up — is verified host-side
+          # by inforge's deploy (unit restart) which deploy-service.yml blocks on.
+          DESC="$(file -b "${WORK}/${BIN}")"
           if ! printf '%s' "${DESC}" | grep -qiE 'ELF 64-bit.*(aarch64|ARM aarch64)'; then
-            echo "::error::built cloud binary is not an aarch64 ELF: ${DESC}"
+            echo "::error::built ${BIN} is not an aarch64 ELF: ${DESC}"
             exit 1
           fi
 
-          DST="release-staging/wardnet-cloud-${VERSION}-aarch64.tar.gz"
-          tar -C "${WORK}" -czf "${DST}" run wardnet-cloud
-          rm -rf "${WORK}" release-staging/wardnet-cloud-aarch64.tar.gz
+          DST="release-staging/${BIN}-${VERSION}-aarch64.tar.gz"
+          tar -C "${WORK}" -czf "${DST}" run "${BIN}"
+          rm -rf "${WORK}" "release-staging/${BIN}-aarch64.tar.gz"
           ls -l release-staging
 
       - name: Sign release tarball
         uses: ./.github/actions/sign-release-tarball
         with:
-          tarball: release-staging/wardnet-cloud-${{ needs.resolve.outputs.version }}-aarch64.tar.gz
-          comment: wardnet-cloud ${{ needs.resolve.outputs.version }} (aarch64)
+          tarball: release-staging/wardnet-${{ inputs.service }}-${{ needs.resolve.outputs.version }}-aarch64.tar.gz
+          comment: wardnet-${{ inputs.service }} ${{ needs.resolve.outputs.version }} (aarch64)
           minisign-key-b64: ${{ secrets.WARDNET_MINISIGN_KEY }}
           minisign-password: ${{ secrets.WARDNET_MINISIGN_PASSWORD }}
 
@@ -215,14 +230,15 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SERVICE: ${{ inputs.service }}
           TAG: ${{ needs.resolve.outputs.tag }}
           VERSION: ${{ needs.resolve.outputs.version }}
           PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
         run: |
           set -euo pipefail
-          ARGS=(--verify-tag --title "Wardnet Cloud ${VERSION}")
+          ARGS=(--verify-tag --title "wardnet-${SERVICE} ${VERSION}")
 
-          NOTES_FILE="docs/releases/cloud-v${VERSION}.md"
+          NOTES_FILE="docs/releases/${SERVICE}-v${VERSION}.md"
           if [[ -f "${NOTES_FILE}" ]]; then
             echo "Using release notes from ${NOTES_FILE}"
             ARGS+=(--notes-file "${NOTES_FILE}")
@@ -241,12 +257,13 @@ jobs:
             release-staging/*.tar.gz.minisig
 
   deploy:
-    name: Deploy Cloud
+    name: Deploy ${{ inputs.service }}
     needs: [resolve, release]
-    if: startsWith(github.ref, 'refs/tags/cloud-v')
+    if: needs.resolve.outputs.publish == 'true'
     permissions:
       contents: read
-    uses: ./.github/workflows/deploy-cloud.yml
+    uses: ./.github/workflows/deploy-service.yml
     with:
+      service: ${{ inputs.service }}
       tag: ${{ needs.resolve.outputs.tag }}
     secrets: inherit

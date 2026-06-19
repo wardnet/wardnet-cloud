@@ -1,44 +1,57 @@
-name: Deploy Cloud
+name: Deploy Service
 
-# Deploys a published cloud release onto wardnet infrastructure via inforge's
-# raw-service path. It does NOT deploy directly: it triggers the
+# Deploys a published per-service cloud release onto wardnet infrastructure via
+# inforge's raw-service path. It does NOT deploy directly: it triggers the
 # `deploy-raw-service` workflow on the wardnet-infrastructure repo (where the
 # deploy SSH key lives — it is never held here) and blocks until that run
 # finishes, failing if it fails.
 #
 # Two entry points:
-#   * workflow_call  — release-cloud.yml chains here after publishing the
-#     GitHub Release, so a `cloud-v*` tag runs release → deploy in sequence.
-#   * workflow_dispatch — run "Deploy Cloud" by hand from the Actions UI for a
-#     given tag (re-deploy, or deploy a tag whose auto-deploy was skipped).
+#   * workflow_call  — release-service.yml chains here after publishing the
+#     GitHub Release, so a `<service>-v*` tag runs release → deploy in sequence.
+#   * workflow_dispatch — run "Deploy Service" by hand for a given service+tag
+#     (re-deploy, or deploy a tag whose auto-deploy was skipped).
 #
 # `repository_dispatch` is fire-and-forget (it returns no run handle), so the
 # job triggers it, then discovers and watches the resulting infra run. A
 # cross-repo reusable `workflow_call` against the infra workflow is deliberately
 # avoided: it would execute in THIS repo's context, where the infra-only
 # DEPLOY_PRIVATE_KEY is unavailable.
+#
+# The regional fan-out (ddns/tunneller run in every region; tenants is global)
+# is the infra side's concern — this job names the service + environment + sha
+# + artifact_url; inforge's deployments/<service>.yaml decides the host set.
 
 on:
   workflow_call:
     inputs:
+      service:
+        description: Service name — tenants | ddns | tunneller.
+        type: string
+        required: true
       tag:
-        description: Cloud release tag (e.g. cloud-v0.1.0).
+        description: Release tag (e.g. tenants-v0.1.0).
         type: string
         required: true
   workflow_dispatch:
     inputs:
+      service:
+        description: Service name — tenants | ddns | tunneller.
+        type: choice
+        options: [tenants, ddns, tunneller]
+        required: true
       tag:
-        description: Cloud release tag (e.g. cloud-v0.1.0).
+        description: Release tag (e.g. tenants-v0.1.0).
         type: string
         required: true
 
-# Serialize ALL cloud deploys from this repo (not per-tag): at most one cloud
-# `deploy-raw-service` dispatch is ever outstanding, which is what lets the
-# run-discovery below unambiguously attribute the newest matching infra run to
-# this job. cancel-in-progress: false so a queued deploy waits rather than
-# clobbering an in-flight one.
+# Serialize deploys per service: at most one `deploy-raw-service` dispatch for a
+# given service is ever outstanding, which is what lets the run-discovery below
+# unambiguously attribute the newest matching infra run to this job.
+# cancel-in-progress: false so a queued deploy waits rather than clobbering an
+# in-flight one.
 concurrency:
-  group: deploy-cloud
+  group: deploy-${{ inputs.service }}
   cancel-in-progress: false
 
 permissions:
@@ -70,6 +83,7 @@ jobs:
       - name: Dispatch deploy-raw-service and block on it
         env:
           SELF: ${{ github.repository }}
+          SERVICE: ${{ inputs.service }}
           TAG: ${{ inputs.tag }}
           SELF_TOKEN: ${{ github.token }}
           INFRA_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -99,21 +113,22 @@ jobs:
             echo "::error::no -aarch64.tar.gz asset found on release ${TAG}"
             exit 1
           fi
-          echo "Deploying ${SELF}@${SHA} → ${INFRA_REPO} (artifact: ${URL})"
+          echo "Deploying ${SERVICE} ${SELF}@${SHA} → ${INFRA_REPO} (artifact: ${URL})"
 
           export GH_TOKEN="${INFRA_TOKEN}"
 
-          # repository_dispatch returns no run id, so correlate by polling. This
-          # job's global `deploy-cloud` concurrency guarantees no other cloud
-          # dispatch from this repo is outstanding, and the filters below scope
-          # to deploy-raw-service runs triggered by THIS bot after our POST — so
-          # the single newest match is ours. (A different service dispatched by
-          # the same bot within the poll window is the only residual ambiguity;
-          # exact correlation would need the infra workflow to echo a token.)
+          # repository_dispatch returns no run id, so correlate by polling. The
+          # per-service `deploy-<service>` concurrency guarantees no other
+          # dispatch for THIS service from this repo is outstanding, and the
+          # filters below scope to deploy-raw-service runs triggered by THIS bot
+          # after our POST — so the single newest match is ours. (A different
+          # service dispatched by the same bot within the poll window is the
+          # only residual ambiguity; exact correlation would need the infra
+          # workflow to echo a token.)
           SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           gh api -X POST "repos/${INFRA_REPO}/dispatches" \
             -f 'event_type=deploy-raw-service' \
-            -F 'client_payload[service]=cloud' \
+            -F "client_payload[service]=${SERVICE}" \
             -F 'client_payload[environment]=prd' \
             -F "client_payload[sha]=${SHA}" \
             -F "client_payload[artifact_url]=${URL}"
@@ -133,6 +148,6 @@ jobs:
           fi
 
           echo "Watching infra run ${RUN_ID}: https://github.com/${INFRA_REPO}/actions/runs/${RUN_ID}"
-          # Blocks until the run completes; --exit-status makes this step (and the
-          # whole release) fail iff the infra deploy fails.
+          # Blocks until the run completes; --exit-status makes this step (and
+          # the whole release) fail iff the infra deploy fails.
           gh run watch "${RUN_ID}" -R "${INFRA_REPO}" --exit-status

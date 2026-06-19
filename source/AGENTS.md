@@ -50,7 +50,7 @@ Conventions and invariants for agents working inside `source/`.
 > `docs/adr/0009`, and invariants #2/#18/#23/#25.
 
 > **Status:** invariants tagged `[#444]`/`[#445]` describe the agreed target architecture (SNI/tunnel
-> data plane, PostgreSQL/Neon, runtime `SecretsProvider`, multi-node `TunnelRouter`) and land with those
+> data plane, PostgreSQL/Neon, inforge-injected env secrets, multi-node `TunnelRouter`) and land with those
 > issues. Everything untagged is live on `main` today.
 
 ## Workspace layout
@@ -150,7 +150,7 @@ do not pin versions per-crate. Lints come from `[workspace.lints.clippy]` (pedan
 
 8. **X-Forwarded-For only from loopback peers.** `client_ip()` (in `wardnet_common::proxy_protocol`) trusts the header only when `addr.ip().is_loopback()`. Never call `headers.get("X-Forwarded-For")` directly in a handler. The real peer address comes from the PROXY v1 header threaded in as `ConnectInfo` (see #13), not from the kernel socket.
 
-9. **Secrets come from `SecretsProvider`, never the environment.** `[#445]` In production, `DATABASE_URL`, the Cloudflare token, etc. are fetched at runtime into memory via the `SecretsProvider` trait. Never read prod secrets from env, never write them to disk, never log them. The bootstrap session token lives on tmpfs only. `FileSecrets`/`EnvSecrets` are for dev/test with dummy values only.
+9. **Secrets arrive as environment variables injected by inforge; never hard-code, persist, or log them.** `[#445]` In production inforge resolves every secret from Infisical and injects it into the process environment — `DATABASE_URL`/`GLOBAL_DATABASE_URL`, the Cloudflare token, the Stripe/Resend keys, the OAuth client secrets — read once at startup via `wardnet_common::config::required` (`Config::from_env`). Secret **material** (the JWT signing/verify keys, the mesh leaf cert/key + trust bundle) is projected onto tmpfs by inforge with only the file *path* passed in the env (`*_KEY_PATH`/`*_BUNDLE_PATH`, read via `read_secret_file`); the key bytes never appear in an env var. Never hard-code a prod secret, never write a resolved secret to disk, never log one — `Config`'s `Debug` redacts them. Dev/test use dummy values. (There is **no runtime `SecretsProvider` trait**: the earlier Infisical-fetch-at-runtime design was folded into inforge-injected env on the [#445] line — secrets are sourced from Infisical *by inforge*, then handed to the process as env vars.)
 
 10. **(retired)** The old per-install **nonce challenge** for the tunnel upgrade is gone. `GET /v1/tunnel` is route-layer `authenticate(DAEMON)`: the per-request Ed25519 **PoP** that the auth layer enforces on the upgrade GET already proves possession of the daemon's `cnf` key, so a separate server-nonce challenge is redundant. The `into_parts`/`from_parts` in the middleware preserve the `OnUpgrade` extension, so the WebSocket upgrade survives the layer (proven by `tunneller/tests/api.rs`).
 
@@ -291,6 +291,7 @@ The cloud services have no Linux-specific dependencies and build natively on mac
 
 ## Local dev
 
-Point `DATABASE_URL` at a local/Neon dev Postgres and use `FileSecrets`/env for the Cloudflare values
-(dummy in tests). Never commit real Cloudflare tokens; in production secrets are resolved at runtime via
-the `SecretsProvider` (Infisical) — see the infrastructure repo for provisioning.
+Point `DATABASE_URL` at a local/Neon dev Postgres and set the Cloudflare values (and the other secrets)
+as plain env vars with dummy values (`Config::from_env` reads them the same way in every environment).
+Never commit real Cloudflare tokens; in production inforge injects all secrets as env vars sourced from
+Infisical (invariant #9) — see the infrastructure repo for provisioning.

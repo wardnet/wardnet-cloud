@@ -1,0 +1,174 @@
+name: Build Service
+
+# Reusable leaf for a single cloud service: lint + test + aarch64 release
+# build. Parameterised by `service` so the three near-identical Rust services
+# (tenants, ddns, tunneller) share one definition.
+#
+# Callers: ci.yml (push to main), pr.yml (PRs), release-service.yml (tag
+# release). Produces one artifact per service:
+#
+#   wardnet-<service>-aarch64-unsigned — stripped binary tarball
+#
+# No version in the filename — release-service.yml repacks with the
+# per-service `run` entrypoint and renames to wardnet-<service>-<version>-
+# aarch64.tar.gz at publish time. Keeping this leaf release-agnostic means
+# every PR run produces a tarball in the same shape a release consumes.
+#
+# Each leaf lints + tests its own crate PLUS the shared `wardnet_common`
+# lib, so common is fully validated by whichever service(s) a change
+# touches (a `common` change fans out to all three via detect-changes).
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: Service crate suffix — tenants | ddns | tunneller.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Check ${{ inputs.service }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      # Upload clippy SARIF to Code Scanning.
+      security-events: write
+      actions: read
+      contents: read
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: clippy, rustfmt
+          workspaces: source
+          cache-key: ${{ inputs.service }}
+
+      - name: Install clippy SARIF tooling
+        uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2
+        with:
+          tool: clippy-sarif,sarif-fmt
+
+      - name: Format check
+        run: cargo fmt --check --manifest-path source/Cargo.toml
+
+      - name: Clippy
+        # Lint this service crate + the shared common lib. Pipe clippy JSON
+        # through clippy-sarif so CI gets a SARIF report for Code Scanning
+        # while still printing human-readable output. `-D warnings` is
+        # enforced; any warning becomes a build failure.
+        run: |
+          set -o pipefail
+          cargo clippy --manifest-path source/Cargo.toml \
+            -p wardnet-${{ inputs.service }} -p wardnet_common \
+            --all-targets --message-format=json -- -D warnings \
+            | clippy-sarif | tee rust-clippy-${{ inputs.service }}.sarif | sarif-fmt
+
+      - name: Upload clippy findings to Code Scanning
+        # Upload even if Clippy failed (captures the warnings that caused the
+        # failure). Skipped when SARIF was not written (e.g. fmt fails first).
+        # `category` is pinned per service so main (ci.yml) and PRs (pr.yml)
+        # publish under the same identifier — otherwise code-scanning flags
+        # PRs with "configuration not found" and blocks merges.
+        if: always() && hashFiles(format('rust-clippy-{0}.sarif', inputs.service)) != ''
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        with:
+          sarif_file: rust-clippy-${{ inputs.service }}.sarif
+          category: rust-clippy-${{ inputs.service }}
+          wait-for-processing: true
+
+      - name: Tests
+        # Only this service's `*_TEST_DATABASE_URL` is read (its #[ignore]'d
+        # Postgres tests); the others are harmless no-ops. The e2e member is
+        # NOT run here — it needs the full docker-compose stack (see e2e.yml).
+        env:
+          TENANTS_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432
+          DDNS_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432
+          TUNNELLER_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432
+        run: >
+          cargo test --manifest-path source/Cargo.toml
+          -p wardnet-${{ inputs.service }} -p wardnet_common
+          --all-targets -- --include-ignored
+
+  build:
+    name: Build ${{ inputs.service }} (aarch64)
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: aarch64-unknown-linux-gnu
+          workspaces: source
+          cache-key: ${{ inputs.service }}-aarch64
+
+      - name: Install aarch64 cross-compilation toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build (aarch64-unknown-linux-gnu)
+        # Set the linker via env var rather than relying on .cargo/config.toml
+        # discovery — Cargo searches for config from the CWD, not the
+        # --manifest-path directory, so the project-level config is not always
+        # found when invoked from the repo root.
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: >
+          cargo build --manifest-path source/Cargo.toml
+          -p wardnet-${{ inputs.service }}
+          --release --target aarch64-unknown-linux-gnu
+
+      - name: Strip binary
+        run: >
+          aarch64-linux-gnu-strip
+          source/target/aarch64-unknown-linux-gnu/release/wardnet-${{ inputs.service }}
+
+      - name: Package
+        env:
+          SERVICE: ${{ inputs.service }}
+        run: |
+          set -euo pipefail
+          mkdir -p build-artefacts
+          cp "source/target/aarch64-unknown-linux-gnu/release/wardnet-${SERVICE}" \
+             "build-artefacts/wardnet-${SERVICE}"
+          chmod 0755 "build-artefacts/wardnet-${SERVICE}"
+          tar -C build-artefacts -czf "build-artefacts/wardnet-${SERVICE}-aarch64.tar.gz" \
+              "wardnet-${SERVICE}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: wardnet-${{ inputs.service }}-aarch64-unsigned
+          path: build-artefacts/wardnet-${{ inputs.service }}-aarch64.tar.gz
+          retention-days: 7

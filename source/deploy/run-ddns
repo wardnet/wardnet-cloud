@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# inforge raw-service entrypoint for wardnet-ddns.
+#
+# release-ddns.yml packs this file into the release tarball as `run`, alongside
+# the `wardnet-ddns` binary. inforge extracts the tarball into the service
+# directory on the host and runs `run` as the systemd unit's ExecStart.
+#
+# The service takes no arguments and reads ALL configuration from the
+# environment (Config::from_env): the INFORGE_DEPLOYMENT_* identity and the
+# loopback listen addresses, plus secrets (the DSN, the Cloudflare token)
+# injected as env vars by inforge — which sources them from Infisical. Secret
+# *material* (the mesh PEM keys) is projected onto tmpfs by inforge with only
+# the file path passed in the environment. So this entrypoint only needs to
+# exec the binary beside it.
+set -euo pipefail
+cd "$(dirname "$0")"
+export RUST_LOG="${RUST_LOG:-info}"
+exec ./wardnet-ddns

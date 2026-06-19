@@ -1,0 +1,53 @@
+version: 2
+updates:
+  # The Cargo workspace at /source (members: common, tenants, ddns, tunneller,
+  # xtask, end2end-tests/mesh).
+  - package-ecosystem: "cargo"
+    directory: "/source"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(deps):"
+    # 3-day cooldown before Dependabot opens a PR for a new version. Gives the
+    # wider ecosystem time to surface supply-chain issues (yanked releases,
+    # compromised publishers) before an auto-merge-eligible PR lands on main.
+    cooldown:
+      default-days: 3
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(ci):"
+    cooldown:
+      default-days: 3
+
+  # Per-service runtime Dockerfiles (crates/<service>/Dockerfile). Their FROM
+  # lines are the supply-chain surface Dependabot surfaces upstream updates for.
+  - package-ecosystem: "docker"
+    directory: "/source/crates/tenants"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(deps):"
+    cooldown:
+      default-days: 3
+
+  - package-ecosystem: "docker"
+    directory: "/source/crates/ddns"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(deps):"
+    cooldown:
+      default-days: 3
+
+  - package-ecosystem: "docker"
+    directory: "/source/crates/tunneller"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(deps):"
+    cooldown:
+      default-days: 3

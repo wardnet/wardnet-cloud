@@ -104,8 +104,8 @@ email_verified}`): a generic-OIDC impl (Google + discovery-based others) and a G
 
 Password flows reuse the one-time-code primitive: signup (code = gate 1) and reset (code → new
 hash, which also deletes the tenant's sessions). Login shares the OAuth callback's
-session-creation tail. Provider `client_id`/`client_secret` arrive via `SecretsProvider`/env and
-are redacted in `Config` `Debug` (invariant #24 pattern).
+session-creation tail. Provider `client_id`/`client_secret` arrive as inforge-injected env vars
+(invariant #9) and are redacted in `Config` `Debug` (invariant #24 pattern).
 
 ## Consequences
 

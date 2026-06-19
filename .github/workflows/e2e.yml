@@ -1,0 +1,50 @@
+name: E2E Mesh
+
+# Reusable leaf for the cross-service mesh-mTLS end-to-end harness under
+# source/end2end-tests/mesh/: real `tenants` + `ddns` containers over SPIFFE
+# mesh mTLS, two Postgres instances, and a wiremock standing in for Cloudflare.
+# Drives the full tombstone lifecycle (provision → USER deregister → reaper →
+# sweep). See source/end2end-tests/mesh/README.md.
+#
+# Callers: ci.yml (push to main), pr.yml (PRs). Gated on a tenants/ddns/shared
+# change — a tunneller-only change does not exercise this harness.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  e2e-mesh:
+    name: Mesh tombstone flow
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      # The xtask cert generator (`make e2e-certs`) and the #[ignore]'d
+      # harness test (`make e2e-test`) both run cargo on the runner; the
+      # service images themselves are built inside docker-compose.
+      - uses: ./.github/actions/setup-rust
+        with:
+          workspaces: source
+          cache-key: e2e
+
+      - name: Run the mesh e2e harness
+        # `make e2e-all` is one-shot: gen certs (xtask) → build+up the compose
+        # stack → run the ignored tombstone test → guaranteed teardown. Driven
+        # from source/. ubuntu-latest ships the Docker Compose v2 plugin as
+        # `docker compose`, not the v1 `docker-compose` hyphen-binary, so
+        # override COMPOSE.
+        working-directory: source
+        run: make e2e-all COMPOSE="docker compose"

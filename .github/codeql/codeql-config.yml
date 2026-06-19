@@ -1,0 +1,33 @@
+name: "wardnet-cloud CodeQL config"
+
+# What gets analysed (implicitly, since `paths:` is not set):
+#
+#   Rust:
+#     - source/crates/*/src/**   (common, tenants, ddns, tunneller)
+#     - source/xtask/src/**      (dev mesh cert generator)
+#
+#   GitHub Actions:
+#     - .github/workflows/**
+#     - .github/actions/**
+#
+# Test code, however, is intentionally excluded below.
+#
+# Test fixtures intentionally contain patterns CodeQL flags as risky —
+# hard-coded fixture passwords, canned Ed25519/mesh keys, dummy session
+# tokens, and so on. These are test inputs, not production credentials, and
+# they never leave the repo.
+#
+# Production code outside these paths is still fully analysed. If a future test
+# file is added somewhere not covered here, extend this list — don't weaken the
+# queries themselves.
+paths-ignore:
+  # Unit tests: per the AGENTS test-placement convention they live in
+  # `src/<module>/tests.rs` and `src/repository/tests/<module>.rs`.
+  - "source/crates/*/src/tests/**"
+  - "source/crates/*/src/**/tests/**"
+
+  # Integration tests compiled as separate crates.
+  - "source/crates/*/tests/**"
+
+  # The cross-service docker-compose e2e harness.
+  - "source/end2end-tests/**"

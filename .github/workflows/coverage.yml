@@ -1,0 +1,125 @@
+name: Coverage
+
+# Reusable leaf for cloud workspace coverage.
+#
+# Called from pr.yml (patch coverage + PR comment) and ci.yml (the
+# default-branch upload that advances the Codecov number/badge — main is
+# squash-merged, so PR-head reports are never main ancestors and the
+# default-branch number would otherwise freeze).
+#
+# One Rust workspace → one job. cargo-llvm-cov drives cargo-nextest so we get
+# line coverage (LCOV) and a JUnit test-results report in a single run. The
+# Postgres-gated (#[ignore]'d) repository tests are included so coverage
+# reflects the SQL paths; the docker-compose e2e member (wardnet-e2e-mesh) is
+# excluded — it can't run without its own stack.
+
+on:
+  workflow_call:
+    secrets:
+      CODECOV_TOKEN:
+        description: |
+          Codecov upload token. Optional so fork PRs — which GitHub denies
+          access to repo secrets — don't fail at the reusable-workflow
+          validation step. When empty, codecov-action falls back to tokenless
+          upload, accepted for unprotected (fork-prefixed) branch refs.
+        required: false
+
+# Explicit scopes (not read-all) so this leaf's workflow-level stays a subset
+# of the caller's workflow-level — GitHub's reusable-workflow permission rules
+# reject leaf > caller.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  coverage:
+    name: Workspace coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: llvm-tools-preview
+          workspaces: source
+          cache-key: coverage
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2
+        with:
+          tool: cargo-nextest
+
+      - name: Generate coverage + test results
+        # Exclude the e2e member (needs docker-compose); include the
+        # #[ignore]'d Postgres tests via nextest's --run-ignored all so the
+        # repository SQL paths are measured. The `ci` nextest profile
+        # (source/.config/nextest.toml) writes the JUnit report.
+        working-directory: source
+        env:
+          TENANTS_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432
+          DDNS_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432
+          TUNNELLER_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432
+        run: |
+          set -euo pipefail
+          mkdir -p coverage
+          cargo llvm-cov --workspace --exclude wardnet-e2e-mesh \
+            --lcov --output-path coverage/lcov.info \
+            nextest --profile ci --run-ignored all
+          cp target/nextest/ci/junit.xml coverage/junit.xml
+
+      # Pre-install the Codecov CLI from PyPI and hand it to both upload steps
+      # via `binary:`. The default path (download from cli.codecov.io + PGP
+      # verification against keybase.io) currently hangs until the job timeout:
+      # Codecov migrated their keybase account, breaking signature verification
+      # — codecov/codecov-action#1956. PyPI provides its own integrity, so this
+      # avoids the broken keybase path WITHOUT `skip_validation`. Revert to the
+      # action's own download once upstream ships the fix.
+      - name: Install Codecov CLI from PyPI
+        id: codecovcli
+        run: |
+          python3 -m venv "$RUNNER_TEMP/codecov-cli-venv"
+          "$RUNNER_TEMP/codecov-cli-venv/bin/pip" install --quiet codecov-cli
+          echo "bin=$RUNNER_TEMP/codecov-cli-venv/bin/codecovcli" >> "$GITHUB_OUTPUT"
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          files: source/coverage/lcov.info
+          binary: ${{ steps.codecovcli.outputs.bin }}
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1
+        with:
+          files: source/coverage/junit.xml
+          binary: ${{ steps.codecovcli.outputs.bin }}
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
