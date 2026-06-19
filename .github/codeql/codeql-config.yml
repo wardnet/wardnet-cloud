@@ -21,10 +21,19 @@ name: "wardnet-cloud CodeQL config"
 # file is added somewhere not covered here, extend this list — don't weaken the
 # queries themselves.
 paths-ignore:
-  # Unit tests: per the AGENTS test-placement convention they live in
-  # `src/<module>/tests.rs` and `src/repository/tests/<module>.rs`.
+  # Unit tests: per the AGENTS test-placement convention they live either in a
+  # `tests/` subdirectory (`src/repository/tests/<module>.rs`) OR as a sibling
+  # `tests.rs` file module (`src/<module>/tests.rs`) declared with
+  # `#[cfg(test)] mod tests;`. The directory globs below miss the file-module
+  # form, so both are listed explicitly.
   - "source/crates/*/src/tests/**"
   - "source/crates/*/src/**/tests/**"
+  - "source/crates/*/src/tests.rs"
+  - "source/crates/*/src/**/tests.rs"
+
+  # Shared test fixtures (the canned Ed25519/mesh keys + dummy tokens/passwords
+  # the rationale above refers to live here).
+  - "source/crates/*/src/test_helpers.rs"
 
   # Integration tests compiled as separate crates.
   - "source/crates/*/tests/**"
