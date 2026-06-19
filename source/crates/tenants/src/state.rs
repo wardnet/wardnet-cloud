@@ -34,8 +34,9 @@ struct Inner {
 }
 
 impl AppState {
-    /// Build the shared state. `cookie_key` must be ≥ 64 bytes (the `axum-extra`
-    /// private jar requirement); a shorter key panics at startup (fail-closed).
+    /// Build the shared state. `config.cookie_key` must be ≥ 64 bytes (the `axum-extra`
+    /// private jar requirement); `Config::from_env` validates this up front, so by the
+    /// time we reach `Key::from` here the length is already guaranteed.
     #[must_use]
     pub fn new(
         config: Config,

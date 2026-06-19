@@ -11,6 +11,10 @@
 
 use wardnet_common::config::required;
 
+/// Minimum `COOKIE_KEY` length in bytes — the `axum-extra` private/signed cookie jar
+/// requires ≥ 64 bytes of key material (a shorter key panics in `Key::from`).
+const COOKIE_KEY_MIN_BYTES: usize = 64;
+
 /// Runtime configuration.
 #[derive(Clone)]
 pub struct Config {
@@ -134,10 +138,20 @@ impl Config {
     /// Load configuration from environment variables.
     ///
     /// # Errors
-    /// Returns an error if any required variable is absent.
+    /// Returns an error if any required variable is absent, or if `COOKIE_KEY` is
+    /// shorter than [`COOKIE_KEY_MIN_BYTES`] (caught here as a clean startup error
+    /// rather than a later panic inside the cookie jar).
     pub fn from_env() -> anyhow::Result<Self> {
         let account_base_url = required("ACCOUNT_BASE_URL")?;
         let opt = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+
+        let cookie_key = required("COOKIE_KEY")?;
+        if cookie_key.len() < COOKIE_KEY_MIN_BYTES {
+            anyhow::bail!(
+                "COOKIE_KEY must be at least {COOKIE_KEY_MIN_BYTES} bytes (got {})",
+                cookie_key.len()
+            );
+        }
         Ok(Self {
             global_database_url: required("GLOBAL_DATABASE_URL")?,
             region: required("INFORGE_DEPLOYMENT_REGION_SLUG")?,
@@ -180,7 +194,7 @@ impl Config {
                 .filter(|s| !s.is_empty()),
             email_from: std::env::var("EMAIL_FROM")
                 .unwrap_or_else(|_| "wardnet <noreply@wardnet.io>".to_string()),
-            cookie_key: required("COOKIE_KEY")?,
+            cookie_key,
             user_jwt_ttl_secs: std::env::var("USER_JWT_TTL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
