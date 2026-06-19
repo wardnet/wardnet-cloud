@@ -71,8 +71,10 @@ e2e scenario; see "Cross-service end-to-end tests" below):
   cancels the subscription, and a periodic **sweep loop** (`TENANT_SWEEP_INTERVAL_SECS`, default 3600,
   N-replica-safe) FK-cascade-deletes tombstoned tenants once their networks are gone. The email is freed
   for a fresh signup the moment the tombstone is set — a **partial unique index** (`email WHERE
-  deregistered_at IS NULL`) means only live tenants reserve it, and `mint_jwt`/`enroll` reject a
-  tombstoned tenant. **Billing (WS-G):** a separate `SubscriptionService` owns the `subscriptions`
+  deregistered_at IS NULL`) means only live tenants reserve it, and a tombstoned tenant is
+  rejected up-front at **every** growth path — `mint_jwt` (token refresh), `issue_tenant_code`
+  (add-daemon code minting), and `enroll` — each returning `Forbidden` so a deregistered-but-not-
+  yet-swept account can never mint a token or grow a daemon. **Billing (WS-G):** a separate `SubscriptionService` owns the `subscriptions`
   aggregate (entitlement source, trial + grace, Stripe lifecycle via the `stripe` `StripeGateway`); a
   `subscription` + `network` **reactor** apply `wardnet_common::event` domain events (invariants
   #22/#23); the `email` `EmailSender` (Resend / dev no-op) sends enrollment codes. Depends on
