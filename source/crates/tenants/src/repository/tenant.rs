@@ -65,8 +65,8 @@ pub trait TenantRepository: Send + Sync {
     async fn set_deregistered(&self, id: &str) -> anyhow::Result<bool>;
     /// Delete every tombstoned tenant that no longer owns any networks, returning the
     /// number of rows deleted. FK `ON DELETE CASCADE` removes the tenant's
-    /// subscriptions, daemons, enrollment codes, and pending enrollments. N-replica-safe
-    /// and idempotent.
+    /// subscriptions, daemons, enrollment codes, pending enrollments, and the Identities
+    /// aggregate's rows (`tenant_identities`, `sessions`). N-replica-safe and idempotent.
     async fn delete_tombstoned_empty(&self) -> anyhow::Result<u64>;
 }
 

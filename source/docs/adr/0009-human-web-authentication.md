@@ -19,6 +19,32 @@ the existing API authenticates only `Authorization: Bearer <JWT>` (invariant #18
 
 ## Decision
 
+### Aggregate segregation — the Identities aggregate (`IdentitiesService`)
+
+The login methods + sessions are **their own aggregate**, owned by a new
+**`IdentitiesService`** — *not* folded into `TenantsService` (invariant #23, ADR-0007).
+It holds **only** its own two repositories (`tenant_identities`, `sessions`), plus the
+password hasher, the federated providers, and a shared `Arc<Signer>` (the signing key
+is a capability, like the event bus — not aggregate state). It coordinates with the
+tenant aggregate through the same one-way-edge + domain-event pattern the subscription
+aggregate uses:
+
+- **Reads / create-delegation** are direct method calls on the owner — a one-way
+  `IdentitiesService → TenantsService` edge (mirroring `TenantsService →
+  SubscriptionService::current`): `find_tenant_by_email` (the join-key read),
+  `register_tenant` (web-first signup — the write *and* `TenantCreated` stay in the
+  tenant aggregate), and `consume_signup_code` (the email-proving gate-1 primitive,
+  keeping `enrollment_codes` inside the tenant aggregate). `IdentitiesService` never
+  touches the tenant/network/daemon/subscription repositories.
+- **The reverse side-effect** rides a domain event: an **identities reactor**
+  subscribes to `TenantDeregistered` (already published on deregister) and calls
+  `IdentitiesService::purge_for` (delete the tenant's sessions + login methods —
+  force-logout). The FK `ON DELETE CASCADE` covers the eventual hard sweep, so a
+  dropped event is harmless; the reaction is idempotent.
+
+The edge stays one-way (reads/create forward; the deregister side-effect as an event),
+so there is no cycle — the same shape as the subscription/network reactors.
+
 ### Identity model — 1:1 user==tenant, verified-email join key
 
 A `USER` principal **is** the tenant (1:1); `sub = tenant_id`. Multi-user teams are explicitly
@@ -91,8 +117,12 @@ are redacted in `Config` `Debug` (invariant #24 pattern).
   (+ httpOnly keeping the cookie unreadable, + TLS). The 5-min JWT TTL narrowly bounds a token
   *leaked without the cookie* (logs, referrer, paste). 5 min is chosen over 2–3 min for margin
   against the verifier's `leeway = 0` clock-skew (ADR-0002).
-- New persistent state in the global Tenants DB: `tenant_identities` and `sessions`. New deps:
-  `argon2`, `axum-extra` (cookies), `openidconnect`.
+- New persistent state in the global Tenants DB: `tenant_identities` and `sessions` (both
+  FK-cascade from `tenants`, so the existing tombstone sweep reaps them). New deps:
+  `argon2`, `axum-extra` (cookies), `openidconnect`, `time` (cookie Max-Age).
+- A second aggregate now lives in the `tenants` crate (`IdentitiesService`, alongside
+  `SubscriptionService`); the auth surface is `api/auth.rs` (a bootstrap group) plus `GET
+  /v1/me` (USER). The USER JWT carries `aud:[tenants]` (ADR-0008) and `sub = tenant_id`.
 - **Deferred:** multi-user teams, settings-page connect/disconnect of providers. Both are
   additive on this model (new rows / a `sub` migration), no redesign.
 - **Rejected alternatives:** distinct `users` entity from day one (drags in membership/roles/

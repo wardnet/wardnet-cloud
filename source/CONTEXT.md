@@ -12,14 +12,22 @@ details. (See `docs/adr/` for the decisions behind these.)
   no separate user entity — teams are deferred). Authenticates to the web/account plane
   by a [login method](#login-method); the daemon plane never carries a user. See
   `docs/adr/0009`.
+- **Identities aggregate** — the human/web login aggregate, owned by
+  `IdentitiesService` (in the `tenants` crate, alongside [Subscription](#subscription)).
+  Holds **only** the [login method](#login-method) + [session](#session) repositories;
+  it reads/creates tenants via `TenantsService` method calls (a one-way edge) and reacts
+  to `TenantDeregistered` by purging a tenant's sessions + login methods. Never touches
+  the tenant/network/daemon/subscription repositories. See `docs/adr/0009`.
 - **Login method / identity** — one way an account can authenticate: a `password` (an
   argon2id hash) or a linked external provider (`google`, `github`, …). An account may
   hold several, all resolving to the one tenant via [verified email](#verified-email-join-key).
-  Stored as rows in `tenant_identities`; `tenants` stays identity-only.
+  Stored as rows in `tenant_identities`, owned by the [Identities aggregate](#identities-aggregate);
+  `tenants` stays identity-only.
 - **Session** — the browser-durable, **revocable** web credential: a server-side row
-  behind an httpOnly cookie (30-day sliding), created at login. Distinct from the
-  short-lived [JWT](#caller-type) it mints — the session is what logout / password-reset
-  destroys. See `docs/adr/0009`.
+  (`sessions`, owned by the [Identities aggregate](#identities-aggregate)) behind an
+  httpOnly cookie (30-day sliding), created at login. Distinct from the short-lived
+  [JWT](#caller-type) it mints via the silent exchange — the session is what logout /
+  password-reset / deregister destroys. See `docs/adr/0009`.
 - **Subscription** — the billing aggregate that **grants** a tenant's
   [entitlement](#entitlement). A tenant has a 1:N history with at most one **live**
   (non-canceled) row — its *current* subscription. Status is `trialing → active →
