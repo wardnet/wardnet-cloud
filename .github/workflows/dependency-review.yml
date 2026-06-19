@@ -25,3 +25,14 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: 'Dependency Review'
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          # Keep this in lockstep with source/.cargo/audit.toml — the same advisories,
+          # accepted for the same reasons (no fix at any current stable version;
+          # transitive via async-stripe 0.41 / openidconnect / jsonwebtoken). See that
+          # file for the per-advisory justification and removal trigger. The two gates
+          # use separate config, so both must list these.
+          #   GHSA-82j2-j2ch-gfr8 = RUSTSEC-2026-0104 (rustls-webpki CRL panic)
+          #   GHSA-965h-392x-2mh5 = RUSTSEC-2026-0098 (rustls-webpki URI name constraints)
+          #   GHSA-xgp8-3hg3-c2mh = RUSTSEC-2026-0099 (rustls-webpki wildcard name)
+          #   GHSA-c38w-74pg-36hr = RUSTSEC-2023-0071 (rsa Marvin timing sidechannel)
+          allow-ghsas: GHSA-82j2-j2ch-gfr8, GHSA-965h-392x-2mh5, GHSA-xgp8-3hg3-c2mh, GHSA-c38w-74pg-36hr
