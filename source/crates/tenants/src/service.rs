@@ -15,7 +15,6 @@
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use wardnet_common::event::{DomainEvent, EventPublisher};
@@ -147,6 +146,20 @@ impl TenantsService {
     pub async fn find_tenant_by_email(&self, email: &str) -> Result<Option<Tenant>, TenantsError> {
         let email = normalize_email(email)?;
         Ok(self.tenants.find_by_email(&email).await?)
+    }
+
+    /// Whether a tenant exists and is **live** (not deregistered) — the liveness edge
+    /// the Identities aggregate calls before creating a session, so a tombstoned tenant
+    /// cannot log in (mirroring the `deregistered_at` guard `mint_jwt`/`enroll` apply).
+    ///
+    /// # Errors
+    /// [`TenantsError::Internal`] on a repository failure.
+    pub async fn tenant_is_live(&self, tenant_id: &str) -> Result<bool, TenantsError> {
+        Ok(self
+            .tenants
+            .find_by_id(tenant_id)
+            .await?
+            .is_some_and(|t| t.deregistered_at.is_none()))
     }
 
     /// Validate + burn a one-time signup code, returning the email it proves control
@@ -676,27 +689,23 @@ impl TenantsService {
     }
 }
 
-/// Lowercase + trim an email and apply a minimal shape check.
+/// Lowercase + trim an email and apply a minimal shape check (the verified-email join
+/// key — see [`crate::util::normalize_email`], shared with the Identities aggregate).
 fn normalize_email(email: &str) -> Result<String, TenantsError> {
-    let e = email.trim().to_lowercase();
-    if e.len() < 3 || !e.contains('@') {
-        return Err(TenantsError::BadRequest("invalid email".to_string()));
-    }
-    Ok(e)
+    crate::util::normalize_email(email).map_err(|m| TenantsError::BadRequest(m.to_string()))
 }
 
 /// Generate a random one-time code, returning `(raw_code_hex, sha256_hex)`. Only
 /// the hash is persisted; the raw code is shown once.
 fn generate_code() -> (String, String) {
-    let bytes: [u8; 32] = rand::random();
-    let code = hex::encode(bytes);
+    let code = crate::util::random_token();
     let hash = hash_code(&code);
     (code, hash)
 }
 
 /// SHA-256 hex of a raw code (the at-rest form).
 fn hash_code(code: &str) -> String {
-    hex::encode(Sha256::digest(code.as_bytes()))
+    crate::util::sha256_hex(code)
 }
 
 #[cfg(test)]

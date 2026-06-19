@@ -137,7 +137,7 @@ async fn password_signup_then_login() {
     // And the password logs in.
     let login = h
         .identities
-        .password_login("alice@example.com", "hunter2hunter2")
+        .password_login("alice@example.com", "hunter2hunter2", "203.0.113.1")
         .await
         .unwrap();
     assert!(!login.is_empty());
@@ -194,14 +194,14 @@ async fn login_rejects_unknown_and_wrong_password() {
 
     assert!(matches!(
         h.identities
-            .password_login("carol@example.com", "wrongpassword")
+            .password_login("carol@example.com", "wrongpassword", "203.0.113.2")
             .await
             .unwrap_err(),
         crate::error::IdentitiesError::Unauthorized(_)
     ));
     assert!(matches!(
         h.identities
-            .password_login("nobody@example.com", "whatever12")
+            .password_login("nobody@example.com", "whatever12", "203.0.113.3")
             .await
             .unwrap_err(),
         crate::error::IdentitiesError::Unauthorized(_)
@@ -249,8 +249,80 @@ async fn purge_for_deletes_sessions_and_identities() {
     assert!(h.identities.exchange_session(&session).await.is_err());
     assert!(
         h.identities
-            .password_login("erin@example.com", "longenough1")
+            .password_login("erin@example.com", "longenough1", "203.0.113.4")
             .await
             .is_err()
+    );
+}
+
+#[tokio::test]
+async fn deregistered_tenant_cannot_exchange_or_log_in() {
+    // Even if the identities reactor has NOT yet purged the session/identity (best-effort
+    // bus), a tombstoned tenant must not mint a USER JWT or open a new session.
+    let h = build_harness(SEED);
+    let code = signup_code(&h, "frank@example.com").await;
+    let session = h
+        .identities
+        .password_signup("frank@example.com", &code, "longenough1")
+        .await
+        .unwrap();
+    let tenant = h
+        .tenants
+        .find_tenant_by_email("frank@example.com")
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Tombstone the tenant WITHOUT running the identities reactor (rows still present).
+    assert!(h.tenants.deregister_tenant(&tenant.id).await.unwrap());
+
+    // The silent exchange refuses to mint for a tombstoned tenant (session-query guard).
+    assert!(matches!(
+        h.identities.exchange_session(&session).await.unwrap_err(),
+        crate::error::IdentitiesError::Unauthorized(_)
+    ));
+    // And a fresh login is refused at session creation (create_session liveness check).
+    assert!(matches!(
+        h.identities
+            .password_login("frank@example.com", "longenough1", "203.0.113.9")
+            .await
+            .unwrap_err(),
+        crate::error::IdentitiesError::Unauthorized(_)
+    ));
+}
+
+#[tokio::test]
+async fn password_login_is_rate_limited_per_ip() {
+    let h = build_harness(SEED);
+    let code = signup_code(&h, "grace@example.com").await;
+    h.identities
+        .password_signup("grace@example.com", &code, "longenough1")
+        .await
+        .unwrap();
+
+    // 10 wrong attempts from one IP are each Unauthorized; the 11th is RateLimited.
+    let ip = "198.51.100.7";
+    for _ in 0..10 {
+        assert!(matches!(
+            h.identities
+                .password_login("grace@example.com", "wrongpassword", ip)
+                .await
+                .unwrap_err(),
+            crate::error::IdentitiesError::Unauthorized(_)
+        ));
+    }
+    assert!(matches!(
+        h.identities
+            .password_login("grace@example.com", "longenough1", ip)
+            .await
+            .unwrap_err(),
+        crate::error::IdentitiesError::RateLimited(_)
+    ));
+    // A different IP is unaffected (correct credentials still succeed).
+    assert!(
+        h.identities
+            .password_login("grace@example.com", "longenough1", "198.51.100.8")
+            .await
+            .is_ok()
     );
 }

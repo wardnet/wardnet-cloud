@@ -28,10 +28,13 @@ pub trait SessionRepository: Send + Sync {
     /// Persist a new session.
     async fn create(&self, session: &Session) -> anyhow::Result<()>;
 
-    /// Resolve a **live** session by its token hash and slide its expiry forward to
-    /// `new_expires_at` (the 30-day sliding window), returning the tenant id. An
-    /// expired or unknown hash yields `None` (and is not extended). This single
-    /// statement is the silent-exchange read.
+    /// Resolve a **live** session belonging to a **live** tenant by its token hash and
+    /// slide its expiry forward to `new_expires_at` (the 30-day sliding window),
+    /// returning the tenant id. An expired/unknown hash — or a session whose tenant has
+    /// been deregistered — yields `None` (and is not extended). The deregistered-tenant
+    /// guard is in the statement itself, so a token can never be minted for a tombstoned
+    /// tenant even in the window before the identities reactor purges the row. This
+    /// single statement is the silent-exchange read.
     async fn touch_and_get_tenant(
         &self,
         token_hash: &str,
@@ -72,6 +75,10 @@ const CREATE: &str =
 
 const TOUCH_AND_GET_TENANT: &str = "UPDATE sessions SET expires_at = $3 \
      WHERE token_hash = $1 AND expires_at > $2 \
+       AND EXISTS ( \
+         SELECT 1 FROM tenants t \
+         WHERE t.id = sessions.tenant_id AND t.deregistered_at IS NULL \
+       ) \
      RETURNING tenant_id";
 
 const DELETE: &str = "DELETE FROM sessions WHERE token_hash = $1";

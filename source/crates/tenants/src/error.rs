@@ -72,6 +72,10 @@ pub enum IdentitiesError {
     /// password already exists).
     #[error("{0}")]
     Conflict(String),
+    /// A per-IP rate limit was exceeded (surfaced from the tenant aggregate's
+    /// signup/reset-code issuance).
+    #[error("{0}")]
+    RateLimited(String),
     /// A provider/repository failure (DB, OAuth provider, hashing).
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
@@ -85,6 +89,7 @@ impl From<IdentitiesError> for ApiError {
                 ApiError::Unauthorized(m)
             }
             IdentitiesError::Conflict(m) => ApiError::Conflict(m),
+            IdentitiesError::RateLimited(m) => ApiError::TooManyRequests(m),
             IdentitiesError::Internal(e) => ApiError::Internal(e),
         }
     }
@@ -96,13 +101,13 @@ impl From<IdentitiesError> for ApiError {
 impl From<TenantsError> for IdentitiesError {
     fn from(e: TenantsError) -> Self {
         match e {
-            TenantsError::BadRequest(m) => IdentitiesError::BadRequest(m),
+            TenantsError::BadRequest(m) | TenantsError::EntitlementExceeded(m) => {
+                IdentitiesError::BadRequest(m)
+            }
             TenantsError::BadCode(m) => IdentitiesError::BadCode(m),
             TenantsError::Forbidden(m) | TenantsError::Conflict(m) => IdentitiesError::Conflict(m),
             TenantsError::NotFound(m) => IdentitiesError::Unauthorized(m),
-            TenantsError::EntitlementExceeded(m) | TenantsError::RateLimited(m) => {
-                IdentitiesError::BadRequest(m)
-            }
+            TenantsError::RateLimited(m) => IdentitiesError::RateLimited(m),
             TenantsError::Internal(e) => IdentitiesError::Internal(e),
         }
     }

@@ -121,12 +121,15 @@ async fn password_signup(
 )]
 async fn password_login(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     jar: PrivateCookieJar,
     Json(body): Json<PasswordLoginRequest>,
 ) -> Result<(PrivateCookieJar, StatusCode), ApiError> {
+    let remote_ip = client_ip(&headers, addr);
     let token = state
         .identities()
-        .password_login(&body.email, &body.password)
+        .password_login(&body.email, &body.password, &remote_ip)
         .await?;
     Ok((jar.add(session_cookie(token)), StatusCode::NO_CONTENT))
 }

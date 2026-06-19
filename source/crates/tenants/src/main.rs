@@ -245,16 +245,26 @@ async fn build_identity_providers(
     };
 
     if let (Some(id), Some(secret)) = (&config.google_client_id, &config.google_client_secret) {
-        let google = OidcProvider::discover(
+        // Discovery is a network call to the provider. A provider outage must not block
+        // the whole service from booting (it also serves the daemon JWT plane, the Stripe
+        // webhook, and the mesh work-queue) — so a failure disables only Google login.
+        match OidcProvider::discover(
             "google",
             "https://accounts.google.com",
             id.clone(),
             secret.clone(),
             redirect("google"),
         )
-        .await?;
-        providers.insert("google".to_string(), Arc::new(google));
-        tracing::info!("google login enabled");
+        .await
+        {
+            Ok(google) => {
+                providers.insert("google".to_string(), Arc::new(google));
+                tracing::info!("google login enabled");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "google OIDC discovery failed; google login disabled");
+            }
+        }
     }
     if let (Some(id), Some(secret)) = (&config.github_client_id, &config.github_client_secret) {
         let github = GitHubProvider::new(id.clone(), secret.clone(), redirect("github"))?;

@@ -21,15 +21,16 @@
 //! [`exchange_session`](Self::exchange_session) mints a short-TTL `USER` JWT.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::{Duration, Utc};
-use sha2::{Digest, Sha256};
 
 use wardnet_common::token::{ClaimsSpec, PrincipalType, Signer};
 
-use crate::error::IdentitiesError;
-use crate::repository::identity::{TenantIdentity, TenantIdentityRepository};
+use crate::error::{IdentitiesError, TenantsError};
+use crate::repository::identity::{
+    InsertIdentityOutcome, TenantIdentity, TenantIdentityRepository,
+};
 use crate::repository::session::{Session, SessionRepository};
 use crate::service::TenantsService;
 
@@ -47,6 +48,11 @@ const MIN_PASSWORD_LEN: usize = 8;
 pub const DEFAULT_USER_JWT_TTL_SECS: i64 = 300;
 /// Session sliding-window length (seconds) — 30 days, refreshed on each exchange.
 const SESSION_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+/// Password-login attempts allowed per client IP per [`LOGIN_WINDOW_SECS`] window
+/// (online-guessing throttle, in addition to argon2's per-attempt cost).
+const LOGIN_ATTEMPTS_PER_IP: u32 = 10;
+/// The rolling window for [`LOGIN_ATTEMPTS_PER_IP`] (seconds).
+const LOGIN_WINDOW_SECS: i64 = 300;
 
 /// The human/web authentication aggregate.
 pub struct IdentitiesService {
@@ -60,6 +66,10 @@ pub struct IdentitiesService {
     signer: Arc<Signer>,
     /// `USER` JWT lifetime (seconds).
     user_jwt_ttl_secs: i64,
+    /// In-memory per-IP password-login throttle (`ip -> (window_start, count)`), in the
+    /// spirit of the in-process `ReplayCache`. Best-effort per replica — defence in
+    /// depth against online password guessing, not a distributed quota.
+    login_attempts: Mutex<HashMap<String, (i64, u32)>>,
 }
 
 impl IdentitiesService {
@@ -79,7 +89,25 @@ impl IdentitiesService {
             providers,
             signer,
             user_jwt_ttl_secs,
+            login_attempts: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Record a login attempt from `remote_ip` and return whether it is within the
+    /// per-IP window cap. Prunes entries whose window has rolled over so the map stays
+    /// bounded by the number of *currently active* source IPs.
+    fn login_allowed(&self, remote_ip: &str, now: i64) -> bool {
+        let mut attempts = self.login_attempts.lock().unwrap();
+        attempts.retain(|_, (started, _)| now - *started < LOGIN_WINDOW_SECS);
+        let entry = attempts.entry(remote_ip.to_string()).or_insert((now, 0));
+        if now - entry.0 >= LOGIN_WINDOW_SECS {
+            *entry = (now, 0);
+        }
+        if entry.1 >= LOGIN_ATTEMPTS_PER_IP {
+            return false;
+        }
+        entry.1 += 1;
+        true
     }
 
     // ── Password ─────────────────────────────────────────────────────────────────
@@ -111,6 +139,20 @@ impl IdentitiesService {
                 "code was not issued for this email".to_string(),
             ));
         }
+        // Reject an existing-password signup *before* paying the (deliberately
+        // expensive) argon2id cost, so a repeated signup for an already-registered
+        // email cannot be used to burn CPU.
+        if self
+            .identities
+            .find_by_provider_subject(PROVIDER_PASSWORD, &code_email)
+            .await
+            .map_err(IdentitiesError::Internal)?
+            .is_some()
+        {
+            return Err(IdentitiesError::Conflict(
+                "an account with this email already has a password".to_string(),
+            ));
+        }
         let hash = hash_password(password)?;
         let verified = VerifiedIdentity {
             provider: PROVIDER_PASSWORD.to_string(),
@@ -127,15 +169,24 @@ impl IdentitiesService {
         self.create_session(&tenant_id).await
     }
 
-    /// Log in with email + password. Returns the raw session token.
+    /// Log in with email + password from `remote_ip`. Returns the raw session token.
+    /// Throttled per source IP ([`LOGIN_ATTEMPTS_PER_IP`] per [`LOGIN_WINDOW_SECS`]) to
+    /// bound online password guessing.
     ///
     /// # Errors
+    /// [`IdentitiesError::RateLimited`] past the per-IP attempt cap;
     /// [`IdentitiesError::Unauthorized`] on an unknown email or a bad password.
     pub async fn password_login(
         &self,
         email: &str,
         password: &str,
+        remote_ip: &str,
     ) -> Result<String, IdentitiesError> {
+        if !self.login_allowed(remote_ip, Utc::now().timestamp()) {
+            return Err(IdentitiesError::RateLimited(
+                "too many login attempts; try again later".to_string(),
+            ));
+        }
         let email = normalize_email(email)?;
         let identity = self
             .identities
@@ -202,23 +253,33 @@ impl IdentitiesService {
         let hash = hash_password(new_password)?;
         // Upsert the password identity: replace the hash, or link a fresh password row
         // (e.g. an OIDC-born account setting its first password).
-        let updated = self
+        if !self
             .identities
             .update_secret_hash(PROVIDER_PASSWORD, &email, &hash)
             .await
-            .map_err(IdentitiesError::Internal)?;
-        if !updated {
-            self.identities
+            .map_err(IdentitiesError::Internal)?
+        {
+            let inserted = self
+                .identities
                 .insert(&TenantIdentity {
                     tenant_id: tenant.id.clone(),
                     provider: PROVIDER_PASSWORD.to_string(),
                     subject: email.clone(),
-                    secret_hash: Some(hash),
+                    secret_hash: Some(hash.clone()),
                     email: email.clone(),
                     created_at: Utc::now(),
                 })
                 .await
                 .map_err(IdentitiesError::Internal)?;
+            // A concurrent reset inserted the row between our update and insert: the
+            // insert was a no-op (ON CONFLICT DO NOTHING), so re-apply the hash via an
+            // update rather than silently dropping this reset.
+            if inserted == InsertIdentityOutcome::AlreadyExists {
+                self.identities
+                    .update_secret_hash(PROVIDER_PASSWORD, &email, &hash)
+                    .await
+                    .map_err(IdentitiesError::Internal)?;
+            }
         }
         // Revocation is the defence: a reset force-logs-out every existing session.
         self.sessions
@@ -383,7 +444,24 @@ impl IdentitiesService {
         // aggregate). `IdentitiesService` never touches the tenant repository.
         let tenant_id = match self.tenants.find_tenant_by_email(&email).await? {
             Some(tenant) => tenant.id,
-            None => self.tenants.register_tenant(&email).await?.id,
+            None => match self.tenants.register_tenant(&email).await {
+                Ok(tenant) => tenant.id,
+                // A concurrent signup created the tenant between our lookup and this
+                // write (TOCTOU): the email is now taken. Fold the race into the
+                // auto-link path rather than surfacing a 409 on a valid first login.
+                Err(TenantsError::Conflict(_)) => {
+                    self.tenants
+                        .find_tenant_by_email(&email)
+                        .await?
+                        .ok_or_else(|| {
+                            IdentitiesError::Internal(anyhow::anyhow!(
+                                "tenant vanished after email-taken conflict"
+                            ))
+                        })?
+                        .id
+                }
+                Err(e) => return Err(e.into()),
+            },
         };
 
         self.identities
@@ -402,8 +480,18 @@ impl IdentitiesService {
 
     /// Mint + persist a fresh session, returning the raw token (the only time it
     /// exists in cleartext; the cookie carries it, the DB stores only its hash).
+    ///
+    /// Rejects a deregistered tenant up front (a one-way liveness read on the tenant
+    /// aggregate) — so a login/OIDC flow can never open a session for a tombstoned
+    /// account, mirroring the `deregistered_at` guard `mint_jwt`/`enroll` apply. The
+    /// silent-exchange path is independently guarded in the session query.
     async fn create_session(&self, tenant_id: &str) -> Result<String, IdentitiesError> {
-        let raw = random_token();
+        if !self.tenants.tenant_is_live(tenant_id).await? {
+            return Err(IdentitiesError::Unauthorized(
+                "account is closed".to_string(),
+            ));
+        }
+        let raw = crate::util::random_token();
         let now = Utc::now();
         self.sessions
             .create(&Session {
@@ -425,14 +513,11 @@ impl IdentitiesService {
     }
 }
 
-/// Lowercase + trim an email and apply a minimal shape check (mirrors the tenant
-/// aggregate's normalization, so the join key matches).
+/// Lowercase + trim an email and apply a minimal shape check — the verified-email join
+/// key, shared with the tenant aggregate via [`crate::util::normalize_email`] so the
+/// two sides never diverge.
 fn normalize_email(email: &str) -> Result<String, IdentitiesError> {
-    let e = email.trim().to_lowercase();
-    if e.len() < 3 || !e.contains('@') {
-        return Err(IdentitiesError::BadRequest("invalid email".to_string()));
-    }
-    Ok(e)
+    crate::util::normalize_email(email).map_err(|m| IdentitiesError::BadRequest(m.to_string()))
 }
 
 /// Reject too-short passwords up front.
@@ -470,17 +555,10 @@ fn verify_password(hash: &str, password: &str) -> bool {
         .is_ok()
 }
 
-/// A random opaque token (session token / OAuth state), hex of 32 random bytes.
-#[must_use]
-fn random_token() -> String {
-    let bytes: [u8; 32] = rand::random();
-    hex::encode(bytes)
-}
-
-/// SHA-256 hex of a raw token — the at-rest session form (invariant #1).
-#[must_use]
+/// SHA-256 hex of a raw token — the at-rest session form (invariant #1). Thin alias
+/// over [`crate::util::sha256_hex`] so the at-rest hashing lives in one place.
 fn hash_token(token: &str) -> String {
-    hex::encode(Sha256::digest(token.as_bytes()))
+    crate::util::sha256_hex(token)
 }
 
 #[cfg(test)]

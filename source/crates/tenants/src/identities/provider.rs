@@ -259,7 +259,7 @@ struct GitHubEmail {
 #[async_trait]
 impl ExternalIdentityProvider for GitHubProvider {
     fn authorize_url(&self) -> AuthorizeRequest {
-        let state = super::random_token();
+        let state = crate::util::random_token();
         let mut url = reqwest::Url::parse(&self.authorize_url)
             .expect("GitHub authorize URL is a valid constant");
         url.query_pairs_mut()

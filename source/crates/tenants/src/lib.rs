@@ -23,6 +23,7 @@ pub mod service;
 pub mod state;
 pub mod stripe;
 pub mod subscription;
+pub mod util;
 
 // Mocks + fixtures shared by unit and integration tests. Doc-hidden and not
 // `cfg(test)` so the integration tests in `tests/` can reach it too; carries no

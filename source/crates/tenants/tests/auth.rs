@@ -42,12 +42,16 @@ fn connect_info() -> ConnectInfo<SocketAddr> {
 }
 
 fn post_json(uri: &str, body: &Value) -> Request<Body> {
-    Request::builder()
+    let mut req = Request::builder()
         .method("POST")
         .uri(uri)
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap()
+        .unwrap();
+    // Handlers that read the client IP (login, reset-code) extract ConnectInfo; attach
+    // it to every POST so oneshot requests resolve it (ignored by handlers that don't).
+    req.extensions_mut().insert(connect_info());
+    req
 }
 
 async fn json_body(resp: axum::response::Response) -> Value {

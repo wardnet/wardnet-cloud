@@ -683,13 +683,19 @@ impl SessionRepository for MockStore {
         new_expires_at: DateTime<Utc>,
     ) -> anyhow::Result<Option<String>> {
         let mut d = self.0.lock().unwrap();
-        match d.sessions.get_mut(token_hash) {
-            Some(s) if s.expires_at > now => {
-                s.expires_at = new_expires_at;
-                Ok(Some(s.tenant_id.clone()))
-            }
-            _ => Ok(None),
-        }
+        // Mirror the SQL guard: only a live session belonging to a live (non-tombstoned)
+        // tenant resolves.
+        let live_tenant = |d: &Data, tid: &str| {
+            d.tenants
+                .get(tid)
+                .is_some_and(|t| t.deregistered_at.is_none())
+        };
+        let tenant_id = match d.sessions.get(token_hash) {
+            Some(s) if s.expires_at > now && live_tenant(&d, &s.tenant_id) => s.tenant_id.clone(),
+            _ => return Ok(None),
+        };
+        d.sessions.get_mut(token_hash).unwrap().expires_at = new_expires_at;
+        Ok(Some(tenant_id))
     }
 
     async fn delete(&self, token_hash: &str) -> anyhow::Result<bool> {
