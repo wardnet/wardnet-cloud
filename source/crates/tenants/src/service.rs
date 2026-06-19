@@ -135,6 +135,33 @@ impl TenantsService {
         }
     }
 
+    /// Look up a **live** tenant by its (normalized) email — the read edge the
+    /// Identities aggregate calls to resolve the verified-email join key (ADR-0009).
+    /// A one-way `IdentitiesService → TenantsService` call; `IdentitiesService` never
+    /// holds the tenant repository.
+    ///
+    /// # Errors
+    /// [`TenantsError::BadRequest`] on a malformed email;
+    /// [`TenantsError::Internal`] on a repository failure.
+    pub async fn find_tenant_by_email(&self, email: &str) -> Result<Option<Tenant>, TenantsError> {
+        let email = normalize_email(email)?;
+        Ok(self.tenants.find_by_email(&email).await?)
+    }
+
+    /// Validate + burn a one-time signup code, returning the email it proves control
+    /// of (`None` if unknown / expired / used). The email-proving gate-1 the Identities
+    /// aggregate calls for web password signup/reset (ADR-0009) — a one-way edge that
+    /// keeps the `enrollment_codes` table inside the tenant aggregate.
+    ///
+    /// # Errors
+    /// [`TenantsError::Internal`] on a repository failure.
+    pub async fn consume_signup_code(&self, code: &str) -> Result<Option<String>, TenantsError> {
+        Ok(self
+            .enrollment
+            .consume_signup_code(&hash_code(code), Utc::now())
+            .await?)
+    }
+
     /// Deprovision all of a tenant's `{active, provisioning}` networks (the DDNS
     /// reaper then tears down DNS and the rows). Invoked by the **network reactor**
     /// on `SubscriptionDeactivated`, and by the reconcile safety net. Idempotent.

@@ -19,9 +19,13 @@ use crate::config::Config;
 use crate::email::EmailSender;
 use crate::repository::daemon::{Daemon, DaemonRepository};
 use crate::repository::enrollment::{EnrollOutcome, EnrollmentRepository};
+use crate::repository::identity::{
+    InsertIdentityOutcome, TenantIdentity, TenantIdentityRepository,
+};
 use crate::repository::network::{
     Network, NetworkRepository, ProvisioningState, RegisterNetworkOutcome,
 };
+use crate::repository::session::{Session, SessionRepository};
 use crate::repository::subscription::{
     Entitlement, Subscription, SubscriptionRepository, SubscriptionStatus,
 };
@@ -87,6 +91,10 @@ struct Data {
     pending: HashMap<String, PendingRow>,
     code_log: Vec<(String, DateTime<Utc>)>,
     processed_events: HashSet<String>,
+    /// Login methods keyed on `(provider, subject)` (mirrors the PK).
+    identities: HashMap<(String, String), TenantIdentity>,
+    /// Sessions keyed on `token_hash`.
+    sessions: HashMap<String, Session>,
 }
 
 /// A shared mock backing store. All mock repositories built from one
@@ -541,6 +549,23 @@ impl EnrollmentRepository for MockStore {
         })
     }
 
+    async fn consume_signup_code(
+        &self,
+        code_hash: &str,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<Option<String>> {
+        let mut d = self.0.lock().unwrap();
+        let Some(code) = d.codes.get_mut(code_hash) else {
+            return Ok(None);
+        };
+        // Signup codes only (tenant_id None), unused and unexpired.
+        if code.used_at.is_some() || code.expires_at <= now || code.tenant_id.is_some() {
+            return Ok(None);
+        }
+        code.used_at = Some(now);
+        Ok(Some(code.email.clone()))
+    }
+
     async fn find_pending_tenant(
         &self,
         public_key: &str,
@@ -583,6 +608,100 @@ impl EnrollmentRepository for MockStore {
             .code_log
             .push((remote_ip.to_string(), created_at));
         Ok(())
+    }
+}
+
+#[async_trait]
+impl TenantIdentityRepository for MockStore {
+    async fn find_by_provider_subject(
+        &self,
+        provider: &str,
+        subject: &str,
+    ) -> anyhow::Result<Option<TenantIdentity>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .identities
+            .get(&(provider.to_string(), subject.to_string()))
+            .cloned())
+    }
+
+    async fn insert(
+        &self,
+        identity: &TenantIdentity,
+    ) -> anyhow::Result<InsertIdentityOutcome> {
+        let mut d = self.0.lock().unwrap();
+        let key = (identity.provider.clone(), identity.subject.clone());
+        if d.identities.contains_key(&key) {
+            return Ok(InsertIdentityOutcome::AlreadyExists);
+        }
+        d.identities.insert(key, identity.clone());
+        Ok(InsertIdentityOutcome::Created)
+    }
+
+    async fn update_secret_hash(
+        &self,
+        provider: &str,
+        subject: &str,
+        secret_hash: &str,
+    ) -> anyhow::Result<bool> {
+        let mut d = self.0.lock().unwrap();
+        if let Some(id) = d
+            .identities
+            .get_mut(&(provider.to_string(), subject.to_string()))
+        {
+            id.secret_hash = Some(secret_hash.to_string());
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn delete_for_tenant(&self, tenant_id: &str) -> anyhow::Result<u64> {
+        let mut d = self.0.lock().unwrap();
+        let before = d.identities.len();
+        d.identities.retain(|_, id| id.tenant_id != tenant_id);
+        Ok((before - d.identities.len()) as u64)
+    }
+}
+
+#[async_trait]
+impl SessionRepository for MockStore {
+    async fn create(&self, session: &Session) -> anyhow::Result<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(session.token_hash.clone(), session.clone());
+        Ok(())
+    }
+
+    async fn touch_and_get_tenant(
+        &self,
+        token_hash: &str,
+        now: DateTime<Utc>,
+        new_expires_at: DateTime<Utc>,
+    ) -> anyhow::Result<Option<String>> {
+        let mut d = self.0.lock().unwrap();
+        match d.sessions.get_mut(token_hash) {
+            Some(s) if s.expires_at > now => {
+                s.expires_at = new_expires_at;
+                Ok(Some(s.tenant_id.clone()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn delete(&self, token_hash: &str) -> anyhow::Result<bool> {
+        Ok(self.0.lock().unwrap().sessions.remove(token_hash).is_some())
+    }
+
+    async fn delete_for_tenant(&self, tenant_id: &str) -> anyhow::Result<u64> {
+        let mut d = self.0.lock().unwrap();
+        let before = d.sessions.len();
+        d.sessions.retain(|_, s| s.tenant_id != tenant_id);
+        Ok((before - d.sessions.len()) as u64)
     }
 }
 

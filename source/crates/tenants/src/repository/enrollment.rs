@@ -57,6 +57,17 @@ pub trait EnrollmentRepository: Send + Sync {
         pending_ttl_secs: i64,
     ) -> anyhow::Result<EnrollOutcome>;
 
+    /// Atomically validate + **burn** a one-time code, returning the email it was
+    /// issued for (`None` if unknown, expired, or already used). The
+    /// email-proving primitive reused by the web password signup/reset gate-1
+    /// (ADR-0009): unlike [`enroll`](Self::enroll), it creates no pending binding and
+    /// resolves no tenant — it only proves control of the email.
+    async fn consume_signup_code(
+        &self,
+        code_hash: &str,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<Option<String>>;
+
     /// The tenant a still-pending (unexpired) daemon pubkey is bound to, if any.
     /// The JWT-issue fallback when the pubkey has no `daemons` row yet.
     async fn find_pending_tenant(
@@ -209,6 +220,26 @@ impl EnrollmentRepository for PgEnrollmentRepository {
             tenant_id,
             tenant_created,
         })
+    }
+
+    async fn consume_signup_code(
+        &self,
+        code_hash: &str,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<Option<String>> {
+        // A signup code (tenant_id IS NULL) only — an add-daemon code is not a web
+        // login credential. Burns it atomically, mirroring the enroll saga's first step.
+        let email: Option<String> = sqlx::query_scalar(
+            "UPDATE enrollment_codes SET used_at = $2 \
+             WHERE code_hash = $1 AND used_at IS NULL AND expires_at > $2 \
+               AND tenant_id IS NULL \
+             RETURNING email",
+        )
+        .bind(code_hash)
+        .bind(now)
+        .fetch_optional(&self.pools.write)
+        .await?;
+        Ok(email)
     }
 
     async fn find_pending_tenant(
