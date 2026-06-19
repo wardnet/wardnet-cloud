@@ -209,7 +209,7 @@ Tests that exercise the public API end-to-end belong in the owning crate's `test
 - `crates/ddns/tests/api.rs` — DDNS HTTP API surface via mock repos
 - `crates/ddns/tests/work_queue_mtls.rs` — mTLS work-queue client integration test
 - `crates/tunneller/tests/api.rs` — the daemon `GET /v1/tunnel` surface (auth / network-scope / routing policy / WS upgrade) against a live mock-backed server
-- `crates/tunneller/tests/mesh_mtls.rs` — inter-node forward round-trip + `TenantsClient` reads over real mTLS (`#[ignore]`)
+- `crates/tunneller/tests/mesh_mtls.rs` — inter-node forward round-trip, the forward acceptor's scope-direction rule (a chain-valid wrong-service peer is dropped by the real `serve_forward_on` loop), initiator-pin rejections, and `TenantsClient` reads — all over real mTLS (`#[ignore]`)
 - `crates/tenants/tests/resource_reads.rs` — the mesh-plane `GET /v1/networks/{id}` · `GET /v1/tenants/{id}` reads
 - `crates/tenants/tests/auth.rs` — the web-auth HTTP surface (WS-F): password signup/login/reset, OIDC callback + auto-link, session↔JWT exchange, `GET /v1/me`, logout
 
