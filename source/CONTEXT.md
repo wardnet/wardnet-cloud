@@ -8,6 +8,18 @@ details. (See `docs/adr/` for the decisions behind these.)
 - **Tenant** — an account: just an identity (an email). The root of ownership; its
   billing/entitlement state lives on its [subscription](#subscription), not on the
   tenant row. Lives in the global Tenants DB.
+- **User** — the human owner of a [tenant](#tenant), **1:1** with it (`sub = tenant_id`;
+  no separate user entity — teams are deferred). Authenticates to the web/account plane
+  by a [login method](#login-method); the daemon plane never carries a user. See
+  `docs/adr/0009`.
+- **Login method / identity** — one way an account can authenticate: a `password` (an
+  argon2id hash) or a linked external provider (`google`, `github`, …). An account may
+  hold several, all resolving to the one tenant via [verified email](#verified-email-join-key).
+  Stored as rows in `tenant_identities`; `tenants` stays identity-only.
+- **Session** — the browser-durable, **revocable** web credential: a server-side row
+  behind an httpOnly cookie (30-day sliding), created at login. Distinct from the
+  short-lived [JWT](#caller-type) it mints — the session is what logout / password-reset
+  destroys. See `docs/adr/0009`.
 - **Subscription** — the billing aggregate that **grants** a tenant's
   [entitlement](#entitlement). A tenant has a 1:N history with at most one **live**
   (non-canceled) row — its *current* subscription. Status is `trialing → active →
@@ -94,6 +106,15 @@ details. (See `docs/adr/` for the decisions behind these.)
   (a daemon additionally proves possession of its key — see PoP).
 - **PoP (proof-of-possession)** — a daemon signs each request with its Ed25519 key;
   the signature is checked against the token's `cnf` key. Users are bearer-only.
+- **Audience (`aud`)** — the set of services a JWT is valid at, drawn from the mesh
+  service namespace (`tenants`/`ddns`/`tunneller`). Each service verifies its own name
+  is in `aud`. A user token is `[tenants]`; a daemon token is `[tenants]` before it binds
+  a network and `[tenants, ddns, tunneller]` after. See `docs/adr/0008`.
+- **Verified-email join key** — the rule that maps any login method to a tenant: a
+  *provider-verified* email (gate 1 — password proves it with a one-time code, OIDC with
+  `email_verified`) that resolves to at most one live tenant (gate 2 — match → auto-link,
+  no match → web-first signup). Tenant creation only ever happens at such a
+  credential-proving moment, never under USER auth. See `docs/adr/0009`.
 - **Mesh plane** — the private, mTLS-only service-to-service boundary
   (DDNS ↔ Tenants, Tunneller ↔ Tenants, and Tunneller node ↔ node). Not reachable
   by daemons or users.
