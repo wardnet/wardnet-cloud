@@ -1,7 +1,9 @@
 # 2. Unified caller-type authentication
 
 Date: 2026-06-16
-Status: Accepted
+Status: Accepted. Amended by [ADR-0008](0008-jwt-audience-grant-scoping.md) (adds the
+`aud` grant claim this ADR deferred) and [ADR-0009](0009-human-web-authentication.md)
+(realizes the deferred user/account plane).
 
 ## Context
 
@@ -30,7 +32,9 @@ one-time-code / key-PoP checks.
 
 There is deliberately **no `aud` claim**: per-service grant scoping is a separate,
 deferred question. Caller-type is a coarser, orthogonal authorization axis and is
-sufficient for the current boundary.
+sufficient for the current boundary. *(Amended: [ADR-0008](0008-jwt-audience-grant-scoping.md)
+later adds the `aud` set — the token shape below already anticipated it, so this was a
+non-breaking addition.)*
 
 ## Consequences
 

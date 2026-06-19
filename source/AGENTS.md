@@ -8,8 +8,7 @@ Conventions and invariants for agents working inside `source/`.
 > `DAEMON`/`USER` via JWT). PoW self-registration and the `introspect` endpoint are
 > gone; DNS is now reconciled from desired state via a mesh work-queue
 > (`GET/PATCH /v1/networks`). See `CONTEXT.md` (glossary) and `docs/adr/0001`,
-> `docs/adr/0002`. Several invariants below still describe the *previous*
-> identity/bearer model and are superseded pending the WS-J docs pass.
+> `docs/adr/0002`.
 >
 > **WS-D (2026-06-17):** `crates/cloud` was carved into **`crates/tunneller`** (the
 > multi-node SNI-passthrough reverse-tunnel edge) and **re-added to the workspace**;
@@ -49,9 +48,12 @@ Conventions and invariants for agents working inside `source/`.
 > account creation now happens only at a credential-proving moment. See `docs/adr/0008`,
 > `docs/adr/0009`, and invariants #2/#18/#23/#25.
 
-> **Status:** invariants tagged `[#444]`/`[#445]` describe the agreed target architecture (SNI/tunnel
-> data plane, PostgreSQL/Neon, inforge-injected env secrets, multi-node `TunnelRouter`) and land with those
-> issues. Everything untagged is live on `main` today.
+> **Status:** every invariant below is **live on `main`**. The earlier `[#444]`/`[#445]` planning
+> tags are retired — the SNI/tunnel data plane (WS-D), PostgreSQL/Neon, the multi-node `TunnelRouter`
+> (`LocalRouter`, its sole impl, already does inter-node forwarding), and the inforge-injected env
+> secret model have all landed. Production secret provisioning (inforge resolving from Infisical and
+> injecting env vars / tmpfs key files) is a deployment contract owned by the **infrastructure repo**,
+> not pending code in this workspace (invariant #9).
 
 ## Workspace layout
 
@@ -62,21 +64,26 @@ e2e scenario; see "Cross-service end-to-end tests" below):
 
 - **`crates/common`** (lib `wardnet_common`) — everything genuinely cross-service: `token`, `mtls`,
   `proxy_protocol` (incl. `client_ip`), `replay_cache`, `dns_provider`, `db` (`DbPools` / `connect`),
-  `error` (`ApiError` / `ErrorBody`), `validation`, the generic `auth` core (`auth_layer<S: AuthContext>`
-  — body guard, timestamp window, canonical payload, Ed25519 PoP, replay cache — each bin implements
-  `AuthContext::resolve_credential`), `serve` (`run_api`, the PROXY-required plain-HTTP listener, plus a
+  `error` (`ApiError` / `ErrorBody`), `validation`, the generic `auth` core (the `authenticate(CallerType)`
+  middleware — body guard, JWT verify, caller-type + `aud` gate, daemon Ed25519 PoP over the canonical
+  payload, replay cache — each service's `AppState` implements `AuthContext` to supply its `verifier()` +
+  `replay_cache()`), `serve` (`run_api`, the PROXY-required plain-HTTP listener, plus a
   stream-generic `connection`), `mtls` (SPIFFE mesh mTLS: `SpiffeId`/`ExpectedPeer`, the SNI-ignoring
   `client_config_from_pem`/`mesh_client` initiator side, `server_config_from_pem` + `peer_spiffe_id`
   acceptor side, the hot-reload holders `MeshClient`/`ReloadableServerConfig`, and `watch_mesh_files`),
   the in-process `event` bus (`EventPublisher` / `BroadcastEventBus` / `DomainEvent` — the
-  cross-aggregate decoupling substrate, invariant #23), generic `health::register`, the
-  env-`config` helpers, and — transiently, until enrollment is redesigned — `pow`.
+  cross-aggregate decoupling substrate, invariant #23), generic `health::register`, and the
+  env-`config` helpers. (The old `pow` module is gone — enrollment is now a one-time email code, ADR-0009.)
 - **`crates/tenants`** (bin `wardnet-tenants`, lib `wardnet_tenants`) — the global identity/naming
-  service, carved out of `cloud` in WS-B. Owns the identity + challenge repos, the JWT `Signer`,
-  `TenantsService`, and the **global naming DB** (its `migrations/` — moved from cloud's
+  service, carved out of `cloud` in WS-B. Owns the tenant/network/daemon/enrollment repos, the JWT
+  `Signer`, `TenantsService`, and the **global Tenants DB** (its `migrations/` — moved from cloud's
   `migrations-global/` — and its own `db::init` with a crate-relative `sqlx::migrate!`), plus its own
-  `config`/`state`/`error`. Serves a **public** nginx-fronted router (`register`/`challenge`/`names`/
-  `token`/`deregister`/`health`) with dual-path auth, **plus** a separate **internal mesh-mTLS**
+  `config`/`state`/`error`. Serves a **public** nginx-fronted router whose routes are grouped by the
+  caller kind they accept (each authenticated group wrapped in `authenticate(CallerType)`): a
+  **bootstrap** group (`health`, daemon `enroll` + `token` issue, signup `codes`, the Stripe `billing`
+  webhook, and the web `auth` login surface — each verifying its own one-time-code / key-PoP /
+  signature / cookie), an `availability` check (DAEMON·USER), register-`network` (DAEMON), and the USER
+  account plane (`tenants`, including `deregister`), **plus** a separate **internal mesh-mTLS**
   reconcile listener (`src/mesh.rs` — mTLS transport only; handlers in `src/api/reconcile.rs`,
   `GET/PATCH /v1/networks`) with no JWT layer. Account deregister (`DELETE /v1/tenants/{id}`, USER,
   owner-checked, 202, idempotent) **tombstones** (`deregistered_at`) rather than deleting: it cascades
@@ -134,49 +141,35 @@ do not pin versions per-crate. Lints come from `[workspace.lints.clippy]` (pedan
 
 ## Must-know invariants (never violate these)
 
-1. **Bearer token never stored raw.** `register.rs` returns `hex(random_32_bytes)` to the caller once and stores only `hex(SHA-256(token))`. Never persist, log, or echo the raw token.
+1. **Opaque credentials are stored only as hashes, never raw.** There is no daemon bearer token any more — daemons authenticate with a JWT + Ed25519 PoP and their device key never leaves the device (#2/#18). The opaque secrets that *are* persisted are stored hashed: one-time enrollment codes and browser session tokens as `hex(SHA-256(value))` (`tenants::util::random_token` mints the raw value, `sha256_hex` is the only form written — `enrollment_codes.code_hash`, `sessions.token_hash`), and passwords as an argon2id PHC string (`tenant_identities.secret_hash`). The raw value is returned/shown exactly once at issuance and is never persisted, logged, or echoed. See invariant #25 (the web-auth extension of this rule).
 
 2. **Auth is a route-layer caller-type guard plus `aud` grant-scoping, not a path-gate.** Every authenticated route group is wrapped in `authenticate(CallerType)` (`common::auth`), which resolves the caller (SERVICE via mTLS / DAEMON · USER via JWT+PoP) and rejects anything outside the allowed set. **Caller-type is no longer the only JWT gate**: each service's `Verifier` is built with its own mesh name as the expected **`aud`** and rejects any token whose `aud` omits it (ADR-0008), so "any envelope-valid token of the right caller type is accepted by any service" is **retired** — a user token (`aud:[tenants]`) is rejected at ddns/tunneller, and a not-yet-network-bound daemon token (`aud:[tenants]`) has no reach into the data plane. There is **no `/v1/installs/` path prefix** any more — DDNS report-IP/ACME and the Tunneller `GET /v1/tunnel` are all route-layer `authenticate(DAEMON)`, scoped to the JWT `net` claim, so a daemon can only ever touch its own network. (The legacy `auth_layer` opaque-bearer path-gate is retired with the old `cloud` bin.)
 
-3. **Uniqueness before challenge burn.** In `register.rs`, the global `names().reserve()` (the atomic slug allocation — its unique violation is the name-clash guard) always runs _before_ `challenges().consume()`. Reversing the order would consume the user's PoW proof on a name-conflict error. Registration is a **two-database saga** (global `names` + regional `installs`); any failure after `reserve` must `release` both rows.
+3. **Slug allocation and entitlement limits are one atomic operation.** `TenantsService::register_network` binds the new network **and** its first daemon in a single `NetworkRepository::register_network` transaction that enforces global slug uniqueness *and* the subscription's `max_networks` / `max_daemons` together, returning a typed `RegisterNetworkOutcome` (`Created` / `SlugTaken` / `NetworkLimit` / `DaemonLimit` / `DaemonExists`) — never a partial write to roll back. There is **no PoW challenge** and **no cross-database saga**: the old `register.rs` `names().reserve()` → `challenges().consume()` ordering and the global-`names` + regional-`installs` two-DB saga are gone. Enrollment is now a one-time email code consumed atomically (`enrollment.enroll`, ADR-0009), and networks/daemons live in the one global Tenants DB.
 
-4. **ReplayCache keyed on `{install_id}:{timestamp}:{body_hash}`.** Do not change this format without updating the replay window constant and tests. The window is ±120 s (double the timestamp window) for clock-skew at the cache boundary.
+4. **ReplayCache keyed on `{daemon-public-key}:{timestamp}:{body_hash}`.** The replay subject is the daemon's token `sub` — its standard-base64 Ed25519 public key (`== cnf`), the daemon's stable identity, **not** a DB row id. The key is built in exactly one place (`verify_pop_request` in `common::auth`). Do not change the format without updating the replay window constant and tests. The window is ±120 s (`REPLAY_WINDOW_SECS`, double the ±60 s timestamp window) for clock-skew at the cache boundary.
 
-5. **Body buffered before auth.** The 1 MiB body guard runs for _every_ request, including unauthenticated ones. It is the first thing `auth_layer` does — before any DB call.
+5. **Body buffered before auth.** The 1 MiB body guard (`MAX_BODY_BYTES`) runs for _every_ request through the `authenticate` middleware, including unauthenticated ones. Buffering the body is the first thing `authenticate` does — before the JWT verify or any DB/mesh call (it is also needed to hash the body for daemon PoP).
 
-6. **`pub_key_bytes` decoded once.** The install row decodes the base64 public key into `[u8; 32]` when loaded from the DB. Auth uses `install.pub_key_bytes` directly — never re-decode the base64 string on a hot path.
+6. **Long-lived keys are parsed once at load, not on the hot path.** A service decodes the Tenants JWT **verify key** from PEM exactly once, when it builds its `Verifier` (`Verifier::from_pem`, at boot), and reuses the `DecodingKey` for every `verify` — never re-parse it per request. (There is no `installs` row any more: a daemon's PoP public key rides in the token's `cnf` claim and is decoded per request via `Claims::pop_public_key()` into `[u8; 32]` — it is carried in the verified token, not loaded from the DB, so there is nothing to cache. The daemon's `sub` *is* that base64 key.)
 
 7. **Canonical payload includes `path_and_query`.** The Ed25519 signature covers `"METHOD\npath_and_query\ntimestamp\nhex-sha256(body)"`. Use `uri.path_and_query()`, not just `uri.path()`, so query parameters are authenticated.
 
 8. **X-Forwarded-For only from loopback peers.** `client_ip()` (in `wardnet_common::proxy_protocol`) trusts the header only when `addr.ip().is_loopback()`. Never call `headers.get("X-Forwarded-For")` directly in a handler. The real peer address comes from the PROXY v1 header threaded in as `ConnectInfo` (see #13), not from the kernel socket.
 
-9. **Secrets arrive as environment variables injected by inforge; never hard-code, persist, or log them.** `[#445]` In production inforge resolves every secret from Infisical and injects it into the process environment — `DATABASE_URL`/`GLOBAL_DATABASE_URL`, the Cloudflare token, the Stripe/Resend keys, the OAuth client secrets — read once at startup via `wardnet_common::config::required` (`Config::from_env`). Secret **material** (the JWT signing/verify keys, the mesh leaf cert/key + trust bundle) is projected onto tmpfs by inforge with only the file *path* passed in the env (`*_KEY_PATH`/`*_BUNDLE_PATH`, read via `read_secret_file`); the key bytes never appear in an env var. Never hard-code a prod secret, never write a resolved secret to disk, never log one — `Config`'s `Debug` redacts them. Dev/test use dummy values. (There is **no runtime `SecretsProvider` trait**: the earlier Infisical-fetch-at-runtime design was folded into inforge-injected env on the [#445] line — secrets are sourced from Infisical *by inforge*, then handed to the process as env vars.)
+9. **Secrets arrive as environment variables injected by inforge; never hard-code, persist, or log them.** In production inforge resolves every secret from Infisical and injects it into the process environment — `DATABASE_URL`/`GLOBAL_DATABASE_URL`, the Cloudflare token, the Stripe/Resend keys, the OAuth client secrets — read once at startup via `wardnet_common::config::required` (`Config::from_env`). Secret **material** (the JWT signing/verify keys, the mesh leaf cert/key + trust bundle) is projected onto tmpfs by inforge with only the file *path* passed in the env (`*_KEY_PATH`/`*_BUNDLE_PATH`, read via `read_secret_file`); the key bytes never appear in an env var. Never hard-code a prod secret, never write a resolved secret to disk, never log one — `Config`'s `Debug` redacts them. Dev/test use dummy values. (There is **no runtime `SecretsProvider` trait**: the earlier Infisical-fetch-at-runtime design was folded into inforge-injected env — secrets are sourced from Infisical *by inforge*, then handed to the process as env vars.)
 
 10. **(retired)** The old per-install **nonce challenge** for the tunnel upgrade is gone. `GET /v1/tunnel` is route-layer `authenticate(DAEMON)`: the per-request Ed25519 **PoP** that the auth layer enforces on the upgrade GET already proves possession of the daemon's `cnf` key, so a separate server-nonce challenge is redundant. The `into_parts`/`from_parts` in the middleware preserve the `OnUpgrade` extension, so the WebSocket upgrade survives the layer (proven by `tunneller/tests/api.rs`).
 
-11. **Route inbound streams only through `TunnelRouter` (LIVE).** The SNI demuxer (`tunneller/src/sni`) hands every stream to the `TunnelRouter` trait keyed on **vanity slug** — never look up the in-memory `TunnelRegistry` `DashMap` directly outside `LocalRouter`. `LocalRouter` short-circuits slugs this node owns into the registry and forwards everything else over the private inter-node mesh link to the `node_addr` in `tunnel_routes`. A node `upsert`s its ownership on tunnel connect and deletes it on disconnect (own-node-guarded). The table is a **hint**: each node's live registry is the source of truth, so a forward to a node whose registry no longer holds the slug **fails closed** (the connection is dropped, not mis-routed). See `docs/adr/0004`.
+11. **Route inbound streams only through `TunnelRouter`.** The SNI demuxer (`tunneller/src/sni`) hands every stream to the `TunnelRouter` trait keyed on **vanity slug** — never look up the in-memory `TunnelRegistry` `DashMap` directly outside `LocalRouter`. `LocalRouter` short-circuits slugs this node owns into the registry and forwards everything else over the private inter-node mesh link to the `node_addr` in `tunnel_routes`. A node `upsert`s its ownership on tunnel connect and deletes it on disconnect (own-node-guarded). The table is a **hint**: each node's live registry is the source of truth, so a forward to a node whose registry no longer holds the slug **fails closed** (the connection is dropped, not mis-routed). See `docs/adr/0004`.
 
-12. **The tunnel registry is in-memory and per-node (LIVE).** It is not persisted; after a node restart all daemons reconnect. Registration is keyed on slug with a per-tunnel **abort token** (`CancellationToken`) + a generation so a reconnect cleanly displaces a stale handler and a superseded handler's cleanup is a no-op. The inter-node `forward` listener is **private mesh-mTLS only** (it bypasses SNI, so it must be authenticated — the handshake *is* the auth); a peer reads a `{slug, dest_port}` preamble then splices the raw L4 stream into the local registry. Treat `conn_id` as wrapping (`u32`). A live tunnel is torn down by the **pull-reconcile abort reaper** (per-node, ADR-0004) when its network is `404`/`deprovisioning` or its subscription lapses; the same pass heartbeats `last_seen`, and a TTL reaper purges rows orphaned by a crashed node.
+12. **The tunnel registry is in-memory and per-node.** It is not persisted; after a node restart all daemons reconnect. Registration is keyed on slug with a per-tunnel **abort token** (`CancellationToken`) + a generation so a reconnect cleanly displaces a stale handler and a superseded handler's cleanup is a no-op. The inter-node `forward` listener is **private mesh-mTLS only** (it bypasses SNI, so it must be authenticated — the handshake *is* the auth); a peer reads a `{slug, dest_port}` preamble then splices the raw L4 stream into the local registry. Treat `conn_id` as wrapping (`u32`). A live tunnel is torn down by the **pull-reconcile abort reaper** (per-node, ADR-0004) when its network is `404`/`deprovisioning` or its subscription lapses; the same pass heartbeats `last_seen`, and a TTL reaper purges rows orphaned by a crashed node.
 
-> ⚠️ **Superseded by WS-A (invariants #14–#17 below):** the in-app TLS-termination + ACME
-> subsystem has been **removed** (`tls/`, `acme/`, `sweep/`, `http01.rs`, `crypto.rs`,
-> `repository/tls.rs`, the `bridge_tls` migration, `ENCRYPTION_KEY`, and the SNI terminate
-> branch are all gone). Public TLS is now fronted by an inforge-injected **nginx sidecar**
-> (which also runs ACME). The control-plane API is served as **plain HTTP** behind it
-> (#13, #14 below), and the tenant data plane is pure **L4 SNI passthrough** — Tunneller
-> never terminates. Invariants **#15–#17 describe deleted machinery** and survive only as a
-> historical record until the WS-J rewrite; do not treat them as live. #14 has been
-> **replaced** with the plain-HTTP rule below.
-
-13. **Strip the PROXY v1 header first, consuming exactly the line.** Every public listener is fronted by nginx with PROXY protocol v1. Read the header byte-by-byte up to its CRLF and **no further** (`proxy_protocol::read_required`/`read_optional`) — never a `BufReader`, which would swallow the `ClientHello` and break the SNI peek. The recovered client IP must be threaded into the API as `ConnectInfo` so the per-IP rate limiter and IP-bound PoW keep working. On the API listener the header is **required** and **fail-closed**: a connection with a missing/invalid header, a read timeout, or a `PROXY UNKNOWN` family is **dropped** rather than served against nginx's loopback address (which would let `client_ip()` trust a spoofable `X-Forwarded-For`). See `serve::run_api` in `crates/common/src/serve.rs` (used by every service's `main.rs`).
+13. **Strip the PROXY v1 header first, consuming exactly the line.** Every public listener is fronted by nginx with PROXY protocol v1. Read the header byte-by-byte up to its CRLF and **no further** (`proxy_protocol::read_required`/`read_optional`) — never a `BufReader`, which would swallow the `ClientHello` and break the SNI peek. The recovered client IP must be threaded into the API as `ConnectInfo` so the per-IP rate limiters (signup-code issuance, password login) keep working — handlers read it via `proxy_protocol::client_ip` (#8). On the API listener the header is **required** and **fail-closed**: a connection with a missing/invalid header, a read timeout, or a `PROXY UNKNOWN` family is **dropped** rather than served against nginx's loopback address (which would let `client_ip()` trust a spoofable `X-Forwarded-For`). See `serve::run_api` in `crates/common/src/serve.rs` (used by every service's `main.rs`).
 
 14. **The control-plane API is served over plain HTTP behind nginx.** It listens on `config.api_listen_addr` (public `:80`, fronted by nginx which terminates TLS) and serves `/v1/health` + the API. There is no in-process TLS for the API any more — do **not** add a rustls/TLS-terminating branch to the API listener. The SNI listeners (`https_listen_addr`/`dot_listen_addr`) are **passthrough-only**: `sni::run(...)` forwards to the tenant tunnel on `dest_port` 443 / 853 and never inspects or terminates the inner TLS.
 
-15. *(superseded — deleted machinery)* Cert/account material was AES-256-GCM-sealed under `ENCRYPTION_KEY` before touching `bridge_tls`. All of `crypto.rs`, the `bridge_tls` table, and `ENCRYPTION_KEY` have been removed.
-
-16. *(superseded — deleted machinery)* ACME issuance was coordinated by the `bridge_tls_lease` winner with version-based hot-swap. nginx now owns ACME; the lease/sweep/`acme_http_challenge` machinery is gone.
-
-17. *(superseded — deleted machinery)* The public `GET /.well-known/acme-challenge/{token}` responder has been removed; nginx answers HTTP-01.
+15–17. *(historical — deleted machinery, kept only as a pointer)* The old in-app TLS-termination + HTTP-01-ACME subsystem (`tls/`, `acme/`, `sweep/`, `http01.rs`, `crypto.rs`, `repository/tls.rs`, the `bridge_tls` table + `bridge_tls_lease`, `ENCRYPTION_KEY`, the `GET /.well-known/acme-challenge/{token}` responder, and the SNI-terminate branch) has been **removed**. Public TLS + ACME are now an inforge-injected **nginx sidecar**, the control-plane API is plain HTTP behind it (#14), and the tenant data plane is pure **L4 SNI passthrough** — Tunneller never terminates. (DDNS still serves daemon-facing **DNS-01** ACME TXT endpoints — that is a different, live path; see #20 and ADR-0003.)
 
 18. **Two auth planes: JWT for external daemons, mTLS for the mesh.** External daemon/user requests (via nginx) authenticate with an identity JWT (Tenants-signed, verified offline) plus, for daemons, the Ed25519 PoP — all via route-layer `authenticate(DAEMON|USER)`. **Inter-service / mesh-plane calls carry no JWT** — they authenticate by **SPIFFE-verified** mutual TLS: a client cert chained to the per-scope **trust bundle** whose URI SAN parses to a `ServiceIdentity{trust_domain,env,scope,service}` that `authenticate(SERVICE)` accepts. Mesh leaves carry a SPIFFE URI SAN only (**no DNS SAN**), so initiators pin an `ExpectedPeer{service,scope}` in a custom verifier that **ignores the SNI** (`mtls::client_config_from_pem`/`mesh_client`), and acceptors enforce a **scope-direction rule** on the parsed peer id (global acceptor → any in-bundle scope; regional acceptor → peer scope == own scope) instead of a per-peer-service allowlist (the bundle is the allowlist). Rotated material hot-reloads in place (ADR-0005). The **Tunneller spans both**: it is a JWT-only daemon endpoint (`GET /v1/tunnel`) *and* a mesh-mTLS client (its routing policy reads Tenants' `GET /v1/networks/{id}` · `GET /v1/tenants/{id}`, and its nodes forward to each other over a private mesh-mTLS link whose acceptor additionally pins `service == tunneller`). Every JWT now carries an **`aud`** grant claim each verifier checks against its own name (ADR-0008, invariant #2). **Humans authenticate to a third plane (WS-F, ADR-0009):** a revocable server-side `sessions` row behind an httpOnly cookie is the durable web credential; the SPA calls `POST /v1/auth/token` to silently exchange it for a short-TTL (5-min) `USER` JWT (`aud:[tenants]`, `sub = tenant_id`). The auth layer itself **stays pure-JWT** — it never learns about cookies; the cookie↔JWT exchange lives entirely in `IdentitiesService` / `api/auth.rs` (the bootstrap group). "Am I logged in?" is answered by *attempting the mint*, not by reading the (httpOnly, unreadable) cookie.
 
@@ -231,9 +224,9 @@ A test that needs **multiple real service binaries running together** (not just 
 ## SQL conventions
 
 - Query strings are `const &str` at module level — never inline in `sqlx::query(format!(...))`.
-- **PostgreSQL** `[#444/#445]` stores `DateTime<Utc>` natively as `TIMESTAMPTZ` via sqlx's `chrono` feature — no `to_rfc3339()` / `.parse()` round-tripping.
+- **PostgreSQL** stores `DateTime<Utc>` natively as `TIMESTAMPTZ` via sqlx's `chrono` feature — no `to_rfc3339()` / `.parse()` round-tripping.
 - Mutations always use `self.pools.write`; reads always use `self.pools.read`.
-- Postgres has no unsigned integers: store counters like `difficulty` as `INTEGER`/`BIGINT` and convert explicitly at the boundary (never `as`).
+- Postgres has no unsigned integers: store any unsigned counter as `INTEGER`/`BIGINT` and convert explicitly at the boundary (never `as`).
 - Keep the Neon serverless pool rules in mind: `min_connections = 0`, graceful reconnect; do not hold an idle connection that would prevent autosuspend.
 
 ## Adding a new authenticated endpoint
