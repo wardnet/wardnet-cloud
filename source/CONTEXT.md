@@ -67,20 +67,8 @@ details. (See `docs/adr/` for the decisions behind these.)
   itself lingers until the **sweep** removes it.
 - **Sweep** — the periodic reaper that deletes tombstoned tenants once their
   networks are fully deprovisioned (the DDNS reaper having torn down DNS first),
-  FK-cascading the tenant's subscriptions, daemons, codes, and pending enrollments.
-  N-replica-safe and idempotent.
-- **Deregister** — the account-closing act: the tenant is **tombstoned**, all its
-  networks are cascaded to [deprovisioning](#provisioning-state), and its
-  subscription is canceled. Idempotent. Distinct from a subscription cancel (which
-  is reversible and leaves the account intact). The owning user triggers it
-  (`DELETE /v1/tenants/{id}`).
-- **Tombstone** — the terminal marker (`deregistered_at`) on a deregistered tenant.
-  A tombstoned tenant cannot mint tokens or enroll daemons, and its email is freed
-  for a fresh signup immediately (only *live* tenants reserve their email). The row
-  itself lingers until the **sweep** removes it.
-- **Sweep** — the periodic reaper that deletes tombstoned tenants once their
-  networks are fully deprovisioned (the DDNS reaper having torn down DNS first),
-  FK-cascading the tenant's subscriptions, daemons, codes, and pending enrollments.
+  FK-cascading the tenant's subscriptions, daemons, codes, pending enrollments, and
+  the [Identities aggregate](#identities-aggregate)'s login methods + sessions.
   N-replica-safe and idempotent.
 
 ## Eventing & reconciliation

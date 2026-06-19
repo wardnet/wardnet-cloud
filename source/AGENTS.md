@@ -215,6 +215,7 @@ Tests that exercise the public API end-to-end belong in the owning crate's `test
 - `crates/tunneller/tests/api.rs` — the daemon `GET /v1/tunnel` surface (auth / network-scope / routing policy / WS upgrade) against a live mock-backed server
 - `crates/tunneller/tests/mesh_mtls.rs` — inter-node forward round-trip + `TenantsClient` reads over real mTLS (`#[ignore]`)
 - `crates/tenants/tests/resource_reads.rs` — the mesh-plane `GET /v1/networks/{id}` · `GET /v1/tenants/{id}` reads
+- `crates/tenants/tests/auth.rs` — the web-auth HTTP surface (WS-F): password signup/login/reset, OIDC callback + auto-link, session↔JWT exchange, `GET /v1/me`, logout
 
 Add new integration test files here when a feature requires two or more real infrastructure components to test correctly. (The former pebble-based `tests/acme.rs` / `tests/tls_renewal.rs` were removed with the in-app TLS/ACME subsystem.)
 
