@@ -213,6 +213,21 @@ async fn webhook_missing_price_metadata_does_not_grant() {
 }
 
 #[tokio::test]
+async fn webhook_missing_tenant_id_does_not_grant() {
+    // A brand-new paid subscription whose metadata carries no `tenant_id` cannot be
+    // attributed to an account — safe-closed: decline to grant rather than guess (the
+    // sibling of the missing-price-metadata path).
+    let (svc, store, _events) = service();
+    svc.create_trial("t1").await.unwrap();
+    let event = upsert_event("evt_1", None, "sub_orphan", SubscriptionStatus::Active);
+    svc.apply_stripe_event(event).await.unwrap();
+    // The existing tenant's trial is untouched; nothing was granted.
+    let current = svc.current("t1").await.unwrap().unwrap();
+    assert_eq!(current.status, SubscriptionStatus::Trialing);
+    assert_eq!(store.subscription_count("t1"), 1);
+}
+
+#[tokio::test]
 async fn webhook_deleted_cancels_and_deactivates() {
     let (svc, _store, events) = service();
     svc.create_trial("t1").await.unwrap();

@@ -281,3 +281,131 @@ async fn tenants_client_reads_network_and_tenant() {
     assert_eq!(tenant.email, "t1@example.com");
     assert!(tenants.get_tenant("missing").await.unwrap().is_none());
 }
+
+// ── Initiator-pin rejections (the SpiffeServerVerifier, ADR-0005) ───────────────
+//
+// Every mesh dial pins an `ExpectedPeer{service, scope}` and rejects a server whose
+// SPIFFE leaf does not match — even when the leaf is chain-valid against the bundle.
+// These prove the *negative*: a wrong-service, wrong-scope, or foreign-CA server is
+// refused at the handshake, so a misrouted/rogue mesh endpoint can never be read from.
+
+const DDNS_GLOBAL_SPIFFE: &str = "spiffe://wardnet.test/dev/global/ddns";
+const TENANTS_USE1_SPIFFE: &str = "spiffe://wardnet.test/dev/use1/tenants";
+const DDNS_USE1_SPIFFE: &str = "spiffe://wardnet.test/dev/use1/ddns";
+
+/// Build a `TenantsClient` pinning `tenants/global` against a server standing up the
+/// given `server_leaf`, trusting `bundle_pem` as its anchor.
+async fn tenants_client_against(
+    server_leaf: &Leaf,
+    ca: &MeshCa,
+    bundle_pem: &str,
+) -> TenantsClient {
+    let addr = spawn_tenants(server_leaf, &ca.root_pem).await;
+    let client = ca.leaf(
+        SanType::URI(TUNNELLER_SPIFFE.try_into().unwrap()),
+        ExtendedKeyUsagePurpose::ClientAuth,
+    );
+    let mesh = MeshClient::new(
+        client.cert_pem.as_bytes(),
+        client.key_pem.as_bytes(),
+        bundle_pem.as_bytes(),
+        ExpectedPeer::new("tenants", "global"),
+    )
+    .expect("build mesh client");
+    TenantsClient::new(mesh, format!("https://127.0.0.1:{}", addr.port()))
+}
+
+#[tokio::test]
+#[ignore = "binds a TCP listener + completes a TLS handshake"]
+async fn mesh_client_rejects_wrong_service_server() {
+    mtls::install_crypto_provider();
+    let ca = MeshCa::new();
+    // The server presents a chain-valid `ddns` leaf where the client pinned `tenants`.
+    let server = ca.leaf(
+        SanType::URI(DDNS_GLOBAL_SPIFFE.try_into().unwrap()),
+        ExtendedKeyUsagePurpose::ServerAuth,
+    );
+    let tenants = tenants_client_against(&server, &ca, &ca.root_pem).await;
+    assert!(
+        tenants.get_network("n1").await.is_err(),
+        "a server with the wrong SPIFFE service must be rejected at the handshake"
+    );
+}
+
+#[tokio::test]
+#[ignore = "binds a TCP listener + completes a TLS handshake"]
+async fn mesh_client_rejects_wrong_scope_server() {
+    mtls::install_crypto_provider();
+    let ca = MeshCa::new();
+    // Right service (`tenants`) but a regional scope where the client pinned `global`.
+    let server = ca.leaf(
+        SanType::URI(TENANTS_USE1_SPIFFE.try_into().unwrap()),
+        ExtendedKeyUsagePurpose::ServerAuth,
+    );
+    let tenants = tenants_client_against(&server, &ca, &ca.root_pem).await;
+    assert!(
+        tenants.get_network("n1").await.is_err(),
+        "a server with the wrong SPIFFE scope must be rejected at the handshake"
+    );
+}
+
+#[tokio::test]
+#[ignore = "binds a TCP listener + completes a TLS handshake"]
+async fn mesh_client_rejects_foreign_ca_server() {
+    mtls::install_crypto_provider();
+    let ca = MeshCa::new();
+    let foreign = MeshCa::new();
+    // The server leaf carries the right SPIFFE id but is signed by a CA outside the
+    // client's trust bundle — the chain must fail before the SPIFFE check even matters.
+    let server = foreign.leaf(
+        SanType::URI(TENANTS_SPIFFE.try_into().unwrap()),
+        ExtendedKeyUsagePurpose::ServerAuth,
+    );
+    // `ca` here only signs the client leaf + is the server's client-cert anchor; the
+    // client's bundle is `ca.root_pem`, which does not anchor the `foreign`-signed server.
+    let tenants = tenants_client_against(&server, &ca, &ca.root_pem).await;
+    assert!(
+        tenants.get_network("n1").await.is_err(),
+        "a server leaf signed by an out-of-bundle CA must fail the chain"
+    );
+}
+
+#[tokio::test]
+#[ignore = "binds a TCP listener + completes a TLS handshake"]
+async fn forwarder_dial_rejects_wrong_service_peer() {
+    mtls::install_crypto_provider();
+    let ca = MeshCa::new();
+    // The forward "owner" stands up a `ddns` server leaf; the dialer pins `tunneller`.
+    let server = ca.leaf(
+        SanType::URI(DDNS_USE1_SPIFFE.try_into().unwrap()),
+        ExtendedKeyUsagePurpose::ServerAuth,
+    );
+    let client = ca.leaf(
+        SanType::URI(TUNNELLER_SPIFFE.try_into().unwrap()),
+        ExtendedKeyUsagePurpose::ClientAuth,
+    );
+    let registry = Arc::new(TunnelRegistry::new());
+    let addr = spawn_forward_listener(&server, &ca.root_pem, Arc::clone(&registry)).await;
+
+    let forwarder = MtlsForwarder::new(
+        client.cert_pem.as_bytes(),
+        client.key_pem.as_bytes(),
+        ca.root_pem.as_bytes(),
+        ExpectedPeer::new("tunneller", "use1"),
+    )
+    .expect("build forwarder");
+
+    let pair_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pair_addr = pair_listener.local_addr().unwrap();
+    let client_near = TcpStream::connect(pair_addr).await.unwrap();
+    let (_client_far, _) = pair_listener.accept().await.unwrap();
+
+    let node_addr = format!("127.0.0.1:{}", addr.port());
+    assert!(
+        forwarder
+            .forward(&node_addr, "alice", 443, client_near)
+            .await
+            .is_err(),
+        "dialing a forward peer whose leaf is not `tunneller` must fail at the handshake"
+    );
+}

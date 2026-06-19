@@ -23,7 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
-use wardnet_common::mtls::{self, ExpectedPeer, ReloadableServerConfig};
+use wardnet_common::mtls::{self, ExpectedPeer, ReloadableServerConfig, SpiffeId};
 
 use crate::tunnel::{ForwardRequest, ForwardResult, TunnelRegistry};
 
@@ -144,6 +144,14 @@ impl InterNodeForwarder for MtlsForwarder {
     }
 }
 
+/// The scope-direction rule for the regional forward acceptor (ADR-0005): admit a peer
+/// only if it is a `tunneller` in this node's **own** scope. Cross-region peers and other
+/// services are already bundle-blocked at the chain; this pins the SPIFFE identity on top,
+/// so the node↔node forward plane is strictly same-service, same-region.
+fn peer_allowed_on_forward(peer: &SpiffeId, own_scope: &str) -> bool {
+    peer.service == "tunneller" && peer.scope == own_scope
+}
+
 /// Serve the inter-node forward listener over mutual TLS on `forward_listen_addr`. The
 /// `server_config` holder is read once per accepted connection (so a leaf rotation takes
 /// effect on new connections); after the handshake the peer's SPIFFE identity must be a
@@ -200,7 +208,7 @@ pub async fn serve_forward(
                 tracing::debug!(%peer, "forward peer presented no parseable SPIFFE id, dropping");
                 return;
             };
-            if peer_id.service != "tunneller" || peer_id.scope != own_scope {
+            if !peer_allowed_on_forward(&peer_id, &own_scope) {
                 tracing::debug!(
                     %peer,
                     peer_service = %peer_id.service,
@@ -283,3 +291,6 @@ pub async fn read_preamble<R: AsyncReadExt + Unpin>(r: &mut R) -> anyhow::Result
         String::from_utf8(slug).map_err(|e| anyhow::anyhow!("preamble slug not UTF-8: {e}"))?;
     Ok((slug, u16::from_be_bytes(port_buf)))
 }
+
+#[cfg(test)]
+mod tests;

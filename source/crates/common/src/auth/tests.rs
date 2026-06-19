@@ -243,6 +243,75 @@ async fn daemon_request_with_stale_timestamp_is_rejected() {
     );
 }
 
+#[tokio::test]
+async fn daemon_request_without_timestamp_header_is_rejected() {
+    let (st, signer) = state();
+    // A fully-valid signed request, minus the timestamp header the `PoP` check needs.
+    let mut req = signed_daemon_request(&signer, 7, now(), b"{}");
+    req.headers_mut().remove("X-Wardnet-Timestamp");
+    assert_eq!(
+        status_of(app(st, CallerType::DAEMON), req).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn daemon_request_without_signature_header_is_rejected() {
+    let (st, signer) = state();
+    let mut req = signed_daemon_request(&signer, 7, now(), b"{}");
+    req.headers_mut().remove("X-Wardnet-Signature");
+    assert_eq!(
+        status_of(app(st, CallerType::DAEMON), req).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn daemon_token_without_cnf_is_rejected() {
+    let (st, signer) = state();
+    // An envelope-valid daemon token that carries no `cnf` `PoP` key: the middleware
+    // must reject it (there is no key to verify possession against), not fall through.
+    let token = signer
+        .sign(
+            &ClaimsSpec {
+                tenant_id: "t1",
+                principal_type: PrincipalType::Daemon,
+                subject: "daemon-1",
+                network: Some("n1"),
+                cnf_ed25519_b64: None,
+                audience: vec!["tenants", "ddns", "tunneller"],
+            },
+            now(),
+            TTL,
+        )
+        .unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/echo")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        status_of(app(st, CallerType::DAEMON), req).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn malformed_bearer_token_is_unauthorized() {
+    let (st, _signer) = state();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/echo")
+        .header(header::AUTHORIZATION, "Bearer not.a.jwt")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        status_of(app(st, CallerType::all()), req).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
 // ── SERVICE ─────────────────────────────────────────────────────────────────────
 
 fn service_request() -> Request<Body> {

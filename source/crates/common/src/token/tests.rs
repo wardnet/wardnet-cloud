@@ -187,6 +187,40 @@ fn user_token_is_rejected_at_a_data_plane_verifier() {
 }
 
 #[test]
+fn token_with_empty_audience_is_rejected() {
+    // `validate_aud = true` fails closed: a token carrying an empty `aud` set names no
+    // service, so no verifier's expected name can be in it.
+    let (signer, verifier) = signer();
+    let (_daemon, cnf) = daemon_key(9);
+    let mut spec = daemon_spec(&cnf);
+    spec.audience = vec![];
+    let token = signer.sign(&spec, now(), TTL).unwrap();
+    assert!(verifier.verify(&token).is_err());
+}
+
+#[test]
+fn pop_public_key_rejects_malformed_cnf() {
+    // An envelope-valid daemon token whose `cnf` is not base64: `verify` succeeds (cnf
+    // is opaque to it), but extracting the `PoP` key fails — the middleware rejects here.
+    let (signer, verifier) = signer();
+    let token = signer
+        .sign(&daemon_spec("!! not base64 !!"), now(), TTL)
+        .unwrap();
+    let claims = verifier.verify(&token).unwrap();
+    assert!(claims.pop_public_key().is_err());
+}
+
+#[test]
+fn pop_public_key_rejects_wrong_length_cnf() {
+    // A `cnf` that base64-decodes to 31 bytes (not 32) is not a valid Ed25519 key.
+    let (signer, verifier) = signer();
+    let short = base64::engine::general_purpose::STANDARD.encode([0u8; 31]);
+    let token = signer.sign(&daemon_spec(&short), now(), TTL).unwrap();
+    let claims = verifier.verify(&token).unwrap();
+    assert!(claims.pop_public_key().is_err());
+}
+
+#[test]
 fn signer_rejects_garbage_pem() {
     assert!(Signer::from_pem(b"not a pem", None).is_err());
     assert!(Verifier::from_pem(b"not a pem", "tenants").is_err());
