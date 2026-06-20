@@ -76,16 +76,25 @@ async fn tombstone_flow_over_real_mesh_mtls() {
     let email = format!("e2e-{suffix}@example.com");
 
     // ── Seed desired state: a live tenant with a provisioning network ───────────
+    // `tenants` is identity-only now (WS-G); entitlement lives on `subscriptions`.
+    sqlx::query("INSERT INTO tenants (id, email, created_at) VALUES ($1, $2, now())")
+        .bind(&tenant_id)
+        .bind(&email)
+        .execute(&global)
+        .await
+        .expect("seed tenant");
+
+    // An active subscription grants the entitlement network provisioning relies on.
     sqlx::query(
-        "INSERT INTO tenants (id, email, entitlement, subscription_status, created_at) \
-         VALUES ($1, $2, $3::jsonb, 'active', now())",
+        "INSERT INTO subscriptions (id, tenant_id, status, entitlement, created_at, updated_at) \
+         VALUES ($1, $2, 'active', $3::jsonb, now(), now())",
     )
+    .bind(format!("sub-{tenant_id}"))
     .bind(&tenant_id)
-    .bind(&email)
     .bind(r#"{"max_networks":1,"max_daemons":1}"#)
     .execute(&global)
     .await
-    .expect("seed tenant");
+    .expect("seed subscription");
 
     sqlx::query(
         "INSERT INTO networks \

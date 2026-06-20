@@ -13,10 +13,12 @@ path = "src/lib.rs"
 [dependencies]
 axum = { workspace = true }
 tokio = { workspace = true }
+tower-http = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
@@ -42,8 +44,25 @@ hyper-util = { workspace = true }
 utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 
+# Observability: OTLP logs + metrics + traces, bridged from the existing `tracing`
+# foundation. Opt-in by endpoint — see `telemetry`.
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-http = { workspace = true }
+opentelemetry-appender-tracing = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
 [dev-dependencies]
 tower = { workspace = true }
+# Integration test (`tests/telemetry.rs`) drives the OTLP pipeline against an
+# in-process receiver; the test crate can't see the lib's normal deps, so these
+# are repeated here.
+axum = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+opentelemetry = { workspace = true }
 
 [lints]
 workspace = true

@@ -18,6 +18,7 @@ pub mod mtls;
 pub mod proxy_protocol;
 pub mod replay_cache;
 pub mod serve;
+pub mod telemetry;
 pub mod token;
 pub mod validation;
 

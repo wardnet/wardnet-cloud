@@ -13,7 +13,6 @@ pub mod ip;
 use axum::Router;
 use axum::extract::State;
 use axum::middleware::from_fn_with_state;
-use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 
@@ -53,5 +52,5 @@ pub fn router(state: AppState) -> Router {
         .merge(daemon)
         .split_for_parts();
 
-    router.layer(TraceLayer::new_for_http()).with_state(state)
+    wardnet_common::telemetry::install_http_layers(router).with_state(state)
 }

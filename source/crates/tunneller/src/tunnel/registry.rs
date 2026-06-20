@@ -142,6 +142,13 @@ impl TunnelRegistry {
     pub fn is_connected(&self, slug: &str) -> bool {
         self.by_slug.contains_key(slug)
     }
+
+    /// The number of tunnels currently registered on this node. Backs the
+    /// `tunneller.active_tunnels` observability gauge (a bounded scalar — no labels).
+    #[must_use]
+    pub fn active_count(&self) -> u64 {
+        u64::try_from(self.by_slug.len()).unwrap_or(u64::MAX)
+    }
 }
 
 #[cfg(test)]

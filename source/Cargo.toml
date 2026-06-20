@@ -34,6 +34,31 @@ serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# OpenTelemetry (observability: logs + metrics + traces over OTLP).
+# Released in lockstep on the 0.32 line; tracing-opentelemetry 0.33 tracks it.
+# OTLP exporter is HTTP/protobuf over reqwest+rustls (no gRPC/tonic) to keep the
+# workspace openssl-free and aligned with the aws-lc-rs rustls stack. The SDK's
+# stable batch/periodic processors export from dedicated OS threads (no Tokio
+# reactor), so the exporter uses the **blocking** reqwest client (its own internal
+# runtime) rather than the async one — the async client panics off-runtime.
+# TECH DEBT (#13): on the next opentelemetry* bump, re-evaluate the blocking
+# client vs the async-runtime processors (experimental in 0.32) — switch to async
+# reqwest if that path has stabilised. See github.com/wardnet/wardnet-cloud#13.
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "http-proto",
+    "reqwest-blocking-client",
+    "reqwest-rustls",
+    "trace",
+    "metrics",
+    "logs",
+] }
+opentelemetry-http = "0.32"
+opentelemetry-appender-tracing = "0.32"
+opentelemetry-semantic-conventions = { version = "0.32", features = ["semconv_experimental"] }
+tracing-opentelemetry = "0.33"
+
 # Misc
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }

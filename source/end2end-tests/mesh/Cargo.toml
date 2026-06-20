@@ -18,3 +18,5 @@ sqlx = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
+# `observability.rs` queries the bundled collector's Prometheus / Tempo / Loki APIs.
+reqwest = { workspace = true }
