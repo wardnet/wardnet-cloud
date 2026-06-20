@@ -193,10 +193,10 @@ impl SubscriptionRepository for PgSubscriptionRepository {
     }
 
     async fn find_current(&self, tenant_id: &str) -> anyhow::Result<Option<Subscription>> {
-        let row = sqlx::query_as::<_, SubscriptionRow>(&format!(
+        let row = sqlx::query_as::<_, SubscriptionRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {SUBSCRIPTION_COLS} FROM subscriptions \
              WHERE tenant_id = $1 AND status <> 'canceled'"
-        ))
+        )))
         .bind(tenant_id)
         .fetch_optional(&self.pools.read)
         .await?;
@@ -207,9 +207,9 @@ impl SubscriptionRepository for PgSubscriptionRepository {
         &self,
         stripe_subscription_id: &str,
     ) -> anyhow::Result<Option<Subscription>> {
-        let row = sqlx::query_as::<_, SubscriptionRow>(&format!(
+        let row = sqlx::query_as::<_, SubscriptionRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {SUBSCRIPTION_COLS} FROM subscriptions WHERE stripe_subscription_id = $1"
-        ))
+        )))
         .bind(stripe_subscription_id)
         .fetch_optional(&self.pools.read)
         .await?;

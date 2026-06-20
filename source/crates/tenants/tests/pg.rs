@@ -39,10 +39,12 @@ async fn test_pool() -> DbPools {
     // DDL: the database identifier cannot be bind-parameterised. The name is a
     // fresh UUID (not user input); this inline format is the deliberate, test-only
     // exception to the const-SQL convention.
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(&maintenance)
-        .await
-        .expect("CREATE DATABASE");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE \"{db_name}\""
+    )))
+    .execute(&maintenance)
+    .await
+    .expect("CREATE DATABASE");
     drop(maintenance);
 
     db::init(&format!("{base}/{db_name}"))

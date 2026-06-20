@@ -55,9 +55,9 @@ const DAEMON_COLS: &str = "id, tenant_id, network_id, public_key, created_at";
 #[async_trait]
 impl DaemonRepository for PgDaemonRepository {
     async fn find_by_public_key(&self, public_key: &str) -> anyhow::Result<Option<Daemon>> {
-        let row = sqlx::query_as::<_, Daemon>(&format!(
+        let row = sqlx::query_as::<_, Daemon>(sqlx::AssertSqlSafe(format!(
             "SELECT {DAEMON_COLS} FROM daemons WHERE public_key = $1"
-        ))
+        )))
         .bind(public_key)
         .fetch_optional(&self.pools.read)
         .await?;
@@ -65,9 +65,9 @@ impl DaemonRepository for PgDaemonRepository {
     }
 
     async fn list_by_tenant(&self, tenant_id: &str) -> anyhow::Result<Vec<Daemon>> {
-        let rows = sqlx::query_as::<_, Daemon>(&format!(
+        let rows = sqlx::query_as::<_, Daemon>(sqlx::AssertSqlSafe(format!(
             "SELECT {DAEMON_COLS} FROM daemons WHERE tenant_id = $1 ORDER BY created_at"
-        ))
+        )))
         .bind(tenant_id)
         .fetch_all(&self.pools.read)
         .await?;
@@ -75,9 +75,9 @@ impl DaemonRepository for PgDaemonRepository {
     }
 
     async fn list_by_network(&self, network_id: &str) -> anyhow::Result<Vec<Daemon>> {
-        let rows = sqlx::query_as::<_, Daemon>(&format!(
+        let rows = sqlx::query_as::<_, Daemon>(sqlx::AssertSqlSafe(format!(
             "SELECT {DAEMON_COLS} FROM daemons WHERE network_id = $1 ORDER BY created_at"
-        ))
+        )))
         .bind(network_id)
         .fetch_all(&self.pools.read)
         .await?;

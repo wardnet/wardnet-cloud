@@ -139,9 +139,9 @@ impl PgNetworkRepository {
 #[async_trait]
 impl NetworkRepository for PgNetworkRepository {
     async fn find_by_id(&self, id: &str) -> anyhow::Result<Option<Network>> {
-        let row = sqlx::query_as::<_, NetworkRow>(&format!(
+        let row = sqlx::query_as::<_, NetworkRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {NETWORK_COLS} FROM networks WHERE id = $1"
-        ))
+        )))
         .bind(id)
         .fetch_optional(&self.pools.read)
         .await?;
@@ -149,9 +149,9 @@ impl NetworkRepository for PgNetworkRepository {
     }
 
     async fn find_by_slug(&self, slug: &str) -> anyhow::Result<Option<Network>> {
-        let row = sqlx::query_as::<_, NetworkRow>(&format!(
+        let row = sqlx::query_as::<_, NetworkRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {NETWORK_COLS} FROM networks WHERE slug = $1"
-        ))
+        )))
         .bind(slug)
         .fetch_optional(&self.pools.read)
         .await?;
@@ -159,9 +159,9 @@ impl NetworkRepository for PgNetworkRepository {
     }
 
     async fn list_by_tenant(&self, tenant_id: &str) -> anyhow::Result<Vec<Network>> {
-        let rows = sqlx::query_as::<_, NetworkRow>(&format!(
+        let rows = sqlx::query_as::<_, NetworkRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {NETWORK_COLS} FROM networks WHERE tenant_id = $1 ORDER BY created_at"
-        ))
+        )))
         .bind(tenant_id)
         .fetch_all(&self.pools.read)
         .await?;
@@ -261,12 +261,12 @@ impl NetworkRepository for PgNetworkRepository {
         after_id: Option<&str>,
         limit: i64,
     ) -> anyhow::Result<Vec<Network>> {
-        let rows = sqlx::query_as::<_, NetworkRow>(&format!(
+        let rows = sqlx::query_as::<_, NetworkRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {NETWORK_COLS} FROM networks \
              WHERE provisioning_state = $1 AND region = $2 \
                AND ($3::text IS NULL OR id > $3) \
              ORDER BY id LIMIT $4"
-        ))
+        )))
         .bind(state.as_str())
         .bind(region)
         .bind(after_id)

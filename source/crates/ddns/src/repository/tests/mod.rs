@@ -44,10 +44,12 @@ async fn fresh_database() -> sqlx::PgPool {
     // this inline `format!` is the deliberate, test-only exception to the
     // "query strings are `const &str`" convention. The name is a fresh
     // UUID-derived identifier (not user input).
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(&maintenance_pool)
-        .await
-        .expect("CREATE DATABASE");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE \"{db_name}\""
+    )))
+    .execute(&maintenance_pool)
+    .await
+    .expect("CREATE DATABASE");
     drop(maintenance_pool);
 
     sqlx::PgPool::connect(&format!("{base_url}/{db_name}"))
