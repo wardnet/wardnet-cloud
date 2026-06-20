@@ -1,0 +1,92 @@
+[workspace]
+resolver = "3"
+members = ["crates/common", "crates/tenants", "crates/ddns", "crates/tunneller", "xtask", "end2end-tests/mesh"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[workspace.dependencies]
+# Internal
+wardnet_common = { path = "crates/common" }
+
+# Web stack
+axum = { version = "0.8", features = ["macros", "ws"] }
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "migrate", "json"] }
+
+# Serde
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Misc
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+async-trait = "0.1"
+# Stripe billing — rustls runtime (the workspace is openssl-free). `webhook-events`
+# needs the full resource surface (EventObject spans the whole API), so `full`.
+async-stripe = { version = "0.41", default-features = false, features = [
+    "runtime-tokio-hyper-rustls",
+    "full",
+    "webhook-events",
+] }
+bitflags = "2"
+dashmap = "6"
+arc-swap = "1"
+tokio-util = { version = "0.7", features = ["rt"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "alloc"] }
+
+# Crypto / tokens
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "pkcs8", "pem"] }
+sha2 = "0.11"
+hex = "0.4"
+base64 = "0.22"
+rand = "0.10"
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+rcgen = "0.14.8"
+# Mesh-mTLS SPIFFE identity: parse the leaf's URI SAN + hot-reload rotated material.
+x509-parser = "0.18"
+notify = "8"
+jsonwebtoken = { version = "10.4.0", default-features = false, features = ["use_pem", "rust_crypto"] }
+
+# Hyper (manual connection serving)
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["server", "tokio", "service"] }
+
+# OpenAPI
+utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-axum = "0.2"
+
+# Human/web auth (WS-F): password hashing, cookie jars, and OIDC (Google + discovery).
+# GitHub OAuth2 is hand-rolled over `reqwest` (no id_token).
+argon2 = "0.5"
+axum-extra = { version = "0.10", features = ["cookie", "cookie-private", "cookie-signed"] }
+# `time` (same crate the cookie jar uses) for cookie Max-Age durations.
+time = "0.3"
+# rustls only — keep the workspace openssl-free (matches `reqwest`/`async-stripe`).
+openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
+
+# Dev
+http-body-util = "0.1"
+wiremock = "0.6"
+tokio-tungstenite = "0.29"

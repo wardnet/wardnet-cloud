@@ -1,0 +1,15 @@
+# Local dev Postgres for the `#[ignore]`d Postgres-backed unit/integration tests
+# (`cargo test --workspace -- --ignored`). The full mesh-mTLS end-to-end topology
+# lives separately under `end2end-tests/mesh/` (see `make e2e-all`).
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 30

@@ -1,0 +1,499 @@
+//! Mutual-TLS round-trip tests for the mesh plane: the inter-node forward link and
+//! the Tenants resolver client. Both stand up a throwaway mesh CA with `rcgen`.
+//!
+//! `#[ignore]`'d — they bind real TCP listeners and complete TLS handshakes.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::extract::Path;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::get;
+use axum::{Json, Router};
+use rcgen::{
+    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose, SanType,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
+
+use wardnet_common::mtls::{self, ExpectedPeer, MeshClient, ReloadableServerConfig};
+use wardnet_common::serve;
+use wardnet_tunneller::mesh::forward::{read_preamble, serve_forward_on};
+use wardnet_tunneller::mesh::{InterNodeForwarder, MtlsForwarder, TenantsClient, TenantsResolver};
+use wardnet_tunneller::tunnel::{ForwardRequest, TunnelRegistry};
+
+/// Mesh leaf SPIFFE ids (URI SAN only — no DNS/IP SAN).
+const TUNNELLER_SPIFFE: &str = "spiffe://wardnet.test/dev/use1/tunneller";
+const TENANTS_SPIFFE: &str = "spiffe://wardnet.test/dev/global/tenants";
+
+struct MeshCa {
+    issuer: Issuer<'static, KeyPair>,
+    root_pem: String,
+}
+
+struct Leaf {
+    cert_pem: String,
+    key_pem: String,
+}
+
+impl MeshCa {
+    fn new() -> Self {
+        let key = KeyPair::generate().expect("generate CA key");
+        let mut params = CertificateParams::new(Vec::new()).expect("CA params");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let root = params.self_signed(&key).expect("self-sign CA root");
+        let root_pem = root.pem();
+        Self {
+            issuer: Issuer::new(params, key),
+            root_pem,
+        }
+    }
+
+    fn leaf(&self, san: SanType, eku: ExtendedKeyUsagePurpose) -> Leaf {
+        let key = KeyPair::generate().expect("generate leaf key");
+        let mut params = CertificateParams::new(Vec::new()).expect("leaf params");
+        params.subject_alt_names = vec![san];
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![eku];
+        let cert = params.signed_by(&key, &self.issuer).expect("sign leaf");
+        Leaf {
+            cert_pem: cert.pem(),
+            key_pem: key.serialize_pem(),
+        }
+    }
+}
+
+// ── Inter-node forward round-trip ──────────────────────────────────────────────
+
+/// Stand up a forward-listener mimic: mTLS accept → read preamble → hand the stream
+/// to the registry. (This is exactly what `serve_forward`'s `handle_forward` does;
+/// inlined here so the test owns the registry it asserts against.)
+async fn spawn_forward_listener(
+    server: &Leaf,
+    ca_pem: &str,
+    registry: Arc<TunnelRegistry>,
+) -> SocketAddr {
+    let server_config = mtls::server_config_from_pem(
+        server.cert_pem.as_bytes(),
+        server.key_pem.as_bytes(),
+        ca_pem.as_bytes(),
+    )
+    .expect("build forward server config");
+    let acceptor = TlsAcceptor::from(server_config);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _peer)) = listener.accept().await else {
+                continue;
+            };
+            let acceptor = acceptor.clone();
+            let registry = Arc::clone(&registry);
+            tokio::spawn(async move {
+                if let Ok(mut tls) = acceptor.accept(stream).await
+                    && let Ok((slug, dest_port)) = read_preamble(&mut tls).await
+                {
+                    let req = ForwardRequest {
+                        stream: Box::new(tls),
+                        dest_port,
+                    };
+                    let _ = registry.forward(&slug, req);
+                }
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+#[ignore = "binds a TCP listener + completes a TLS handshake"]
+async fn inter_node_forward_round_trip() {
+    mtls::install_crypto_provider();
+    let ca = MeshCa::new();
+    // Both ends are `tunneller` in the same region (node↔node).
+    let server = ca.leaf(
+        SanType::URI(TUNNELLER_SPIFFE.try_into().unwrap()),
+        ExtendedKeyUsagePurpose::ServerAuth,
+    );
+    let client = ca.leaf(
+        SanType::URI(TUNNELLER_SPIFFE.try_into().unwrap()),
+        ExtendedKeyUsagePurpose::ClientAuth,
+    );
+
+    // The owning node: a registry with a live tunnel for "alice".
+    let registry = Arc::new(TunnelRegistry::new());
+    let mut registration = registry.register("alice");
+    let addr = spawn_forward_listener(&server, &ca.root_pem, Arc::clone(&registry)).await;
+
+    // The dialing node: a real MtlsForwarder, and a local client socket pair whose
+    // far end stands in for the SNI-accepted tenant connection.
+    let forwarder = MtlsForwarder::new(
+        client.cert_pem.as_bytes(),
+        client.key_pem.as_bytes(),
+        ca.root_pem.as_bytes(),
+        ExpectedPeer::new("tunneller", "use1"),
+    )
+    .expect("build forwarder");
+
+    let pair_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pair_addr = pair_listener.local_addr().unwrap();
+    let client_near = TcpStream::connect(pair_addr).await.unwrap();
+    let (mut client_far, _) = pair_listener.accept().await.unwrap();
+
+    let node_addr = format!("127.0.0.1:{}", addr.port());
+    tokio::spawn(async move {
+        let _ = forwarder
+            .forward(&node_addr, "alice", 443, client_near)
+            .await;
+    });
+
+    // The forwarded connection lands in the owning node's registry…
+    let mut req = registration.rx.recv().await.expect("forwarded request");
+    assert_eq!(req.dest_port, 443);
+
+    // …and bytes written at the far client end arrive over the spliced mTLS link.
+    client_far.write_all(b"hello over the mesh").await.unwrap();
+    let mut buf = [0u8; 19];
+    req.stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"hello over the mesh");
+}
+
+// ── TenantsClient resolver reads ───────────────────────────────────────────────
+
+async fn spawn_tenants(server: &Leaf, ca_pem: &str) -> SocketAddr {
+    let server_config = mtls::server_config_from_pem(
+        server.cert_pem.as_bytes(),
+        server.key_pem.as_bytes(),
+        ca_pem.as_bytes(),
+    )
+    .expect("build tenants server config");
+    let acceptor = TlsAcceptor::from(server_config);
+
+    let router = Router::new()
+        .route(
+            "/v1/networks/{id}",
+            get(|Path(id): Path<String>| async move {
+                if id == "n1" {
+                    Json(serde_json::json!({
+                        "id": "n1",
+                        "tenant_id": "t1",
+                        "slug": "happy",
+                        "display_name": "Happy",
+                        "region": "use1",
+                        "provisioning_state": "active",
+                        "created_at": "2026-06-16T00:00:00Z",
+                        "updated_at": "2026-06-16T00:00:00Z"
+                    }))
+                    .into_response()
+                } else {
+                    StatusCode::NOT_FOUND.into_response()
+                }
+            }),
+        )
+        .route(
+            "/v1/tenants/{id}",
+            get(|Path(id): Path<String>| async move {
+                if id == "t1" {
+                    Json(serde_json::json!({
+                        "id": "t1",
+                        "email": "t1@example.com",
+                        "subscription": {
+                            "id": "sub-t1",
+                            "status": "active",
+                            "entitlement": { "max_networks": 1, "max_daemons": 1 },
+                            "stripe_customer_id": null,
+                            "stripe_subscription_id": null,
+                            "price_id": null,
+                            "trial_expires_at": null,
+                            "current_period_end": null,
+                            "created_at": "2026-06-16T00:00:00Z",
+                            "updated_at": "2026-06-16T00:00:00Z"
+                        },
+                        "created_at": "2026-06-16T00:00:00Z"
+                    }))
+                    .into_response()
+                } else {
+                    StatusCode::NOT_FOUND.into_response()
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, peer)) = listener.accept().await else {
+                continue;
+            };
+            let acceptor = acceptor.clone();
+            let router = router.clone();
+            tokio::spawn(async move {
+                if let Ok(tls) = acceptor.accept(stream).await {
+                    let _ = serve::connection(tls, router, peer).await;
+                }
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+#[ignore = "binds a TCP listener + completes a TLS handshake"]
+async fn tenants_client_reads_network_and_tenant() {
+    mtls::install_crypto_provider();
+    let ca = MeshCa::new();
+    let server = ca.leaf(
+        SanType::URI(TENANTS_SPIFFE.try_into().unwrap()),
+        ExtendedKeyUsagePurpose::ServerAuth,
+    );
+    let client = ca.leaf(
+        SanType::URI(TUNNELLER_SPIFFE.try_into().unwrap()),
+        ExtendedKeyUsagePurpose::ClientAuth,
+    );
+
+    let addr = spawn_tenants(&server, &ca.root_pem).await;
+
+    let mesh = MeshClient::new(
+        client.cert_pem.as_bytes(),
+        client.key_pem.as_bytes(),
+        ca.root_pem.as_bytes(),
+        ExpectedPeer::new("tenants", "global"),
+    )
+    .expect("build mesh client");
+    let tenants = TenantsClient::new(mesh, format!("https://127.0.0.1:{}", addr.port()));
+
+    let network = tenants
+        .get_network("n1")
+        .await
+        .expect("get_network")
+        .unwrap();
+    assert_eq!(network.slug, "happy");
+    assert_eq!(network.tenant_id, "t1");
+    assert!(tenants.get_network("missing").await.unwrap().is_none());
+
+    let tenant = tenants.get_tenant("t1").await.expect("get_tenant").unwrap();
+    assert_eq!(tenant.email, "t1@example.com");
+    assert!(tenants.get_tenant("missing").await.unwrap().is_none());
+}
+
+// ── Initiator-pin rejections (the SpiffeServerVerifier, ADR-0005) ───────────────
+//
+// Every mesh dial pins an `ExpectedPeer{service, scope}` and rejects a server whose
+// SPIFFE leaf does not match — even when the leaf is chain-valid against the bundle.
+// These prove the *negative*: a wrong-service, wrong-scope, or foreign-CA server is
+// refused at the handshake, so a misrouted/rogue mesh endpoint can never be read from.
+
+const DDNS_GLOBAL_SPIFFE: &str = "spiffe://wardnet.test/dev/global/ddns";
+const TENANTS_USE1_SPIFFE: &str = "spiffe://wardnet.test/dev/use1/tenants";
+const DDNS_USE1_SPIFFE: &str = "spiffe://wardnet.test/dev/use1/ddns";
+
+/// Build a `TenantsClient` pinning `tenants/global` against a server standing up the
+/// given `server_leaf`, trusting `bundle_pem` as its anchor.
+async fn tenants_client_against(
+    server_leaf: &Leaf,
+    ca: &MeshCa,
+    bundle_pem: &str,
+) -> TenantsClient {
+    let addr = spawn_tenants(server_leaf, &ca.root_pem).await;
+    let client = ca.leaf(
+        SanType::URI(TUNNELLER_SPIFFE.try_into().unwrap()),
+        ExtendedKeyUsagePurpose::ClientAuth,
+    );
+    let mesh = MeshClient::new(
+        client.cert_pem.as_bytes(),
+        client.key_pem.as_bytes(),
+        bundle_pem.as_bytes(),
+        ExpectedPeer::new("tenants", "global"),
+    )
+    .expect("build mesh client");
+    TenantsClient::new(mesh, format!("https://127.0.0.1:{}", addr.port()))
+}
+
+#[tokio::test]
+#[ignore = "binds a TCP listener + completes a TLS handshake"]
+async fn mesh_client_rejects_wrong_service_server() {
+    mtls::install_crypto_provider();
+    let ca = MeshCa::new();
+    // The server presents a chain-valid `ddns` leaf where the client pinned `tenants`.
+    let server = ca.leaf(
+        SanType::URI(DDNS_GLOBAL_SPIFFE.try_into().unwrap()),
+        ExtendedKeyUsagePurpose::ServerAuth,
+    );
+    let tenants = tenants_client_against(&server, &ca, &ca.root_pem).await;
+    assert!(
+        tenants.get_network("n1").await.is_err(),
+        "a server with the wrong SPIFFE service must be rejected at the handshake"
+    );
+}
+
+#[tokio::test]
+#[ignore = "binds a TCP listener + completes a TLS handshake"]
+async fn mesh_client_rejects_wrong_scope_server() {
+    mtls::install_crypto_provider();
+    let ca = MeshCa::new();
+    // Right service (`tenants`) but a regional scope where the client pinned `global`.
+    let server = ca.leaf(
+        SanType::URI(TENANTS_USE1_SPIFFE.try_into().unwrap()),
+        ExtendedKeyUsagePurpose::ServerAuth,
+    );
+    let tenants = tenants_client_against(&server, &ca, &ca.root_pem).await;
+    assert!(
+        tenants.get_network("n1").await.is_err(),
+        "a server with the wrong SPIFFE scope must be rejected at the handshake"
+    );
+}
+
+#[tokio::test]
+#[ignore = "binds a TCP listener + completes a TLS handshake"]
+async fn mesh_client_rejects_foreign_ca_server() {
+    mtls::install_crypto_provider();
+    let ca = MeshCa::new();
+    let foreign = MeshCa::new();
+    // The server leaf carries the right SPIFFE id but is signed by a CA outside the
+    // client's trust bundle — the chain must fail before the SPIFFE check even matters.
+    let server = foreign.leaf(
+        SanType::URI(TENANTS_SPIFFE.try_into().unwrap()),
+        ExtendedKeyUsagePurpose::ServerAuth,
+    );
+    // `ca` here only signs the client leaf + is the server's client-cert anchor; the
+    // client's bundle is `ca.root_pem`, which does not anchor the `foreign`-signed server.
+    let tenants = tenants_client_against(&server, &ca, &ca.root_pem).await;
+    assert!(
+        tenants.get_network("n1").await.is_err(),
+        "a server leaf signed by an out-of-bundle CA must fail the chain"
+    );
+}
+
+#[tokio::test]
+#[ignore = "binds a TCP listener + completes a TLS handshake"]
+async fn forwarder_dial_rejects_wrong_service_peer() {
+    mtls::install_crypto_provider();
+    let ca = MeshCa::new();
+    // The forward "owner" stands up a `ddns` server leaf; the dialer pins `tunneller`.
+    let server = ca.leaf(
+        SanType::URI(DDNS_USE1_SPIFFE.try_into().unwrap()),
+        ExtendedKeyUsagePurpose::ServerAuth,
+    );
+    let client = ca.leaf(
+        SanType::URI(TUNNELLER_SPIFFE.try_into().unwrap()),
+        ExtendedKeyUsagePurpose::ClientAuth,
+    );
+    let registry = Arc::new(TunnelRegistry::new());
+    let addr = spawn_forward_listener(&server, &ca.root_pem, Arc::clone(&registry)).await;
+
+    let forwarder = MtlsForwarder::new(
+        client.cert_pem.as_bytes(),
+        client.key_pem.as_bytes(),
+        ca.root_pem.as_bytes(),
+        ExpectedPeer::new("tunneller", "use1"),
+    )
+    .expect("build forwarder");
+
+    let pair_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pair_addr = pair_listener.local_addr().unwrap();
+    let client_near = TcpStream::connect(pair_addr).await.unwrap();
+    let (_client_far, _) = pair_listener.accept().await.unwrap();
+
+    let node_addr = format!("127.0.0.1:{}", addr.port());
+    assert!(
+        forwarder
+            .forward(&node_addr, "alice", 443, client_near)
+            .await
+            .is_err(),
+        "dialing a forward peer whose leaf is not `tunneller` must fail at the handshake"
+    );
+}
+
+// ── Acceptor-side scope-direction rule (the real serve_forward loop) ────────────
+//
+// The initiator-pin tests above protect the dialer. This drives the **real**
+// `serve_forward_on` accept loop on an ephemeral port and proves the acceptor side:
+// a chain-valid `ddns` client (handshake succeeds — same CA, same region) is dropped
+// by the scope-direction rule before any forward lands, while an in-scope `tunneller`
+// client is admitted. Without this, a regression that deleted/negated the rule inside
+// `serve_forward` would pass every other test (the round-trip harness inlines its own
+// loop that never runs the rule).
+
+/// Dial the forward listener at `node_addr` as a client presenting `client_spiffe`,
+/// announce slug `alice`, and run the splice in a background task. Returns nothing — the
+/// caller observes the outcome via the owning node's registry.
+async fn dial_forward(ca: &MeshCa, node_addr: &str, client_spiffe: &str) {
+    let client = ca.leaf(
+        SanType::URI(client_spiffe.try_into().unwrap()),
+        ExtendedKeyUsagePurpose::ClientAuth,
+    );
+    let forwarder = MtlsForwarder::new(
+        client.cert_pem.as_bytes(),
+        client.key_pem.as_bytes(),
+        ca.root_pem.as_bytes(),
+        ExpectedPeer::new("tunneller", "use1"),
+    )
+    .expect("build forwarder");
+
+    let pair_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pair_addr = pair_listener.local_addr().unwrap();
+    let client_near = TcpStream::connect(pair_addr).await.unwrap();
+    let (_client_far, _) = pair_listener.accept().await.unwrap();
+
+    let node_addr = node_addr.to_string();
+    tokio::spawn(async move {
+        let _ = forwarder
+            .forward(&node_addr, "alice", 443, client_near)
+            .await;
+    });
+}
+
+#[tokio::test]
+#[ignore = "binds a TCP listener + completes a TLS handshake"]
+async fn serve_forward_enforces_scope_direction_rule() {
+    mtls::install_crypto_provider();
+    let ca = MeshCa::new();
+    let server = ca.leaf(
+        SanType::URI(TUNNELLER_SPIFFE.try_into().unwrap()),
+        ExtendedKeyUsagePurpose::ServerAuth,
+    );
+
+    // Drive the REAL serve_forward_on accept loop (with its scope-direction authorization)
+    // on an ephemeral port — not the simplified `spawn_forward_listener` mimic.
+    let registry = Arc::new(TunnelRegistry::new());
+    let mut registration = registry.register("alice");
+    let server_config = ReloadableServerConfig::new(
+        server.cert_pem.as_bytes(),
+        server.key_pem.as_bytes(),
+        ca.root_pem.as_bytes(),
+    )
+    .expect("build forward server config");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(serve_forward_on(
+        listener,
+        server_config,
+        Arc::clone(&registry),
+        "use1".to_string(),
+    ));
+
+    // A chain-valid `ddns` client (wrong service) must be rejected by the rule: no forward
+    // should ever reach the registry.
+    dial_forward(&ca, &node_addr, DDNS_USE1_SPIFFE).await;
+    let landed = tokio::time::timeout(Duration::from_millis(500), registration.rx.recv()).await;
+    assert!(
+        landed.is_err(),
+        "a chain-valid but wrong-service (ddns) client must be dropped by serve_forward"
+    );
+
+    // Positive control: an in-scope `tunneller` client IS admitted — proving the silence
+    // above is the rule firing, not a broken handshake/harness.
+    dial_forward(&ca, &node_addr, TUNNELLER_SPIFFE).await;
+    let landed = tokio::time::timeout(Duration::from_secs(2), registration.rx.recv()).await;
+    assert!(
+        matches!(landed, Ok(Some(_))),
+        "an in-scope tunneller client must be admitted by serve_forward"
+    );
+}

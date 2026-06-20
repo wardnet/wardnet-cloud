@@ -1,0 +1,60 @@
+name: CodeQL
+
+# Advanced CodeQL setup for wardnet-cloud.
+#
+# Advanced (not default) setup so we can pass a config file that excludes test
+# paths from analysis — tests carry intentional "bad" patterns (fixture
+# passwords, canned keys) that make the default setup noisy without adding
+# signal. The matrix covers the two source-only languages present in this pure-
+# Rust repo: `rust` and `actions` (the daemon repo's `javascript-typescript` is
+# dropped — there is no JS/TS here).
+#
+# NOTE: after this workflow runs green for the first time, disable the default
+# setup in Settings → Security → Code scanning, otherwise both run and produce
+# duplicate alerts.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly sweep so new CVEs in the query pack surface even without pushes.
+    - cron: "0 4 * * 1"
+
+permissions: read-all
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # The Rust extractor uses source-only analysis (`build-mode: none`) —
+        # manual/autobuild are not supported. `actions` is also source-only.
+        language: [actions, rust]
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          config-file: .github/codeql/codeql-config.yml
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        with:
+          category: "/language:${{ matrix.language }}"

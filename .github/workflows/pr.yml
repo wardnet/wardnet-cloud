@@ -1,0 +1,149 @@
+name: PR
+
+# Orchestrator for pull requests targeting `main`.
+#
+# Runs the same per-service reusable leaves as CI, gated by detect-changes, so
+# a PR is validated on exactly what would land on main. The `all-checks-passed`
+# aggregator is the single required status check for branch protection — it
+# runs unconditionally and is immune to the gated-leaf trap where a skipped job
+# never reports and blocks the PR forever.
+#
+# Each heavy leaf is gated on `<service> || all`. An `all` change
+# (common / lockfile / xtask / e2e / Makefile / any CI config) runs everything
+# — those can invalidate any assumption.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+# Cancel superseded runs on the same PR.
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+# Workflow-level permissions stay read-only. Each job/leaf elevates to the
+# writes it actually needs via its own `permissions:` block.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      all: ${{ steps.detect.outputs.all }}
+      tenants: ${{ steps.detect.outputs.tenants }}
+      ddns: ${{ steps.detect.outputs.ddns }}
+      tunneller: ${{ steps.detect.outputs.tunneller }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: ./.github/actions/detect-changes
+        id: detect
+
+  build-tenants:
+    name: Build tenants
+    needs: preflight
+    if: needs.preflight.outputs.tenants == 'true' || needs.preflight.outputs.all == 'true'
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    uses: ./.github/workflows/build-service.yml
+    with:
+      service: tenants
+    secrets: inherit
+
+  build-ddns:
+    name: Build ddns
+    needs: preflight
+    if: needs.preflight.outputs.ddns == 'true' || needs.preflight.outputs.all == 'true'
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    uses: ./.github/workflows/build-service.yml
+    with:
+      service: ddns
+    secrets: inherit
+
+  build-tunneller:
+    name: Build tunneller
+    needs: preflight
+    if: needs.preflight.outputs.tunneller == 'true' || needs.preflight.outputs.all == 'true'
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    uses: ./.github/workflows/build-service.yml
+    with:
+      service: tunneller
+    secrets: inherit
+
+  # NOTE: the mesh e2e harness is intentionally NOT a PR leaf. It is heavy and
+  # flaky on shared runners (see .github/workflows/e2e.yml), so it runs nightly
+  # on a schedule + on demand (workflow_dispatch) instead of gating every merge.
+
+  coverage:
+    name: Coverage
+    needs: preflight
+    # Skip for any bot-authored PR: bots push to same-repo branches, which
+    # GitHub denies repo-secret access for, and Codecov requires a token for
+    # same-repo branches on public repos. Gate on the PR author, not
+    # github.actor (re-running flips actor to the clicker). For workflow_call
+    # there's no pull_request context, so user.type is empty and coverage runs.
+    if: |
+      github.event.pull_request.user.type != 'Bot' && (
+        needs.preflight.outputs.tenants == 'true' ||
+        needs.preflight.outputs.ddns == 'true' ||
+        needs.preflight.outputs.tunneller == 'true' ||
+        needs.preflight.outputs.all == 'true'
+      )
+    uses: ./.github/workflows/coverage.yml
+    secrets: inherit
+
+  # Aggregator for branch protection. Lists every other job as a dependency,
+  # runs unconditionally (if: always()), and passes iff each dependency either
+  # succeeded or was legitimately skipped via the changes filter. Failing or
+  # cancelled leaves short-circuit to exit 1.
+  #
+  # Required-check on main branch protection: require ONLY "All checks passed".
+  # Single source of truth, immune to the gated-leaf trap where a skipped job
+  # never reports and blocks the PR forever.
+  all-checks-passed:
+    name: All checks passed
+    needs: [preflight, build-tenants, build-ddns, build-tunneller, coverage]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Verify no failure/cancelled among required leaves
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          set -euo pipefail
+          echo "Leaf results: ${RESULTS}"
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "::error::a required check failed"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "::error::a required check was cancelled"
+            exit 1
+          fi
+          echo "all checks succeeded or were legitimately skipped."

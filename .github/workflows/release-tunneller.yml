@@ -1,0 +1,33 @@
+name: Release Tunneller
+
+# Thin caller: a `tunneller-v*` tag (or a manual dry run) drives the shared
+# per-service release pipeline for wardnet-tunneller. The version source of
+# truth is source/crates/tunneller/Cargo.toml; the tag must equal
+# `tunneller-v<version>`.
+#
+# To cut a release: bump source/crates/tunneller/Cargo.toml `version`, commit,
+# then tag + push (e.g. `git tag tunneller-v0.1.1 && git push origin tunneller-v0.1.1`).
+# A workflow_dispatch on any ref is a dry run: builds + signs, never publishes.
+
+on:
+  push:
+    tags:
+      - "tunneller-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Release
+    permissions:
+      contents: write
+      actions: read
+      security-events: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/release-service.yml
+    with:
+      service: tunneller
+    secrets: inherit

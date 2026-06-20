@@ -1,0 +1,55 @@
+name: Detect changes
+description: >-
+  Classifies the changed paths of a push/PR into per-service buckets
+  (tenants, ddns, tunneller) plus an `all` bucket for changes that force
+  every service to rebuild. Used by the CI/PR orchestrators to gate the
+  heavy per-service reusable leaves and skip noop builds.
+
+  All filter rules live here so adding a new area is a one-file change
+  instead of editing every orchestrator.
+
+outputs:
+  all:
+    description: >-
+      'true' when shared code (common), the lockfile/manifest, xtask, the
+      e2e harness, the Makefile, or ANY CI config changed — i.e. a change
+      that can affect every service. Orchestrators treat this as
+      "run everything".
+    value: ${{ steps.filter.outputs.all }}
+  tenants:
+    description: "'true' when the tenants service crate changed."
+    value: ${{ steps.filter.outputs.tenants }}
+  ddns:
+    description: "'true' when the ddns service crate changed."
+    value: ${{ steps.filter.outputs.ddns }}
+  tunneller:
+    description: "'true' when the tunneller service crate changed."
+    value: ${{ steps.filter.outputs.tunneller }}
+
+runs:
+  using: composite
+  steps:
+    - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3.0.3
+      id: filter
+      with:
+        # `all` is the "run everything" bucket: anything cross-service
+        # (the shared `common` crate, the workspace manifest/lockfile,
+        # xtask, the e2e harness, the Makefile) plus every CI config
+        # change — a workflow/action edit can invalidate any assumption,
+        # so the only honest response is a full validation.
+        filters: |
+          all:
+            - 'source/crates/common/**'
+            - 'source/Cargo.toml'
+            - 'source/Cargo.lock'
+            - 'source/rust-toolchain.toml'
+            - 'source/xtask/**'
+            - 'source/end2end-tests/**'
+            - 'source/Makefile'
+            - '.github/**'
+          tenants:
+            - 'source/crates/tenants/**'
+          ddns:
+            - 'source/crates/ddns/**'
+          tunneller:
+            - 'source/crates/tunneller/**'

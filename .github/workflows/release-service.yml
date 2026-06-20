@@ -1,0 +1,269 @@
+name: Release Service
+
+# Reusable per-service release pipeline, parameterised by `service`. Invoked by
+# the thin tag-triggered callers (release-tenants.yml / release-ddns.yml /
+# release-tunneller.yml): push a `<service>-v*` tag and that caller runs this
+# pipeline for its service.
+#
+# The three services release INDEPENDENTLY of each other and of the daemon.
+# Each has its own SemVer tag prefix (`tenants-v*` / `ddns-v*` / `tunneller-v*`)
+# and its own version source of truth — the `version` in its crate's
+# Cargo.toml. The tag is validated against that crate version, so a tag can
+# never disagree with what was built.
+#
+# Pipeline: resolve+validate version → build (build-service.yml) →
+# preflight-deploy → publish GitHub Release → deploy (deploy-service.yml).
+#
+# A non-tag invocation (the caller's `workflow_dispatch` dry run) builds + signs
+# but stops before publishing and never deploys.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: Service name — tenants | ddns | tunneller.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  resolve:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version from ref and guard against the crate Cargo.toml
+        id: version
+        env:
+          SERVICE: ${{ inputs.service }}
+        run: |
+          set -euo pipefail
+
+          # Read `version` ONLY from within the [package] table of the service
+          # crate's Cargo.toml, so a future [workspace.package] / dependency
+          # `version = ` line (or a reorder) can't make the guard compare
+          # against the wrong string. The cloud services use pure SemVer, so the
+          # tag compares directly against the package version.
+          MANIFEST="source/crates/${SERVICE}/Cargo.toml"
+          CARGO_VERSION="$(awk -F' *= *' '
+            /^\[/        { in_pkg = ($0 == "[package]") }
+            in_pkg && $1 == "version" { gsub(/"/, "", $2); print $2; exit }
+          ' "${MANIFEST}")"
+          if [[ -z "${CARGO_VERSION}" ]]; then
+            echo "::error::could not read [package] version from ${MANIFEST}"
+            exit 1
+          fi
+
+          PREFIX="refs/tags/${SERVICE}-v"
+          if [[ "${GITHUB_REF}" == "${PREFIX}"* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            VERSION="${TAG#"${SERVICE}"-v}"
+            PUBLISH="true"
+
+            if [[ "${VERSION}" != "${CARGO_VERSION}" ]]; then
+              echo "::error::tag ${TAG} (version ${VERSION}) does not agree with ${MANIFEST} (${CARGO_VERSION}). Bump Cargo.toml and re-tag."
+              exit 1
+            fi
+          else
+            # Non-tag ref (the caller's workflow_dispatch dry run) — use the
+            # Cargo version, build + sign only, no publish/deploy.
+            TAG=""
+            VERSION="${CARGO_VERSION}"
+            PUBLISH="false"
+          fi
+
+          if [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+- ]]; then
+            PRERELEASE="true"
+          else
+            PRERELEASE="false"
+          fi
+
+          {
+            echo "tag=${TAG}"
+            echo "version=${VERSION}"
+            echo "prerelease=${PRERELEASE}"
+            echo "publish=${PUBLISH}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "${SERVICE} release version: ${VERSION} (tag=${TAG:-<dispatch>}, publish=${PUBLISH}, prerelease=${PRERELEASE})"
+
+  build:
+    name: Build ${{ inputs.service }}
+    needs: resolve
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    uses: ./.github/workflows/build-service.yml
+    with:
+      service: ${{ inputs.service }}
+    secrets: inherit
+
+  # Fail BEFORE publishing if the deploy can't possibly succeed, to avoid a
+  # half-applied release (a published GitHub Release that was never deployed).
+  # Catches a missing/misscoped bot app AND the deploy-raw-service.yml workflow
+  # not yet existing on the infra repo's default branch (repository_dispatch
+  # only runs workflows from the default branch).
+  preflight-deploy:
+    name: Preflight deploy prerequisites
+    needs: resolve
+    if: needs.resolve.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Mint infra deploy token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: wardnet-infrastructure
+
+      - name: Verify the bot app can reach the infra deploy workflow
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          INFRA_REPO: ${{ github.repository_owner }}/wardnet-infrastructure
+        run: |
+          set -euo pipefail
+          gh api "repos/${INFRA_REPO}" --jq .full_name
+          gh api "repos/${INFRA_REPO}/actions/workflows/deploy-raw-service.yml" --jq .path \
+            || { echo "::error::bot app cannot see deploy-raw-service.yml on ${INFRA_REPO} default branch (not merged yet, or app lacks actions:read)"; exit 1; }
+
+  release:
+    name: Publish GitHub Release
+    needs: [resolve, build, preflight-deploy]
+    if: needs.resolve.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      # OIDC + attestation upload for actions/attest-build-provenance.
+      id-token: write
+      attestations: write
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Download ${{ inputs.service }} aarch64
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: wardnet-${{ inputs.service }}-aarch64-unsigned
+          path: release-staging/
+
+      - name: Assemble run+binary tarball
+        env:
+          SERVICE: ${{ inputs.service }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # build-service.yml ships wardnet-<service>-aarch64.tar.gz containing
+          # just the binary. The inforge raw-service contract requires the
+          # deployed tarball's root to hold an executable `run` entrypoint plus
+          # the binary, so repack with the per-service run script as `run`.
+          BIN="wardnet-${SERVICE}"
+          WORK="staged-aarch64"
+          mkdir -p "${WORK}"
+          tar -C "${WORK}" -xzf "release-staging/${BIN}-aarch64.tar.gz"
+          install -m 0755 "source/deploy/run-${SERVICE}" "${WORK}/run"
+
+          # Sanity-guard the built binary: it must be a valid aarch64 ELF
+          # (catches a wrong-target/corrupt build before it ships). Runtime
+          # health — that the process actually comes up — is verified host-side
+          # by inforge's deploy (unit restart) which deploy-service.yml blocks on.
+          DESC="$(file -b "${WORK}/${BIN}")"
+          if ! printf '%s' "${DESC}" | grep -qiE 'ELF 64-bit.*(aarch64|ARM aarch64)'; then
+            echo "::error::built ${BIN} is not an aarch64 ELF: ${DESC}"
+            exit 1
+          fi
+
+          DST="release-staging/${BIN}-${VERSION}-aarch64.tar.gz"
+          tar -C "${WORK}" -czf "${DST}" run "${BIN}"
+          rm -rf "${WORK}" "release-staging/${BIN}-aarch64.tar.gz"
+          ls -l release-staging
+
+      - name: Sign release tarball
+        uses: ./.github/actions/sign-release-tarball
+        with:
+          tarball: release-staging/wardnet-${{ inputs.service }}-${{ needs.resolve.outputs.version }}-aarch64.tar.gz
+          comment: wardnet-${{ inputs.service }} ${{ needs.resolve.outputs.version }} (aarch64)
+          minisign-key-b64: ${{ secrets.WARDNET_MINISIGN_KEY }}
+          minisign-password: ${{ secrets.WARDNET_MINISIGN_PASSWORD }}
+
+      - name: Attest SLSA build provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: release-staging/*.tar.gz
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SERVICE: ${{ inputs.service }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          ARGS=(--verify-tag --title "wardnet-${SERVICE} ${VERSION}")
+
+          NOTES_FILE="docs/releases/${SERVICE}-v${VERSION}.md"
+          if [[ -f "${NOTES_FILE}" ]]; then
+            echo "Using release notes from ${NOTES_FILE}"
+            ARGS+=(--notes-file "${NOTES_FILE}")
+          else
+            echo "No ${NOTES_FILE} found — falling back to auto-generated notes"
+            ARGS+=(--generate-notes)
+          fi
+
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            ARGS+=(--prerelease)
+          fi
+
+          gh release create "${TAG}" "${ARGS[@]}" \
+            release-staging/*.tar.gz \
+            release-staging/*.tar.gz.sha256 \
+            release-staging/*.tar.gz.minisig
+
+  deploy:
+    name: Deploy ${{ inputs.service }}
+    needs: [resolve, release]
+    if: needs.resolve.outputs.publish == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/deploy-service.yml
+    with:
+      service: ${{ inputs.service }}
+      tag: ${{ needs.resolve.outputs.tag }}
+    secrets: inherit
