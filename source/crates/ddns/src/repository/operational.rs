@@ -121,7 +121,7 @@ const OPERATIONAL_COLS: &str =
 impl OperationalRepository for PgOperationalRepository {
     async fn find_by_id(&self, network_id: &str) -> anyhow::Result<Option<Operational>> {
         let sql = format!("SELECT {OPERATIONAL_COLS} FROM operational WHERE network_id = $1");
-        let row = sqlx::query_as::<_, OperationalRow>(&sql)
+        let row = sqlx::query_as::<_, OperationalRow>(sqlx::AssertSqlSafe(sql))
             .bind(network_id)
             .fetch_optional(&self.pools.read)
             .await?;

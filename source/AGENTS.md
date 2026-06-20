@@ -223,7 +223,7 @@ A test that needs **multiple real service binaries running together** (not just 
 
 ## SQL conventions
 
-- Query strings are `const &str` at module level — never inline in `sqlx::query(format!(...))`.
+- Query strings are `const &str` at module level; never interpolate *runtime* values into SQL (bind them with `$N`). Where a query `format!`s only a compile-time `const` column list (e.g. `format!("SELECT {NETWORK_COLS} FROM …")`), sqlx 0.9's `SqlSafeStr` bound rejects the resulting `String`, so wrap it in `sqlx::AssertSqlSafe(format!(…))` — the deliberate, audited opt-out for safe-but-dynamic SQL (real inputs are still `$N`-bound). `AssertSqlSafe` is for SQL only; connection URLs passed to `PgPool::connect`/`db::init` take a plain `&str`, not `SqlSafeStr`.
 - **PostgreSQL** stores `DateTime<Utc>` natively as `TIMESTAMPTZ` via sqlx's `chrono` feature — no `to_rfc3339()` / `.parse()` round-tripping.
 - Mutations always use `self.pools.write`; reads always use `self.pools.read`.
 - Postgres has no unsigned integers: store any unsigned counter as `INTEGER`/`BIGINT` and convert explicitly at the boundary (never `as`).

@@ -129,9 +129,9 @@ impl TunnelRouteRepository for PgTunnelRouteRepository {
     }
 
     async fn find_by_slug(&self, slug: &str) -> anyhow::Result<Option<TunnelRoute>> {
-        let row = sqlx::query_as::<_, TunnelRoute>(&format!(
+        let row = sqlx::query_as::<_, TunnelRoute>(sqlx::AssertSqlSafe(format!(
             "SELECT {ROUTE_COLS} FROM tunnel_routes WHERE slug = $1"
-        ))
+        )))
         .bind(slug)
         .fetch_optional(&self.pools.read)
         .await?;
@@ -139,9 +139,9 @@ impl TunnelRouteRepository for PgTunnelRouteRepository {
     }
 
     async fn list_owned(&self, node_addr: &str) -> anyhow::Result<Vec<TunnelRoute>> {
-        let rows = sqlx::query_as::<_, TunnelRoute>(&format!(
+        let rows = sqlx::query_as::<_, TunnelRoute>(sqlx::AssertSqlSafe(format!(
             "SELECT {ROUTE_COLS} FROM tunnel_routes WHERE node_addr = $1 ORDER BY slug"
-        ))
+        )))
         .bind(node_addr)
         .fetch_all(&self.pools.read)
         .await?;
