@@ -922,8 +922,8 @@ impl EventPublisher for RecordingEventPublisher {
 
 /// A recording [`StripeGateway`] fake: checkout/portal return canned URLs and record
 /// their calls; `construct_event` returns a pre-set [`StripeEvent`] (set by the
-/// webhook-endpoint test). No real Stripe — the signature crypto is `async-stripe`'s
-/// concern, not ours to re-test.
+/// webhook-endpoint test). No real Stripe — the signature crypto is exercised
+/// directly in `stripe::tests`, not re-tested here.
 /// A recorded `create_checkout_session` call: `(customer_id, email, price_id, tenant_id)`.
 pub type CheckoutCall = (Option<String>, String, String, String);
 

@@ -1,7 +1,7 @@
 # cargo-audit configuration (RustSec advisory DB).
 #
 # We track the latest STABLE release of every dependency (openidconnect 4.0.1,
-# jsonwebtoken 10.4, rustls 0.23, rsa 0.9.10, async-stripe 0.41.0, …). The
+# jsonwebtoken 10.4, rustls 0.23, rsa 0.9.10, …). The
 # advisories ignored below have NO fix available at any current stable version;
 # each is a transitive dependency we cannot remove and cannot upgrade past
 # without adopting a pre-release. Every entry is justified and has a concrete
@@ -19,16 +19,4 @@ ignore = [
     # *signature verification*, so practical exposure is minimal.
     # Remove when a fixed `rsa` release is published.
     "RUSTSEC-2023-0071",
-
-    # rustls-webpki 0.101.7 (reachable CRL-parsing panic + two name-constraint
-    # acceptance issues). Pulled ONLY by `async-stripe 0.41.0` (the latest
-    # stable) via its `hyper-rustls 0.24` / `rustls 0.21` runtime — the path that
-    # validates Stripe's *own* API TLS certificate. Exploiting it needs a crafted
-    # cert/CRL served from that endpoint, a low practical threat. Our mesh + daemon
-    # TLS uses rustls 0.23 → rustls-webpki 0.103.13 (unaffected). The only fix is
-    # async-stripe 1.0, currently a pre-release with a full API rewrite.
-    # Remove when async-stripe 1.0 ships stable and we migrate to it.
-    "RUSTSEC-2026-0104",
-    "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0099",
 ]

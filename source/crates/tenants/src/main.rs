@@ -84,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
     // cross-aggregate write call).
     let events: Arc<dyn EventPublisher> = Arc::new(BroadcastEventBus::new(EVENT_BUS_CAPACITY));
 
-    // Stripe gateway (real async-stripe client; the signature secret is the webhook
+    // Stripe gateway (hand-rolled reqwest client; the signature secret is the webhook
     // credential). Secrets arrive in the env via inforge, like the DSN.
     let stripe = Arc::new(StripeClient::new(
         &config.stripe_secret_key,
