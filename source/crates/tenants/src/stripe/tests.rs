@@ -315,3 +315,57 @@ fn invoice_payment_failed_reads_nested_subscription() {
         StripeEventKind::PaymentFailed { stripe_subscription_id } if stripe_subscription_id == "sub_nested"
     ));
 }
+
+// ── construct_event wrapper + constructors ──────────────────────────────────────
+
+/// A `StripeClient` whose webhook secret matches [`sign`]'s `SECRET`. The base URL is
+/// never dialed — these tests exercise the offline `construct_event` path only.
+fn offline_client() -> StripeClient {
+    StripeClient::from_url(
+        "http://stripe.invalid",
+        "sk_test",
+        SECRET,
+        "https://account.test/",
+    )
+}
+
+#[test]
+fn construct_event_verifies_signature_and_normalizes() {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "id": "evt_x",
+        "type": "customer.subscription.deleted",
+        "data": { "object": {
+            "id": "sub_x", "customer": "cus_1", "status": "canceled", "items": { "data": [] }
+        } }
+    }))
+    .unwrap();
+    let header = sign(&body, chrono::Utc::now().timestamp());
+
+    let event = offline_client().construct_event(&body, &header).unwrap();
+    assert_eq!(event.id, "evt_x");
+    assert!(matches!(
+        event.kind,
+        StripeEventKind::SubscriptionDeleted { stripe_subscription_id } if stripe_subscription_id == "sub_x"
+    ));
+}
+
+#[test]
+fn construct_event_rejects_a_bad_signature() {
+    let body = br#"{"id":"e","type":"x","data":{"object":{}}}"#;
+    let header = format!("t={},v1={}", chrono::Utc::now().timestamp(), "0".repeat(64));
+    assert!(offline_client().construct_event(body, &header).is_err());
+}
+
+#[test]
+fn construct_event_rejects_malformed_json_under_a_valid_signature() {
+    let body = b"not json at all";
+    let header = sign(body, chrono::Utc::now().timestamp());
+    let err = offline_client().construct_event(body, &header).unwrap_err();
+    assert!(err.to_string().contains("malformed Stripe webhook payload"));
+}
+
+#[test]
+fn new_constructs_a_client() {
+    // The production constructor (covers `new` -> `with_base`); never dialed here.
+    let _client = StripeClient::new("sk_live_x", "whsec_x", "https://account.example/");
+}
