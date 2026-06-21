@@ -38,9 +38,10 @@ e2e-build:
 e2e-up: e2e-certs
 	$(COMPOSE) -f $(COMPOSE_FILE) up -d --build
 
-# Run the (ignored) e2e test against a running stack.
+# Run the (ignored) e2e tests against a running stack — the tombstone flow over
+# real mesh mTLS, and the OTLP observability assertions against the collector.
 e2e-test:
-	cargo test -p wardnet-e2e-mesh --test tombstone_flow -- --ignored --nocapture
+	cargo test -p wardnet-e2e-mesh -- --ignored --nocapture
 
 e2e-down:
 	$(COMPOSE) -f $(COMPOSE_FILE) down -v

@@ -63,6 +63,7 @@ impl TenantsWorkQueue {
 
 #[async_trait]
 impl WorkQueue for TenantsWorkQueue {
+    #[tracing::instrument(skip(self), fields(provisioning_state = state, region))]
     async fn list(
         &self,
         state: &str,
@@ -78,31 +79,25 @@ impl WorkQueue for TenantsWorkQueue {
             limit: Some(limit),
         };
 
-        let resp = self
-            .mesh
-            .current()
-            .get(&url)
-            .query(&query)
-            .send()
-            .await?
-            .error_for_status()?;
+        // Build → inject W3C trace context → execute, so Tenants continues this trace.
+        let client = self.mesh.current();
+        let request = client.get(&url).query(&query).build()?;
+        let request = wardnet_common::telemetry::inject_trace_context(request);
+        let resp = client.execute(request).await?.error_for_status()?;
         let networks = resp.json::<Vec<NetworkView>>().await?;
         Ok(networks)
     }
 
+    #[tracing::instrument(skip(self))]
     async fn transition(&self, id: &str, target: &str) -> anyhow::Result<()> {
         let url = format!("{}/v1/networks/{id}", self.base_url);
         let body = TransitionRequest {
             provisioning_state: target.to_string(),
         };
-        let resp = self
-            .mesh
-            .current()
-            .patch(&url)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?;
+        let client = self.mesh.current();
+        let request = client.patch(&url).json(&body).build()?;
+        let request = wardnet_common::telemetry::inject_trace_context(request);
+        let resp = client.execute(request).await?.error_for_status()?;
         let status = resp.status();
         if status != reqwest::StatusCode::NO_CONTENT {
             anyhow::bail!("unexpected status {status} transitioning network {id} to {target}");

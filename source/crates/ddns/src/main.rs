@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use wardnet_common::config as common_config;
 use wardnet_common::mtls::{ExpectedPeer, MeshClient};
 use wardnet_common::{mtls, serve, token};
@@ -18,10 +17,9 @@ use wardnet_ddns::{
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::registry()
-        .with(fmt::layer().json())
-        .with(EnvFilter::from_default_env())
-        .init();
+    // Telemetry (logs + metrics + traces over OTLP); opt-in by endpoint. Held for
+    // the lifetime of `main` so the final batch flushes on exit.
+    let _telemetry = wardnet_common::telemetry::init("wardnet-ddns", env!("CARGO_PKG_VERSION"));
 
     // rustls 0.23 needs a process-default crypto provider before any TLS (the
     // mesh client) is built.

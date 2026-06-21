@@ -10,6 +10,10 @@ real service binaries — no mocks on the mesh path. It stands up:
 - **`cloudflare`** — a [wiremock](https://wiremock.org/) standing in for the
   Cloudflare v4 API, so the harness never touches a real zone. `ddns` is pointed at
   it via the `CLOUDFLARE_API_BASE` override.
+- **`otel-lgtm`** — the bundled OTLP collector + Prometheus/Tempo/Loki. `tenants`
+  and `ddns` export logs/metrics/traces to it (`OTEL_EXPORTER_OTLP_ENDPOINT`); its
+  query APIs are exposed to the host (Prometheus `:19090`, Tempo `:13200`, Loki
+  `:13100`, Grafana UI `:13000`).
 
 The mesh leaves (SPIFFE URI SAN only, no DNS SAN), the trust bundle, and a dev JWT
 keypair are minted by the `xtask` cert generator and mounted read-only at the
@@ -32,6 +36,12 @@ Tenant/network and operational-IP state are seeded directly via SQL; the daemon
 enrollment flow is covered by the unit/api tests, not here. The single `DELETE`
 is issued over a raw socket with a PROXY v1 preamble (the API listener requires
 one — invariant #13).
+
+`tests/observability.rs` proves the **OTLP pipeline** end to end against a real
+collector: it queries the `otel-lgtm` Prometheus/Loki/Tempo APIs and asserts the
+running services' three signals landed — the `tenants` tombstone-sweep **metric**,
+`wardnet-tenants` **logs**, and `wardnet-ddns` **traces** (the provisioner's
+instrumented work-queue reads). Both `#[ignore]`d tests run under `make e2e-test`.
 
 ## Running it
 

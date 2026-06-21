@@ -32,8 +32,16 @@ pub async fn provisioner(
     subdomain_parent: String,
     interval: Duration,
 ) {
+    // Bounded-cardinality domain metric: networks fully provisioned (A record
+    // published + transitioned to active). No per-network labels — plan §5a. Built
+    // once for the lifetime of the loop, not rebuilt per tick.
+    let provisioned = opentelemetry::global::meter(wardnet_common::telemetry::SCOPE)
+        .u64_counter("ddns.networks.provisioned")
+        .with_description("Networks the provisioner published an A record for and activated.")
+        .build();
+
     loop {
-        provisioner_tick(&work, &ddns, &op, &region, &subdomain_parent).await;
+        provisioner_tick(&work, &ddns, &op, &region, &subdomain_parent, &provisioned).await;
         tokio::time::sleep(interval).await;
     }
 }
@@ -45,6 +53,7 @@ async fn provisioner_tick(
     op: &Arc<dyn OperationalRepository>,
     region: &str,
     subdomain_parent: &str,
+    provisioned: &opentelemetry::metrics::Counter<u64>,
 ) {
     let mut after: Option<String> = None;
     loop {
@@ -86,6 +95,8 @@ async fn provisioner_tick(
             }
             if let Err(e) = work.transition(&net.id, "active").await {
                 tracing::error!(network_id = %net.id, error = %e, "provisioner: report active failed; retry next tick");
+            } else {
+                provisioned.add(1, &[]);
             }
         }
         if !full {

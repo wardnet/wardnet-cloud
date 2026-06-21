@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use std::collections::HashMap;
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+
 use wardnet_common::config as common_config;
 use wardnet_common::event::{BroadcastEventBus, EventPublisher};
 use wardnet_common::{mtls, serve, token};
@@ -38,10 +38,9 @@ const EVENT_BUS_CAPACITY: usize = 1024;
 #[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::registry()
-        .with(fmt::layer().json())
-        .with(EnvFilter::from_default_env())
-        .init();
+    // Telemetry (logs + metrics + traces over OTLP); opt-in by endpoint. Held for
+    // the lifetime of `main` so the final batch flushes on exit.
+    let _telemetry = wardnet_common::telemetry::init("wardnet-tenants", env!("CARGO_PKG_VERSION"));
 
     // rustls 0.23 needs a process-default crypto provider before any TLS work —
     // the internal mesh-mTLS work-queue listener relies on it.
@@ -278,11 +277,33 @@ async fn build_identity_providers(
 /// first tick fires immediately, then every `interval`. N-replica-safe (the delete is
 /// idempotent), so every node may run it.
 async fn sweep_loop(service: Arc<TenantsService>, interval: std::time::Duration) {
+    use opentelemetry::{KeyValue, global};
+
+    // Bounded-cardinality domain metrics (no per-tenant labels — plan §5a):
+    // `deleted` counts reclaimed tenants; `runs` counts passes labelled
+    // `result=ok|error` so operators can alert on the sweep *failure* rate, not
+    // just successes.
+    let meter = global::meter(wardnet_common::telemetry::SCOPE);
+    let deleted = meter
+        .u64_counter("tenants.tombstone_sweep.deleted")
+        .with_description("Tombstoned tenants FK-cascade-deleted by the sweep loop.")
+        .build();
+    let runs = meter
+        .u64_counter("tenants.tombstone_sweep.runs")
+        .with_description("Tombstone sweep passes, labelled by result.")
+        .build();
     let mut tick = tokio::time::interval(interval);
     loop {
         tick.tick().await;
-        if let Err(e) = service.sweep_deregistered().await {
-            tracing::error!(error = %e, "tombstone sweep failed");
+        match service.sweep_deregistered().await {
+            Ok(n) => {
+                deleted.add(n, &[]);
+                runs.add(1, &[KeyValue::new("result", "ok")]);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "tombstone sweep failed");
+                runs.add(1, &[KeyValue::new("result", "error")]);
+            }
         }
     }
 }

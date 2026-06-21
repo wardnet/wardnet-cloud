@@ -16,6 +16,14 @@ use crate::work_queue::{NetworkView, WorkQueue};
 const REGION: &str = "use1";
 const PARENT: &str = "my.wardnet.services";
 
+/// A throwaway counter for the `provisioned` metric arg — these tests assert
+/// reconcile behaviour, not metrics, so the recorded value is irrelevant.
+fn test_counter() -> opentelemetry::metrics::Counter<u64> {
+    opentelemetry::global::meter("test")
+        .u64_counter("test.provisioned")
+        .build()
+}
+
 fn view(id: &str, slug: &str, state: &str) -> NetworkView {
     NetworkView {
         id: id.to_string(),
@@ -43,7 +51,7 @@ async fn provisioner_publishes_and_reports_active_when_ip_present() {
 
     let work_dyn: Arc<dyn WorkQueue> = Arc::new(work.clone());
     let op_dyn: Arc<dyn OperationalRepository> = Arc::new(op.clone());
-    provisioner_tick(&work_dyn, &svc, &op_dyn, REGION, PARENT).await;
+    provisioner_tick(&work_dyn, &svc, &op_dyn, REGION, PARENT, &test_counter()).await;
 
     assert_eq!(dns.a_creates(), 1, "the A record was published");
     assert_eq!(
@@ -69,7 +77,7 @@ async fn provisioner_skips_network_without_an_ip() {
 
     let work_dyn: Arc<dyn WorkQueue> = Arc::new(work.clone());
     let op_dyn: Arc<dyn OperationalRepository> = Arc::new(op.clone());
-    provisioner_tick(&work_dyn, &svc, &op_dyn, REGION, PARENT).await;
+    provisioner_tick(&work_dyn, &svc, &op_dyn, REGION, PARENT, &test_counter()).await;
 
     assert_eq!(dns.a_creates(), 0, "nothing published without an IP");
     assert!(
@@ -144,7 +152,7 @@ async fn provisioner_does_not_crash_when_transition_fails() {
 
     let work_dyn: Arc<dyn WorkQueue> = Arc::new(work.clone());
     let op_dyn: Arc<dyn OperationalRepository> = Arc::new(op.clone());
-    provisioner_tick(&work_dyn, &svc, &op_dyn, REGION, PARENT).await;
+    provisioner_tick(&work_dyn, &svc, &op_dyn, REGION, PARENT, &test_counter()).await;
 
     assert_eq!(
         dns.a_creates(),
@@ -178,7 +186,7 @@ async fn run_provisioner_over(total: usize, with_ip: bool) -> (MockDnsProvider, 
     ));
     let work_dyn: Arc<dyn WorkQueue> = Arc::new(work.clone());
     let op_dyn: Arc<dyn OperationalRepository> = Arc::new(op.clone());
-    provisioner_tick(&work_dyn, &svc, &op_dyn, REGION, PARENT).await;
+    provisioner_tick(&work_dyn, &svc, &op_dyn, REGION, PARENT, &test_counter()).await;
     (dns, work)
 }
 

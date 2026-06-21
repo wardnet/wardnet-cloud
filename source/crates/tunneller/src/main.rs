@@ -1,8 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
-
 use wardnet_common::config as common_config;
 use wardnet_common::mtls::{ExpectedPeer, MeshClient, ReloadableServerConfig, SpiffeId};
 use wardnet_common::{mtls, serve, token};
@@ -33,10 +31,10 @@ type MeshSetup = (
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::registry()
-        .with(fmt::layer().json())
-        .with(EnvFilter::from_default_env())
-        .init();
+    // Telemetry (logs + metrics + traces over OTLP); opt-in by endpoint. Held for
+    // the lifetime of `main` so the final batch flushes on exit.
+    let _telemetry =
+        wardnet_common::telemetry::init("wardnet-tunneller", env!("CARGO_PKG_VERSION"));
 
     // rustls 0.23 needs a process-default crypto provider before any TLS work (the
     // mesh client, the forward listener/dialer); idempotent.
@@ -56,6 +54,17 @@ async fn main() -> anyhow::Result<()> {
     let routes: Arc<dyn TunnelRouteRepository> =
         Arc::new(PgTunnelRouteRepository::new_pools(pools));
     let registry = Arc::new(TunnelRegistry::new());
+
+    // Domain metric: tunnels currently registered on this node (bounded scalar, no
+    // labels — plan §5a). An observable gauge polled by the meter on each export.
+    {
+        let registry = Arc::clone(&registry);
+        opentelemetry::global::meter(wardnet_common::telemetry::SCOPE)
+            .u64_observable_gauge("tunneller.active_tunnels")
+            .with_description("Tunnels currently registered on this node.")
+            .with_callback(move |observer| observer.observe(registry.active_count(), &[]))
+            .build();
+    }
 
     // Mesh mTLS consumers (Tenants reader, inter-node forwarder, forward acceptor
     // config) + the rotation watcher; `own_id` carries this node's scope/service.

@@ -47,9 +47,14 @@ impl TenantsClient {
     }
 
     /// `GET {base}{path}` over mTLS, mapping `200 → Some`, `404 → None`.
+    #[tracing::instrument(skip(self))]
     async fn get_resource<T: DeserializeOwned>(&self, path: &str) -> anyhow::Result<Option<T>> {
         let url = format!("{}{path}", self.base_url);
-        let resp = self.mesh.current().get(&url).send().await?;
+        // Build → inject W3C trace context → execute, so Tenants continues this trace.
+        let client = self.mesh.current();
+        let request = client.get(&url).build()?;
+        let request = wardnet_common::telemetry::inject_trace_context(request);
+        let resp = client.execute(request).await?;
         match resp.status() {
             StatusCode::OK => Ok(Some(resp.json::<T>().await?)),
             StatusCode::NOT_FOUND => Ok(None),

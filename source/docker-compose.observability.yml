@@ -1,0 +1,26 @@
+# Optional local observability backend for verifying the OTLP pipeline end-to-end
+# WITHOUT a Grafana Cloud account. `grafana/otel-lgtm` bundles an OTel Collector +
+# Prometheus (metrics) + Tempo (traces) + Loki (logs) + Grafana (UI) in one image.
+#
+#   docker compose -f docker-compose.observability.yml up
+#
+# Then point a service at it and exercise it:
+#
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
+#   INFORGE_SERVICE_NAMESPACE=wardnet INFORGE_INSTANCE_ID=tenants-dev-0 \
+#   INFORGE_HOST_ID=dev-node-0 INFORGE_DEPLOYMENT_ENV=local \
+#   INFORGE_DEPLOYMENT_REGION_SLUG=dev RUST_LOG=info \
+#   cargo run -p wardnet-tenants
+#
+# (Leave OTEL_AUTH_TOKEN_PATH unset — the local collector needs no auth.) Open
+# Grafana at http://localhost:3000 (anonymous admin) and check the Tempo / Prometheus
+# / Loki data sources for traces, metrics, and logs. In production the only change is
+# pointing OTEL_EXPORTER_OTLP_ENDPOINT at the Grafana Cloud OTLP gateway and projecting
+# the instanceID:token secret at OTEL_AUTH_TOKEN_PATH (inforge) — no code change.
+services:
+  otel-lgtm:
+    image: grafana/otel-lgtm:latest
+    ports:
+      - "3000:3000" # Grafana UI
+      - "4317:4317" # OTLP/gRPC
+      - "4318:4318" # OTLP/HTTP (what the services export to)

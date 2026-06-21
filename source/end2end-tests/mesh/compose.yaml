@@ -41,17 +41,34 @@ services:
     volumes:
       - ./wiremock/mappings:/home/wiremock/mappings:ro
 
+  # OTLP collector + backends (Grafana / Prometheus / Tempo / Loki) bundled in one
+  # image. Tenants and DDNS export to it over OTLP/HTTP (`otel-lgtm:4318`); the
+  # observability test queries the Prometheus / Tempo / Loki HTTP APIs (exposed to
+  # the host) to assert the three signals actually landed. Stands in for Grafana
+  # Cloud — the only production difference is the OTLP endpoint URL.
+  otel-lgtm:
+    image: grafana/otel-lgtm:latest
+    ports:
+      - "13000:3000" # Grafana UI (manual inspection)
+      - "19090:9090" # Prometheus query API
+      - "13200:3200" # Tempo query API
+      - "13100:3100" # Loki query API
+
   tenants:
     build:
       context: ../..
       dockerfile: crates/tenants/Dockerfile
-    depends_on:
-      pg-global:
-        condition: service_healthy
     environment:
       GLOBAL_DATABASE_URL: postgres://postgres:postgres@pg-global:5432/postgres
       INFORGE_DEPLOYMENT_REGION_SLUG: use1
       KNOWN_REGIONS: use1
+      # WS-G billing + WS-F web-auth config. Dummies — neither Stripe nor the
+      # cookie jar is exercised by the mesh/observability flow, but Config::from_env
+      # requires them, so the service can't boot without them.
+      ACCOUNT_BASE_URL: http://tenants
+      STRIPE_SECRET_KEY: sk_test_e2e_dummy
+      STRIPE_WEBHOOK_SECRET: whsec_e2e_dummy
+      COOKIE_KEY: e2e-cookie-key-with-enough-entropy-to-exceed-sixty-four-bytes-xxxxxx
       API_LISTEN_ADDR: 0.0.0.0:80
       MESH_LISTEN_ADDR: 0.0.0.0:9443
       MTLS_TRUST_BUNDLE_PATH: /certs/bundle.pem
@@ -62,6 +79,21 @@ services:
       # Fast sweep so the tombstone is reaped within the test's poll window.
       TENANT_SWEEP_INTERVAL_SECS: "2"
       RUST_LOG: info
+      # Observability: export OTLP to the bundled collector. Short metric interval
+      # so the periodic reader flushes within the observability test's poll window.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-lgtm:4318
+      OTEL_METRIC_EXPORT_INTERVAL: "3000"
+      # INFORGE-injected resource identity (dummies here; `region` comes from
+      # INFORGE_DEPLOYMENT_REGION_SLUG above).
+      INFORGE_SERVICE_NAMESPACE: wardnet
+      INFORGE_INSTANCE_ID: tenants-e2e-0
+      INFORGE_HOST_ID: e2e-node-0
+      INFORGE_DEPLOYMENT_ENV: e2e
+    depends_on:
+      pg-global:
+        condition: service_healthy
+      otel-lgtm:
+        condition: service_started
     volumes:
       - ./certs:/certs:ro
     ports:
@@ -77,6 +109,8 @@ services:
       tenants:
         condition: service_started
       cloudflare:
+        condition: service_started
+      otel-lgtm:
         condition: service_started
     environment:
       DATABASE_URL: postgres://postgres:postgres@pg-regional:5432/postgres
@@ -97,5 +131,14 @@ services:
       REAPER_INTERVAL_SECS: "2"
       REAPER_JITTER_SECS: "0"
       RUST_LOG: info
+      # Observability: export OTLP to the bundled collector (short metric interval).
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-lgtm:4318
+      OTEL_METRIC_EXPORT_INTERVAL: "3000"
+      # INFORGE-injected resource identity (dummies here; `region` comes from
+      # INFORGE_DEPLOYMENT_REGION_SLUG above).
+      INFORGE_SERVICE_NAMESPACE: wardnet
+      INFORGE_INSTANCE_ID: ddns-e2e-0
+      INFORGE_HOST_ID: e2e-node-0
+      INFORGE_DEPLOYMENT_ENV: e2e
     volumes:
       - ./certs:/certs:ro

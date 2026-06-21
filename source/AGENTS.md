@@ -27,6 +27,20 @@ Conventions and invariants for agents working inside `source/`.
 > `ExpectedPeer{service,scope}`. `ServiceIdentity` is now structured
 > `{trust_domain,env,scope,service}`. See `docs/adr/0005` and invariants #18/#19.
 >
+> **WS-K (2026-06-20):** cloud-side OpenTelemetry observability landed. Logs + metrics + traces
+> ship over OTLP to Grafana Cloud (free tier); the backend is a single env var so it is
+> **vendor-neutral** and **opt-in** — with `OTEL_EXPORTER_OTLP_ENDPOINT` unset the services
+> keep their prior stdout-JSON behaviour unchanged. Each service now calls
+> `wardnet_common::telemetry::init(service_name, version)` in `main` (replacing the hand-rolled
+> `tracing_subscriber` registry) and holds the returned `TelemetryGuard` for the process
+> lifetime (Drop flushes via `shutdown_with_timeout(3 s)`). A shared
+> `telemetry::install_http_layers(router)` mounts RED-metrics middleware + inbound
+> `traceparent` extraction + an INFO-level TraceLayer on every service router. Domain meters
+> added: tenants tombstone-sweep counters, a ddns provisioned counter, and a tunneller
+> active-tunnel gauge. Outbound `traceparent` injection for distributed traces: DDNS
+> work-queue and Tunneller mesh client each call `telemetry::inject_trace_context`. See
+> invariants #26 and #27.
+
 > **WS-G (2026-06-18):** billing landed. Entitlement is **granted by a `subscriptions`
 > aggregate** (not the tenant — `tenants` is identity-only now), with a card-less
 > managed **trial** + grace windows; **Stripe** drives the paid lifecycle (webhook +
@@ -72,8 +86,9 @@ e2e scenario; see "Cross-service end-to-end tests" below):
   `client_config_from_pem`/`mesh_client` initiator side, `server_config_from_pem` + `peer_spiffe_id`
   acceptor side, the hot-reload holders `MeshClient`/`ReloadableServerConfig`, and `watch_mesh_files`),
   the in-process `event` bus (`EventPublisher` / `BroadcastEventBus` / `DomainEvent` — the
-  cross-aggregate decoupling substrate, invariant #23), generic `health::register`, and the
-  env-`config` helpers. (The old `pow` module is gone — enrollment is now a one-time email code, ADR-0009.)
+  cross-aggregate decoupling substrate, invariant #23), generic `health::register`, the
+  env-`config` helpers, and `telemetry` (OTLP init + HTTP middleware — see invariants #26/#27).
+  (The old `pow` module is gone — enrollment is now a one-time email code, ADR-0009.)
 - **`crates/tenants`** (bin `wardnet-tenants`, lib `wardnet_tenants`) — the global identity/naming
   service, carved out of `cloud` in WS-B. Owns the tenant/network/daemon/enrollment repos, the JWT
   `Signer`, `TenantsService`, and the **global Tenants DB** (its `migrations/` — moved from cloud's
@@ -186,6 +201,10 @@ do not pin versions per-crate. Lints come from `[workspace.lints.clippy]` (pedan
 24. **Stripe is reached behind the `StripeGateway` trait; the webhook is a self-verifying bootstrap endpoint.** `async-stripe` (rustls runtime, openssl-free) is the production gateway; tests use a recording fake, so `SubscriptionService` (and `apply_stripe_event`) never touch `async-stripe`. `POST /v1/billing/stripe/webhook` carries no JWT layer — the **`Stripe-Signature` header is the credential**, verified in the handler (`security(())`), and applies idempotently via the `processed_stripe_events` ledger (Stripe redelivers). Stripe/Resend secrets (`STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` / `RESEND_API_KEY`) arrive in the env via inforge like the DSN, are redacted in `Config`'s `Debug`, and use dummies in dev/test.
 
 25. **Web auth: session-cookie anchor, minted-JWT API, verified-email two-gate, store only hashes.** A `USER` principal **is** the tenant (1:1, `sub = tenant_id`); a human's login methods (`password` = argon2id, or a linked `google`/`github`) are rows in `tenant_identities`, each resolving to its tenant by a **provider-verified email** with two gates (gate 1: `email_verified` / a one-time code proves the inbox; gate 2: match→auto-link, no-match→web-first signup via `TenantsService::register_tenant`). Tenant creation therefore **only ever happens at a credential-proving moment** — never under `USER` auth (`register_tenant`/`POST /v1/tenants` is gone). The browser credential is a revocable server-side `sessions` row behind an httpOnly+Secure+SameSite cookie (30-day sliding, `axum-extra` private jar); the SPA exchanges it via `POST /v1/auth/token` for a 5-min `USER` JWT held only in memory. **Revocation (deleting the session row), not JWT TTL, is the primary hijack defence**; password-reset and deregister both force-logout by deleting the tenant's sessions. A **deregistered tenant can never receive a new session or exchange an existing one**: `create_session` pre-checks `TenantsService::tenant_is_live`, and the `touch_and_get_tenant` SQL adds `deregistered_at IS NULL` so the exchange is live-tenant-only even before the identities reactor purges the row. **Password login is throttled per source IP** (in-memory, `LOGIN_ATTEMPTS_PER_IP` attempts per `LOGIN_WINDOW_SECS`-second window in `IdentitiesService`; `IdentitiesError::RateLimited` → HTTP 429); this is defence-in-depth per replica, not a distributed quota. **Store only hashes** (invariant #1, extended): `sessions.token_hash` is `hex(SHA-256(token))` and `tenant_identities.secret_hash` is an argon2id PHC string — never the raw token or password, never logged or echoed. Federated login is backend-orchestrated with `state`/PKCE in a short-lived signed cookie; Google (full OIDC, `openidconnect`) and GitHub (OAuth2, `reqwest`) sit behind the `ExternalIdentityProvider` trait. Cookie key + OAuth client secrets are inforge-injected, redacted in `Config`'s `Debug`, dummies in dev/test. See `docs/adr/0009`.
+
+26. **Observability is opt-in by `OTEL_EXPORTER_OTLP_ENDPOINT`; the OTLP auth credential comes from a tmpfs file, never an env var.** Call `wardnet_common::telemetry::init(service_name, version)` once in `main` and hold the returned `TelemetryGuard` for the process lifetime — it flushes the final OTLP batch on Drop. With the endpoint env var unset the call is a no-op (stdout JSON logging only, exact prior behaviour). The Grafana Cloud Basic-auth credential (`instanceID:token`) is read from the tmpfs file pointed to by `OTEL_AUTH_TOKEN_PATH` via `config::read_secret_file` (consistent with invariant #9 — no secrets in env). Logs and traces are filtered on **independent** axes: `RUST_LOG` governs log signals (stdout JSON + OTLP logs); `OTEL_TRACES_FILTER` (default `info`) governs the spans-as-traces layer. Do **not** collapse them back into a single global `EnvFilter`. Call `telemetry::install_http_layers(router)` in every service's `api/mod.rs` to mount the RED-metrics middleware + inbound `traceparent` extraction + the INFO-level `TraceLayer`.
+
+27. **Metric label cardinality is bounded — never put unbounded identifiers on a metric label.** The RED histogram (`http.server.request.duration`, seconds, seconds-scale buckets) is labelled with the matched route **template** (via `MatchedPath`, never the raw path), method, and status code only. Domain meters (sweep counters, provisioned counter, active-tunnel gauge) carry only small enum values or no labels at all. `tenant_id`, `network_id`, `daemon_id`, slug, IP address, request-id, and any other unbounded identifier go on **traces and logs**, not metric labels. The SDK default histogram boundaries are millisecond-scale; always override to seconds-scale boundaries (e.g. `[0.005 .. 10.0]`) when recording durations in seconds.
 
 ## Test placement
 
