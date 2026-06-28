@@ -70,7 +70,7 @@ jobs:
           cache-key: ${{ inputs.service }}
 
       - name: Install clippy SARIF tooling
-        uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
         with:
           tool: clippy-sarif,sarif-fmt
 
