@@ -101,6 +101,10 @@ fn resource_carries_the_inforge_identity_attributes() {
         std::env::set_var("INFORGE_SERVICE_NAMESPACE", "wardnet");
         std::env::set_var("INFORGE_INSTANCE_ID", "tenants-test-7");
         std::env::set_var("INFORGE_HOST_ID", "node-3");
+        std::env::set_var("INFORGE_HOST_TYPE", "cx23");
+        std::env::set_var("INFORGE_CLOUD_PROVIDER", "hetzner");
+        std::env::set_var("INFORGE_CLOUD_REGION", "us-east");
+        std::env::set_var("INFORGE_CLOUD_AVAILABILITY_ZONE", "ash");
         std::env::set_var("INFORGE_DEPLOYMENT_ENV", "test");
         std::env::set_var("INFORGE_DEPLOYMENT_REGION_SLUG", "use1");
     }
@@ -120,6 +124,10 @@ fn resource_carries_the_inforge_identity_attributes() {
         Some("tenants-test-7")
     );
     assert_eq!(attr("host.id").as_deref(), Some("node-3"));
+    assert_eq!(attr("host.type").as_deref(), Some("cx23"));
+    assert_eq!(attr("cloud.provider").as_deref(), Some("hetzner"));
+    assert_eq!(attr("cloud.region").as_deref(), Some("us-east"));
+    assert_eq!(attr("cloud.availability_zone").as_deref(), Some("ash"));
     assert_eq!(attr("deployment.environment.name").as_deref(), Some("test"));
     assert_eq!(attr("region").as_deref(), Some("use1"));
 
@@ -127,6 +135,10 @@ fn resource_carries_the_inforge_identity_attributes() {
         std::env::remove_var("INFORGE_SERVICE_NAMESPACE");
         std::env::remove_var("INFORGE_INSTANCE_ID");
         std::env::remove_var("INFORGE_HOST_ID");
+        std::env::remove_var("INFORGE_HOST_TYPE");
+        std::env::remove_var("INFORGE_CLOUD_PROVIDER");
+        std::env::remove_var("INFORGE_CLOUD_REGION");
+        std::env::remove_var("INFORGE_CLOUD_AVAILABILITY_ZONE");
         std::env::remove_var("INFORGE_DEPLOYMENT_ENV");
         std::env::remove_var("INFORGE_DEPLOYMENT_REGION_SLUG");
     }
