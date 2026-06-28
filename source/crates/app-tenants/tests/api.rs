@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 use wardnet_billing::gateway::{StripeEvent, StripeEventKind, SubscriptionData};
-use wardnet_common::contract::SubscriptionStatus;
+use wardnet_common::contract::{InvoiceStatus, InvoiceView, PaymentMethodView, SubscriptionStatus};
 use wardnet_common::token::{ClaimsSpec, PrincipalType, canonical_request_payload};
 use wardnet_tenants::api;
 use wardnet_tenants::repository::tenant::Tenant;
@@ -396,6 +396,111 @@ async fn checkout_session_returns_stripe_url() {
     assert_eq!(checkouts[0].1, "owner@b.com");
     assert_eq!(checkouts[0].2, "price_pro");
     assert_eq!(checkouts[0].3, "tb");
+}
+
+/// GET the billing read endpoint at `path` for `tenant`, authenticated as `token`'s owner.
+async fn billing_get(app: &Router, path: &str, token: &str) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(path)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn payment_method_returns_card_for_tenant_with_customer() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    h.store.seed_billing_customer("tb", "cus_b");
+    h.stripe.set_payment_method(PaymentMethodView {
+        brand: "visa".to_string(),
+        last4: "4242".to_string(),
+        exp_month: 8,
+        exp_year: 2027,
+    });
+
+    let resp = billing_get(
+        &app,
+        "/v1/tenants/tb/billing/payment-method",
+        &user_token("tb"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["brand"], json!("visa"));
+    assert_eq!(body["last4"], json!("4242"));
+    assert_eq!(body["exp_month"], json!(8));
+    assert_eq!(body["exp_year"], json!(2027));
+}
+
+#[tokio::test]
+async fn payment_method_is_null_for_trial_tenant_without_customer() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    // No billing_customer seeded → no provider customer; must be null, never a 5xx.
+    let resp = billing_get(
+        &app,
+        "/v1/tenants/tt/billing/payment-method",
+        &user_token("tt"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await, Value::Null);
+}
+
+#[tokio::test]
+async fn invoices_returns_rows_for_tenant_with_customer() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    h.store.seed_billing_customer("tb", "cus_b");
+    h.stripe.set_invoices(vec![InvoiceView {
+        date: "2026-06-01".to_string(),
+        amount_cents: 800,
+        currency: "usd".to_string(),
+        status: InvoiceStatus::Paid,
+        hosted_url: Some("https://invoice.stripe.test/i/1".to_string()),
+    }]);
+
+    let resp = billing_get(&app, "/v1/tenants/tb/billing/invoices", &user_token("tb")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body[0]["date"], json!("2026-06-01"));
+    assert_eq!(body[0]["amount_cents"], json!(800));
+    assert_eq!(body[0]["currency"], json!("usd"));
+    assert_eq!(body[0]["status"], json!("paid"));
+    assert_eq!(
+        body[0]["hosted_url"],
+        json!("https://invoice.stripe.test/i/1")
+    );
+}
+
+#[tokio::test]
+async fn invoices_is_empty_for_trial_tenant_without_customer() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    let resp = billing_get(&app, "/v1/tenants/tt/billing/invoices", &user_token("tt")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await, json!([]));
+}
+
+#[tokio::test]
+async fn billing_reads_reject_other_tenants_token() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    h.store.seed_billing_customer("tb", "cus_b");
+    // A USER token for a different tenant must not read tb's billing data.
+    let other = user_token("other");
+    let pm = billing_get(&app, "/v1/tenants/tb/billing/payment-method", &other).await;
+    assert_eq!(pm.status(), StatusCode::FORBIDDEN);
+    let inv = billing_get(&app, "/v1/tenants/tb/billing/invoices", &other).await;
+    assert_eq!(inv.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

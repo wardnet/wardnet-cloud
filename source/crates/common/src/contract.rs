@@ -359,6 +359,49 @@ pub struct BillingPortalResponse {
     pub url: String,
 }
 
+/// The tenant's default payment-method summary, read back from the provider for
+/// `GET /v1/tenants/{id}/billing/payment-method`.
+///
+/// These fields are **not** PAN/CVC — `last4`/`brand`/`exp_*` are safe to read and render
+/// (SAQ-A preserved; card *entry* still happens only through hosted Checkout/Portal). The
+/// endpoint returns `null` when the tenant has no provider customer / default card yet.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PaymentMethodView {
+    /// Card brand, e.g. `"visa"`.
+    pub brand: String,
+    /// The last four digits of the card number, e.g. `"4242"`.
+    pub last4: String,
+    /// Expiry month, `1`–`12`.
+    pub exp_month: u32,
+    /// Expiry year, four digits, e.g. `2027`.
+    pub exp_year: u32,
+}
+
+/// Provider-agnostic invoice lifecycle status (mapped from the provider's own set).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, utoipa::ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InvoiceStatus {
+    Paid,
+    Open,
+    Void,
+    Uncollectible,
+}
+
+/// One invoice row for `GET /v1/tenants/{id}/billing/invoices` (newest first in the list).
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct InvoiceView {
+    /// Invoice creation date as `YYYY-MM-DD`.
+    pub date: String,
+    /// Amount in the currency's minor units (e.g. cents); the SPA formats for display.
+    pub amount_cents: i64,
+    /// ISO-4217 currency code, lowercase (e.g. `"usd"`), as the provider reports it.
+    pub currency: String,
+    /// Provider-agnostic status.
+    pub status: InvoiceStatus,
+    /// The provider-hosted invoice/receipt URL (the download action); `None` if absent.
+    pub hosted_url: Option<String>,
+}
+
 // ── Tenants — mesh / SERVICE plane (work queue) ─────────────────────────────────
 
 /// Query for the reconcile scan (`GET /v1/networks`, mesh-mTLS plane). The

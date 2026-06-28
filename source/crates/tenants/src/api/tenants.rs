@@ -14,7 +14,8 @@ use utoipa_axum::routes;
 use wardnet_common::auth::{AuthCaller, Caller};
 use wardnet_common::contract::{
     BillingPortalResponse, CheckoutSessionResponse, CodeResponse, CreateCheckoutSessionRequest,
-    DaemonView, MeView, NetworkView, SubscriptionView, TenantView, UpdateTenantRequest,
+    DaemonView, InvoiceView, MeView, NetworkView, PaymentMethodView, SubscriptionView, TenantView,
+    UpdateTenantRequest,
 };
 
 use crate::error::ApiError;
@@ -33,6 +34,8 @@ pub fn register(router: OpenApiRouter<AppState>) -> OpenApiRouter<AppState> {
         .routes(routes!(delete_network))
         .routes(routes!(create_checkout_session))
         .routes(routes!(billing_portal))
+        .routes(routes!(get_payment_method))
+        .routes(routes!(list_invoices))
 }
 
 // ── Domain → contract conversions (orphan rule OK: the domain type is local) ───
@@ -305,4 +308,42 @@ async fn billing_portal(
     require_owner(&caller, &id)?;
     let url = state.billing().billing_portal(&id).await?;
     Ok(Json(BillingPortalResponse { url }))
+}
+
+#[utoipa::path(
+    get, path = "/v1/tenants/{id}/billing/payment-method", tag = "tenants",
+    description = "The tenant's default payment-method summary, or null. Read-only and \
+                   provider-proxied; never PAN/CVC (SAQ-A).",
+    responses(
+        (status = 200, description = "Payment method summary, or null", body = Option<PaymentMethodView>),
+        (status = 401, description = "Unauthenticated"),
+        (status = 403, description = "Not your tenant"),
+    ),
+)]
+async fn get_payment_method(
+    State(state): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+    Path(id): Path<String>,
+) -> Result<Json<Option<PaymentMethodView>>, ApiError> {
+    require_owner(&caller, &id)?;
+    Ok(Json(state.billing().payment_method(&id).await?))
+}
+
+#[utoipa::path(
+    get, path = "/v1/tenants/{id}/billing/invoices", tag = "tenants",
+    description = "Recent invoices, newest first; empty when the tenant has no provider \
+                   customer. Read-only and provider-proxied.",
+    responses(
+        (status = 200, description = "Invoice history", body = [InvoiceView]),
+        (status = 401, description = "Unauthenticated"),
+        (status = 403, description = "Not your tenant"),
+    ),
+)]
+async fn list_invoices(
+    State(state): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<InvoiceView>>, ApiError> {
+    require_owner(&caller, &id)?;
+    Ok(Json(state.billing().invoices(&id).await?))
 }
