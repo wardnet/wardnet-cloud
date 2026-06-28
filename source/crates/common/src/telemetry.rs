@@ -121,6 +121,9 @@ impl Drop for TelemetryGuard {
 /// - Resource attributes (best-effort, INFORGE-injected — see the env contract in
 ///   `resource`): `INFORGE_SERVICE_NAMESPACE` → `service.namespace`,
 ///   `INFORGE_INSTANCE_ID` → `service.instance.id`, `INFORGE_HOST_ID` → `host.id`,
+///   `INFORGE_HOST_TYPE` → `host.type`, `INFORGE_CLOUD_PROVIDER` → `cloud.provider`,
+///   `INFORGE_CLOUD_REGION` → `cloud.region`,
+///   `INFORGE_CLOUD_AVAILABILITY_ZONE` → `cloud.availability_zone`,
 ///   `INFORGE_DEPLOYMENT_ENV` → `deployment.environment.name`,
 ///   `INFORGE_DEPLOYMENT_REGION_SLUG` → `region`.
 pub fn init(service_name: &'static str, service_version: &'static str) -> TelemetryGuard {
@@ -258,6 +261,10 @@ fn resource(service_name: &'static str, service_version: &'static str) -> Resour
         ("service.namespace", "INFORGE_SERVICE_NAMESPACE"),
         ("service.instance.id", "INFORGE_INSTANCE_ID"),
         ("host.id", "INFORGE_HOST_ID"),
+        ("host.type", "INFORGE_HOST_TYPE"),
+        ("cloud.provider", "INFORGE_CLOUD_PROVIDER"),
+        ("cloud.region", "INFORGE_CLOUD_REGION"),
+        ("cloud.availability_zone", "INFORGE_CLOUD_AVAILABILITY_ZONE"),
         ("deployment.environment.name", "INFORGE_DEPLOYMENT_ENV"),
         ("region", "INFORGE_DEPLOYMENT_REGION_SLUG"),
     ] {
