@@ -80,15 +80,56 @@ jobs:
         # bails ("Failed to find targets"). `--all` formats every workspace member.
         run: cargo fmt --all --check --manifest-path source/Cargo.toml
 
+      - name: Resolve cargo package set
+        # A "service" is now a domain lib + its thin bin (uniform lib/bin layout,
+        # ADR-0010); `tenants` additionally composes the `subscriptions` + `billing`
+        # libs into its binary. Lint/test the full set; build the bin package.
+        id: pkgs
+        env:
+          SERVICE: ${{ inputs.service }}
+        run: |
+          set -euo pipefail
+          case "$SERVICE" in
+            tenants) LINT="-p wardnet-tenants -p wardnet-subscriptions -p wardnet-billing -p wardnet-tenants-bin" ;;
+            ddns) LINT="-p wardnet-ddns -p wardnet-ddns-bin" ;;
+            tunneller) LINT="-p wardnet-tunneller -p wardnet-tunneller-bin" ;;
+            *) echo "::error::unknown service $SERVICE"; exit 1 ;;
+          esac
+          {
+            echo "lint=$LINT -p wardnet_common"
+            echo "bin=-p wardnet-${SERVICE}-bin"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify aggregate boundaries (ADR-0010)
+        # The tenants / subscriptions / billing crates MUST stay mutually
+        # independent (each promotable to its own host) — they may depend only on
+        # `wardnet_common`. A sibling dependency would make the boundary a
+        # convention, not a compiler guarantee. Cheap guard so it cannot regress.
+        if: inputs.service == 'tenants'
+        working-directory: source
+        run: |
+          set -euo pipefail
+          fail=0
+          for c in tenants subscriptions billing; do
+            if grep -REn 'wardnet[_-](tenants|subscriptions|billing)' "crates/$c/Cargo.toml" \
+                 | grep -v 'name = '; then
+              echo "::error::crate '$c' depends on a sibling aggregate crate"; fail=1
+            fi
+            if grep -REn 'use +wardnet_(tenants|subscriptions|billing)' "crates/$c/src" 2>/dev/null; then
+              echo "::error::crate '$c' imports a sibling aggregate crate"; fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+
       - name: Clippy
-        # Lint this service crate + the shared common lib. Pipe clippy JSON
-        # through clippy-sarif so CI gets a SARIF report for Code Scanning
-        # while still printing human-readable output. `-D warnings` is
-        # enforced; any warning becomes a build failure.
+        # Lint this service's crates (domain lib + thin bin, plus the libs it
+        # composes) + the shared common lib. Pipe clippy JSON through clippy-sarif
+        # so CI gets a SARIF report for Code Scanning while still printing
+        # human-readable output. `-D warnings` is enforced.
         run: |
           set -o pipefail
           cargo clippy --manifest-path source/Cargo.toml \
-            -p wardnet-${{ inputs.service }} -p wardnet_common \
+            ${{ steps.pkgs.outputs.lint }} \
             --all-targets --message-format=json -- -D warnings \
             | clippy-sarif | tee rust-clippy-${{ inputs.service }}.sarif | sarif-fmt
 
@@ -115,7 +156,7 @@ jobs:
           TUNNELLER_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432
         run: >
           cargo test --manifest-path source/Cargo.toml
-          -p wardnet-${{ inputs.service }} -p wardnet_common
+          ${{ steps.pkgs.outputs.lint }}
           --all-targets -- --include-ignored
 
   build:
@@ -149,7 +190,7 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: >
           cargo build --manifest-path source/Cargo.toml
-          -p wardnet-${{ inputs.service }}
+          -p wardnet-${{ inputs.service }}-bin
           --release --target aarch64-unknown-linux-gnu
 
       - name: Strip binary

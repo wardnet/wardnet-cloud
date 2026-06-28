@@ -1,0 +1,56 @@
+[package]
+name = "wardnet-tenants-bin"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Wardnet Tenants deployable — composition root wiring tenants + subscriptions + billing into one binary"
+
+# The composition root is a thin lib (`wardnet_tenants_app`) — the merged `db` migrator
+# plus the cross-aggregate `test_support` fixtures (the `Harness` that wires all three
+# aggregates) — and a thin bin that composes it. `test_support` is a non-cfg-test
+# module so the integration tests in `tests/` can use it, mirroring the old tenants
+# crate's doc-hidden `test_helpers`; its dependencies are therefore regular ones.
+[lib]
+name = "wardnet_tenants_app"
+path = "src/lib.rs"
+
+# The binary artifact stays `wardnet-tenants` (unchanged deploy unit); only the
+# Cargo package that owns it moved out of the tenants *library* crate so the three
+# aggregate crates can stay mutually independent (ADR-0010).
+[[bin]]
+name = "wardnet-tenants"
+path = "src/main.rs"
+
+[dependencies]
+wardnet_common = { workspace = true }
+wardnet-tenants = { workspace = true }
+wardnet-subscriptions = { workspace = true }
+wardnet-billing = { workspace = true }
+
+axum = { workspace = true }
+tokio = { workspace = true }
+sqlx = { workspace = true }
+tracing = { workspace = true }
+opentelemetry = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+# The shared integration-test fixture (tests/common/mod.rs) needs these; they are
+# test-only, so they stay out of the production library + binary dependency graph.
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+ed25519-dalek = { workspace = true }
+serde_json = { workspace = true }
+tower = { workspace = true }
+http-body-util = { workspace = true }
+reqwest = { workspace = true }
+rcgen = { workspace = true }
+tokio-rustls = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

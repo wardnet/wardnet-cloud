@@ -18,16 +18,8 @@ pub mod email;
 pub mod error;
 pub mod identities;
 pub mod mesh;
+pub mod reactor;
 pub mod repository;
 pub mod service;
 pub mod state;
-pub mod stripe;
-pub mod subscription;
 pub mod util;
-
-// Mocks + fixtures shared by unit and integration tests. Doc-hidden and not
-// `cfg(test)` so the integration tests in `tests/` can reach it too; carries no
-// extra production dependencies. (A dedicated `wardnet-test-support` crate is the
-// eventual home — see PLAN-INITIATIVE follow-ups.)
-#[doc(hidden)]
-pub mod test_helpers;

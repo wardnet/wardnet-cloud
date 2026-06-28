@@ -1,9 +1,9 @@
 //! `StripeClient` (the reqwest gateway) against a wiremock Stripe — validates the
 //! request shape (path, Bearer auth, form body) for checkout / billing-portal sessions
 //! and that a Stripe API error surfaces only its `type`/`code`, never the raw response
-//! body (invariant #9). Mirrors `tests/email.rs`; no real Stripe API is touched.
+//! body (invariant #9). No real Stripe API is touched.
 
-use wardnet_tenants::stripe::{StripeClient, StripeGateway};
+use wardnet_billing::gateway::{StripeClient, StripeGateway};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 

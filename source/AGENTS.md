@@ -62,6 +62,26 @@ Conventions and invariants for agents working inside `source/`.
 > account creation now happens only at a credential-proving moment. See `docs/adr/0008`,
 > `docs/adr/0009`, and invariants #2/#18/#23/#25.
 
+> **PR1 / My Account (2026-06-28):** the `tenants` crate's intermingled billing was split
+> into **three mutually-independent aggregate crates** — **`subscriptions`** (the
+> provider-agnostic **license**: status/entitlement/trial+grace + reaper), **`billing`**
+> (the **payment** provider: `StripeGateway`, Checkout/Portal, the webhook, the
+> `processed_stripe_events` ledger, and a new Billing-owned `billing_customers` table that
+> the `stripe_*` columns moved into), and **`tenants`** (identity/networks/daemons +
+> Identities). The three depend on `wardnet_common` and **never on each other**
+> (compiler-enforced; a CI guard greps for regressions). All cross-crate interaction goes
+> through **ports in `wardnet_common`**: the transport-free **`EventBus`/`EventStream`**
+> (replacing the tokio-leaking `EventPublisher`; `DomainEvent` is now serde+versioned) and
+> the synchronous **`SubscriptionReader`** (entitlement reads), **`SubscriptionCommands`**
+> (the one-way Billing→Subscription edge), and **`BillingPort`** (checkout/portal/webhook)
+> trait objects, injected by a new composition-root binary crate. The uniform **lib/bin**
+> layout was applied to all services: each domain is a pure lib (`crates/<svc>`) and a thin
+> bin crate (`crates/app-<svc>`, artifact name unchanged) composes it — for `tenants` the
+> bin composes `tenants` + `subscriptions` + `billing`. The cross-aggregate **reconcile**
+> moved to the composition root. **Strictly behavior-preserving**; the split is designed so
+> a future out-of-process move is an adapter/config change, not a rewrite. See
+> `docs/adr/0010` (supersedes `0006`, refines `0007`) and invariants #22/#23/#24.
+
 > **Status:** every invariant below is **live on `main`**. The earlier `[#444]`/`[#445]` planning
 > tags are retired — the SNI/tunnel data plane (WS-D), PostgreSQL/Neon, the multi-node `TunnelRouter`
 > (`LocalRouter`, its sole impl, already does inter-node forwarding), and the inforge-injected env

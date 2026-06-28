@@ -1,7 +1,14 @@
 # 6. Entitlement is granted by a subscription aggregate, with a card-less managed trial
 
 Date: 2026-06-18
-Status: Accepted
+Status: Superseded by [0010](0010-license-billing-split-ports.md)
+
+> **Superseded (2026-06-28):** the card-less managed-trial *license* model below still
+> holds, but the Stripe/payment concern it folded into the `subscriptions` aggregate has
+> been split into a separate `billing` aggregate, and the `stripe_*` columns moved off the
+> `subscriptions` row into a Billing-owned `billing_customers` table. The inter-aggregate
+> boundary is now the two-port (`SubscriptionReader` / `SubscriptionCommands`) +
+> `EventBus` seam. See [ADR-0010](0010-license-billing-split-ports.md).
 
 ## Context
 

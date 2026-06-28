@@ -5,7 +5,7 @@
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p wardnet-tenants
+RUN cargo build --release -p wardnet-tenants-bin
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \

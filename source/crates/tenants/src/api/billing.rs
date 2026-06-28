@@ -44,9 +44,6 @@ async fn stripe_webhook(
         .get("Stripe-Signature")
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| ApiError::BadRequest("missing Stripe-Signature header".to_string()))?;
-    state
-        .subscriptions()
-        .handle_webhook(&body, signature)
-        .await?;
+    state.billing().handle_webhook(&body, signature).await?;
     Ok(StatusCode::OK)
 }

@@ -17,7 +17,8 @@ use tower::ServiceExt;
 use wardnet_tenants::api;
 use wardnet_tenants::identities::provider::{ExternalIdentityProvider, VerifiedIdentity};
 use wardnet_tenants::repository::tenant::Tenant;
-use wardnet_tenants::test_helpers::{Harness, MockIdentityProvider, build_harness_with_providers};
+mod common;
+use common::{Harness, MockIdentityProvider, build_harness_with_providers};
 
 const SEED: u8 = 5;
 

@@ -1,0 +1,24 @@
+[package]
+name = "wardnet-ddns-bin"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Wardnet DDNS deployable — thin composition root over the wardnet_ddns library"
+
+# Binary artifact stays `wardnet-ddns` (unchanged deploy unit); only the package that
+# owns it moved out of the library crate (uniform lib/bin layout — ADR-0010).
+[[bin]]
+name = "wardnet-ddns"
+path = "src/main.rs"
+
+[dependencies]
+wardnet_common = { workspace = true }
+wardnet-ddns = { workspace = true }
+
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+
+[lints]
+workspace = true

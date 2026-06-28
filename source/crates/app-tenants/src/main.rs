@@ -1,33 +1,47 @@
-use std::sync::Arc;
+//! Composition root for the **wardnet-tenants** deployable.
+//!
+//! Wires the three independent aggregate crates — `tenants` (identity/networks/
+//! daemons/enrollment + web auth), `subscriptions` (the license), `billing` (the
+//! payment provider) — into one process (a modular monolith). This is the **only**
+//! crate that depends on all three; it instantiates each concrete service and injects
+//! the others as `dyn` **port** trait objects, so the aggregates never name each
+//! other (ADR-0010). The in-process event bus + direct port calls are the adapters
+//! today; a broker + mesh-HTTP adapters drop in here later with no domain-code change.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use wardnet_common::config as common_config;
-use wardnet_common::event::{BroadcastEventBus, EventPublisher};
+use wardnet_common::event::{EventBus, InProcessEventBus};
+use wardnet_common::ports::{BillingPort, SubscriptionCommands, SubscriptionReader};
 use wardnet_common::{mtls, serve, token};
 
+use wardnet_billing::{BillingRepository, BillingService, PgBillingRepository, StripeClient};
+use wardnet_subscriptions::{
+    PgSubscriptionRepository, SubscriptionRepository, SubscriptionService, TrialPolicy,
+    reactor as subscription_reactor,
+};
 use wardnet_tenants::{
     api,
     config::Config,
-    db,
     email::{EmailSender, NoopEmailSender, ResendEmailSender},
     identities::{
         IdentitiesService,
         provider::{ExternalIdentityProvider, GitHubProvider, OidcProvider},
         reactor as identities_reactor,
     },
-    mesh,
+    mesh, reactor,
     repository::{
         DaemonRepository, EnrollmentRepository, NetworkRepository, PgDaemonRepository,
-        PgEnrollmentRepository, PgNetworkRepository, PgSessionRepository, PgSubscriptionRepository,
-        PgTenantIdentityRepository, PgTenantRepository, SessionRepository, SubscriptionRepository,
+        PgEnrollmentRepository, PgNetworkRepository, PgSessionRepository,
+        PgTenantIdentityRepository, PgTenantRepository, SessionRepository,
         TenantIdentityRepository, TenantRepository,
     },
     service::TenantsService,
     state::AppState,
-    stripe::StripeClient,
-    subscription::{SubscriptionService, TrialPolicy, reactor},
 };
+
+use wardnet_tenants_app::db;
 
 /// Broadcast channel depth for domain events. Generous so a momentarily-busy reactor
 /// never lags (a dropped event is still recovered by the reconcile loop).
@@ -60,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
     let networks_repo = Arc::new(PgNetworkRepository::new_pools(pools.clone()));
     let daemons_repo = Arc::new(PgDaemonRepository::new_pools(pools.clone()));
     let subscriptions_repo = Arc::new(PgSubscriptionRepository::new_pools(pools.clone()));
+    let billing_repo = Arc::new(PgBillingRepository::new_pools(pools.clone()));
     // Identities aggregate repos (WS-F).
     let identity_repo = Arc::new(PgTenantIdentityRepository::new_pools(pools.clone()));
     let session_repo = Arc::new(PgSessionRepository::new_pools(pools.clone()));
@@ -73,36 +88,42 @@ async fn main() -> anyhow::Result<()> {
     drop(signing_key_pem);
 
     // The auth layer verifies identity JWTs offline with the matching public key,
-    // scoped to this service's own audience (ADR-0008): a token whose `aud` omits
-    // `tenants` is rejected.
+    // scoped to this service's own audience (ADR-0008).
     let verifier = token::Verifier::from_pem(
         common_config::load_jwt_verify_key_pem()?.as_bytes(),
         "tenants",
     )?;
 
-    // Domain-event bus: services publish, reactors react (one-way, never a direct
-    // cross-aggregate write call).
-    let events: Arc<dyn EventPublisher> = Arc::new(BroadcastEventBus::new(EVENT_BUS_CAPACITY));
+    // Domain-event bus (in-process adapter): services publish, reactors react.
+    let events: Arc<dyn EventBus> = Arc::new(InProcessEventBus::new(EVENT_BUS_CAPACITY));
 
-    // Stripe gateway (hand-rolled reqwest client; the signature secret is the webhook
-    // credential). Secrets arrive in the env via inforge, like the DSN.
-    let stripe = Arc::new(StripeClient::new(
-        &config.stripe_secret_key,
-        &config.stripe_webhook_secret,
-        &config.account_base_url,
-    ));
-
-    // Build the subscription aggregate first (Tenants reads it via a service method).
+    // The license aggregate. Shared as both its read port (entitlement) and its
+    // command port (Billing → Subscription, account cancel).
     let subscriptions = Arc::new(SubscriptionService::new(
         subscriptions_repo as Arc<dyn SubscriptionRepository>,
         Arc::clone(&events),
-        stripe,
         TrialPolicy {
             trial_days: config.trial_days,
             trial_grace_days: config.trial_grace_days,
             payment_grace_days: config.payment_grace_days,
         },
     ));
+    let subscription_reader: Arc<dyn SubscriptionReader> = subscriptions.clone();
+    let subscription_commands: Arc<dyn SubscriptionCommands> = subscriptions.clone();
+
+    // The payment aggregate. Drives the license aggregate only through the ports above.
+    let stripe = Arc::new(StripeClient::new(
+        &config.stripe_secret_key,
+        &config.stripe_webhook_secret,
+        &config.account_base_url,
+    ));
+    let billing: Arc<dyn BillingPort> = Arc::new(BillingService::new(
+        stripe,
+        billing_repo as Arc<dyn BillingRepository>,
+        Arc::clone(&subscription_reader),
+        Arc::clone(&subscription_commands),
+    ));
+
     // Transactional email: Resend when configured, else the dev no-op (logs the code).
     let email: Arc<dyn EmailSender> = if let Some(key) = &config.resend_api_key {
         Arc::new(ResendEmailSender::new(key, &config.email_from)?)
@@ -116,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
         networks_repo as Arc<dyn NetworkRepository>,
         daemons_repo as Arc<dyn DaemonRepository>,
         enrollment_repo as Arc<dyn EnrollmentRepository>,
-        Arc::clone(&subscriptions),
+        Arc::clone(&subscription_reader),
         Arc::clone(&events),
         email,
         Arc::clone(&signer),
@@ -136,25 +157,27 @@ async fn main() -> anyhow::Result<()> {
         config.user_jwt_ttl_secs,
     ));
 
-    // Reactors: turn published events into the owning service's method calls.
-    tokio::spawn(reactor::run_subscription_reactor(
+    // Reactors: turn published events into the owning service's method calls. Each
+    // takes an `EventStream` from the bus (no tokio transport type leaks).
+    tokio::spawn(subscription_reactor::run_subscription_reactor(
         Arc::clone(&subscriptions),
-        events.subscribe(),
+        events.subscribe("subscription").await?,
     ));
     tokio::spawn(reactor::run_network_reactor(
         Arc::clone(&service),
-        events.subscribe(),
+        events.subscribe("network").await?,
     ));
-    // Identities reactor: TenantDeregistered → purge sessions + login methods.
     tokio::spawn(identities_reactor::run_identities_reactor(
         Arc::clone(&identities),
-        events.subscribe(),
+        events.subscribe("identities").await?,
     ));
 
     let state = AppState::new(
         config.clone(),
         Arc::clone(&service),
-        Arc::clone(&subscriptions),
+        Arc::clone(&subscription_reader),
+        Arc::clone(&subscription_commands),
+        Arc::clone(&billing),
         Arc::clone(&identities),
         verifier,
     );
@@ -279,10 +302,6 @@ async fn build_identity_providers(
 async fn sweep_loop(service: Arc<TenantsService>, interval: std::time::Duration) {
     use opentelemetry::{KeyValue, global};
 
-    // Bounded-cardinality domain metrics (no per-tenant labels — plan §5a):
-    // `deleted` counts reclaimed tenants; `runs` counts passes labelled
-    // `result=ok|error` so operators can alert on the sweep *failure* rate, not
-    // just successes.
     let meter = global::meter(wardnet_common::telemetry::SCOPE);
     let deleted = meter
         .u64_counter("tenants.tombstone_sweep.deleted")
@@ -322,7 +341,7 @@ async fn sub_reaper_loop(
         if let Err(e) = subscriptions.expire_overdue().await {
             tracing::error!(error = %e, "subscription reaper failed");
         }
-        if let Err(e) = service.reconcile().await {
+        if let Err(e) = wardnet_tenants_app::reconcile(&service, &subscriptions).await {
             tracing::error!(error = %e, "subscription reconcile failed");
         }
     }

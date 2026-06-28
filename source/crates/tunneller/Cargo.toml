@@ -10,10 +10,6 @@ description = "Wardnet Tunneller — multi-node SNI-passthrough reverse-tunnel e
 name = "wardnet_tunneller"
 path = "src/lib.rs"
 
-[[bin]]
-name = "wardnet-tunneller"
-path = "src/main.rs"
-
 [dependencies]
 wardnet_common = { workspace = true }
 

@@ -13,12 +13,13 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
+use wardnet_billing::gateway::{StripeEvent, StripeEventKind, SubscriptionData};
+use wardnet_common::contract::SubscriptionStatus;
 use wardnet_common::token::{ClaimsSpec, PrincipalType, canonical_request_payload};
 use wardnet_tenants::api;
-use wardnet_tenants::repository::subscription::SubscriptionStatus;
 use wardnet_tenants::repository::tenant::Tenant;
-use wardnet_tenants::stripe::{StripeEvent, StripeEventKind, SubscriptionData};
-use wardnet_tenants::test_helpers::{build_harness, build_state, daemon_keypair, test_signer};
+mod common;
+use common::{build_harness, build_state, daemon_keypair, test_signer};
 
 const SEED: u8 = 5;
 
@@ -442,6 +443,167 @@ async fn stripe_webhook_converts_trial_to_paid() {
     let current = h.store.current_subscription("tw").unwrap();
     assert_eq!(current.status, SubscriptionStatus::Active);
     assert_eq!(current.entitlement.max_networks, 5);
+    // The Billing-side provider ref is recorded, so subsequent webhooks for this
+    // subscription resolve the tenant via the mapping (not just checkout metadata).
+    assert_eq!(
+        h.store.billing_tenant_for_subscription("sub_w").as_deref(),
+        Some("tw")
+    );
+    assert_eq!(h.store.billing_customer_id("tw").as_deref(), Some("cus_w"));
+    // Trial→paid *replaced* the live row (cancel trial + insert paid), never mutated it
+    // in place: two rows total, exactly one non-canceled (the `uq_subscriptions_live`
+    // invariant).
+    assert_eq!(h.store.subscription_count("tw"), 2);
+}
+
+/// POST a (mock-verified) Stripe webhook through the real router; returns the status.
+async fn post_webhook(state: &wardnet_tenants::state::AppState) -> StatusCode {
+    api::router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/billing/stripe/webhook")
+                .header("Stripe-Signature", "t=1,v1=deadbeef")
+                .body(Body::from(b"{}".to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn stripe_webhook_without_price_metadata_declines_and_records_nothing() {
+    // A misconfigured plan (price has no max_networks/max_daemons metadata) → the
+    // webhook declines to grant (safe-closed) AND records no provider ref, so a later
+    // delete for the same subscription cannot resolve — and cancel — the tenant's trial.
+    let h = build_harness(SEED);
+    h.store.seed_tenant(Tenant {
+        id: "tm".to_string(),
+        email: "m@b.com".to_string(),
+        created_at: chrono::Utc::now(),
+        deregistered_at: None,
+    });
+    h.subscriptions.create_trial("tm").await.unwrap();
+
+    h.stripe.set_event(StripeEvent {
+        id: "evt_nometa".to_string(),
+        kind: StripeEventKind::SubscriptionUpsert(SubscriptionData {
+            tenant_id: Some("tm".to_string()),
+            stripe_subscription_id: "sub_m".to_string(),
+            stripe_customer_id: "cus_m".to_string(),
+            price_id: Some("price_broken".to_string()),
+            entitlement: None, // <-- no price metadata
+            status: SubscriptionStatus::Active,
+            current_period_end: Some(chrono::Utc::now()),
+        }),
+    });
+    assert_eq!(post_webhook(&h.state).await, StatusCode::OK);
+
+    // Declined: still on the trial, and NOTHING recorded on the Billing side.
+    assert_eq!(
+        h.store.current_subscription("tm").unwrap().status,
+        SubscriptionStatus::Trialing
+    );
+    assert_eq!(h.store.billing_tenant_for_subscription("sub_m"), None);
+
+    // Now a `customer.subscription.deleted` for that never-granted subscription must be
+    // a no-op — it must NOT cancel the tenant's live trial.
+    h.stripe.set_event(StripeEvent {
+        id: "evt_del".to_string(),
+        kind: StripeEventKind::SubscriptionDeleted {
+            stripe_subscription_id: "sub_m".to_string(),
+        },
+    });
+    assert_eq!(post_webhook(&h.state).await, StatusCode::OK);
+    assert_eq!(
+        h.store.current_subscription("tm").unwrap().status,
+        SubscriptionStatus::Trialing
+    );
+}
+
+#[tokio::test]
+async fn stripe_webhook_deleted_cancels_via_recorded_mapping() {
+    // Convert (records the mapping), then a delete resolves the tenant via
+    // tenant_for_subscription and cancels the paid license.
+    let h = build_harness(SEED);
+    h.store.seed_tenant(Tenant {
+        id: "td".to_string(),
+        email: "d@b.com".to_string(),
+        created_at: chrono::Utc::now(),
+        deregistered_at: None,
+    });
+    h.subscriptions.create_trial("td").await.unwrap();
+
+    h.stripe.set_event(StripeEvent {
+        id: "evt_c".to_string(),
+        kind: StripeEventKind::SubscriptionUpsert(SubscriptionData {
+            tenant_id: Some("td".to_string()),
+            stripe_subscription_id: "sub_d".to_string(),
+            stripe_customer_id: "cus_d".to_string(),
+            price_id: Some("price_pro".to_string()),
+            entitlement: Some(wardnet_common::contract::Entitlement {
+                max_networks: 3,
+                max_daemons: 9,
+            }),
+            status: SubscriptionStatus::Active,
+            current_period_end: Some(chrono::Utc::now()),
+        }),
+    });
+    assert_eq!(post_webhook(&h.state).await, StatusCode::OK);
+    assert_eq!(
+        h.store.current_subscription("td").unwrap().status,
+        SubscriptionStatus::Active
+    );
+
+    // The delete carries no checkout metadata — resolution is purely via the mapping.
+    h.stripe.set_event(StripeEvent {
+        id: "evt_d".to_string(),
+        kind: StripeEventKind::SubscriptionDeleted {
+            stripe_subscription_id: "sub_d".to_string(),
+        },
+    });
+    assert_eq!(post_webhook(&h.state).await, StatusCode::OK);
+    assert!(h.store.current_subscription("td").is_none());
+}
+
+#[tokio::test]
+async fn stripe_webhook_is_idempotent_on_redelivery() {
+    // The same event id delivered twice applies once (the ledger dedupes the second).
+    let h = build_harness(SEED);
+    h.store.seed_tenant(Tenant {
+        id: "ti".to_string(),
+        email: "i@b.com".to_string(),
+        created_at: chrono::Utc::now(),
+        deregistered_at: None,
+    });
+    h.subscriptions.create_trial("ti").await.unwrap();
+
+    h.stripe.set_event(StripeEvent {
+        id: "evt_dup".to_string(),
+        kind: StripeEventKind::SubscriptionUpsert(SubscriptionData {
+            tenant_id: Some("ti".to_string()),
+            stripe_subscription_id: "sub_i".to_string(),
+            stripe_customer_id: "cus_i".to_string(),
+            price_id: Some("price_pro".to_string()),
+            entitlement: Some(wardnet_common::contract::Entitlement {
+                max_networks: 2,
+                max_daemons: 4,
+            }),
+            status: SubscriptionStatus::Active,
+            current_period_end: Some(chrono::Utc::now()),
+        }),
+    });
+    assert_eq!(post_webhook(&h.state).await, StatusCode::OK);
+    assert_eq!(post_webhook(&h.state).await, StatusCode::OK); // redelivery, same id
+
+    // Applied exactly once: the conversion produced one trial + one paid row, not two
+    // paid rows from a double-apply.
+    assert_eq!(h.store.subscription_count("ti"), 2);
+    assert_eq!(
+        h.store.current_subscription("ti").unwrap().status,
+        SubscriptionStatus::Active
+    );
 }
 
 #[tokio::test]

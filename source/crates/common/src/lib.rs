@@ -15,6 +15,7 @@ pub mod error;
 pub mod event;
 pub mod health;
 pub mod mtls;
+pub mod ports;
 pub mod proxy_protocol;
 pub mod replay_cache;
 pub mod serve;

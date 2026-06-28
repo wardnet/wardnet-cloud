@@ -32,10 +32,15 @@ async fn get_tenant(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<TenantView>, ApiError> {
-    let (tenant, subscription) = state
+    let tenant = state
         .tenants()
         .find_tenant(&id)
         .await?
         .ok_or_else(|| ApiError::NotFound("no such tenant".to_string()))?;
+    let subscription = state
+        .subscriptions()
+        .current(&id)
+        .await
+        .map_err(ApiError::Internal)?;
     Ok(Json(crate::api::tenants::tenant_view(tenant, subscription)))
 }

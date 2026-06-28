@@ -4,20 +4,23 @@
 //! entitlement enforcement, and the mesh reconcile transitions consumed by the
 //! regional DDNS provisioner/reaper.
 //!
-//! Billing is a **separate aggregate**: this service never touches the subscription
-//! repository. It *reads* the current subscription by calling
-//! [`SubscriptionService::current`](crate::subscription::SubscriptionService::current),
-//! and drives subscription side-effects by **publishing domain events** (a reactor
-//! reacts). Conversely the network-deprovision side-effect of a deactivated
-//! subscription is [`deprovision_networks_for`](Self::deprovision_networks_for),
+//! The **license** is a separate aggregate: this service never touches the
+//! subscription repository or the `subscriptions` crate. It *reads* entitlement
+//! through the [`SubscriptionReader`] port (an `Arc<dyn …>` injected by the
+//! composition root), and drives subscription side-effects by **publishing domain
+//! events** (a reactor reacts). Conversely the network-deprovision side-effect of a
+//! deactivated subscription is [`deprovision_networks_for`](Self::deprovision_networks_for),
 //! invoked by the network reactor.
+//!
+//! [`SubscriptionReader`]: wardnet_common::ports::SubscriptionReader
 
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 use uuid::Uuid;
 
-use wardnet_common::event::{DomainEvent, EventPublisher};
+use wardnet_common::event::{DomainEvent, EventBus};
+use wardnet_common::ports::SubscriptionReader;
 use wardnet_common::token::{ClaimsSpec, PrincipalType, Signer};
 use wardnet_common::validation::{is_valid_name, validate_public_key};
 
@@ -25,10 +28,8 @@ use crate::email::EmailSender;
 use crate::error::TenantsError;
 use crate::repository::{
     CreateTenantOutcome, Daemon, DaemonRepository, EnrollOutcome, EnrollmentRepository, Network,
-    NetworkRepository, ProvisioningState, RegisterNetworkOutcome, Subscription, Tenant,
-    TenantRepository,
+    NetworkRepository, ProvisioningState, RegisterNetworkOutcome, Tenant, TenantRepository,
 };
-use crate::subscription::SubscriptionService;
 
 /// Identity JWT lifetime (seconds). Offline revocation is bounded by this.
 const IDENTITY_JWT_TTL_SECS: i64 = 3600;
@@ -52,11 +53,11 @@ pub struct TenantsService {
     networks: Arc<dyn NetworkRepository>,
     daemons: Arc<dyn DaemonRepository>,
     enrollment: Arc<dyn EnrollmentRepository>,
-    /// The subscription aggregate — **read-only** access (`current`) plus the
-    /// `is_active` policy. All subscription *writes* happen via events.
-    subscriptions: Arc<SubscriptionService>,
+    /// The license aggregate — **read-only** access via the port (`current` /
+    /// grace-aware `is_active`). All subscription *writes* happen via events.
+    subscriptions: Arc<dyn SubscriptionReader>,
     /// Domain-event sink for cross-aggregate side-effects.
-    events: Arc<dyn EventPublisher>,
+    events: Arc<dyn EventBus>,
     /// Transactional email for enrollment codes (Resend in prod, no-op in dev/test).
     email: Arc<dyn EmailSender>,
     /// Shared signing capability (also held by `IdentitiesService` to mint USER JWTs).
@@ -76,8 +77,8 @@ impl TenantsService {
         networks: Arc<dyn NetworkRepository>,
         daemons: Arc<dyn DaemonRepository>,
         enrollment: Arc<dyn EnrollmentRepository>,
-        subscriptions: Arc<SubscriptionService>,
-        events: Arc<dyn EventPublisher>,
+        subscriptions: Arc<dyn SubscriptionReader>,
+        events: Arc<dyn EventBus>,
         email: Arc<dyn EmailSender>,
         signer: Arc<Signer>,
         regions: impl IntoIterator<Item = String>,
@@ -92,6 +93,17 @@ impl TenantsService {
             email,
             signer,
             regions: regions.into_iter().collect(),
+        }
+    }
+
+    /// Publish a domain event **best-effort**: a transport failure is logged and
+    /// swallowed, never propagated. Events are the fast path; the periodic reconcile is
+    /// the correctness guarantee (ADR-0007/0010), so a dropped publish must not fail an
+    /// operation whose DB write already committed. (The in-process bus never errs; this
+    /// matters once a durable-broker adapter lands.)
+    async fn publish_best_effort(&self, event: DomainEvent) {
+        if let Err(e) = self.events.publish(&event).await {
+            tracing::error!(error = %e, ?event, "failed to publish domain event; reconcile is the safety net");
         }
     }
 
@@ -124,9 +136,13 @@ impl TenantsService {
         };
         match self.tenants.create(&tenant).await? {
             CreateTenantOutcome::Created => {
-                self.events.publish(DomainEvent::TenantCreated {
+                // Best-effort: a publish failure must not fail an account whose row is
+                // already committed — the reconcile loop backfills the trial. (Never
+                // errs on the in-proc bus; matters once a broker adapter lands.)
+                self.publish_best_effort(DomainEvent::TenantCreated {
                     tenant_id: tenant.id.clone(),
-                });
+                })
+                .await;
                 Ok(tenant)
             }
             CreateTenantOutcome::EmailTaken => Err(TenantsError::Conflict(
@@ -211,9 +227,10 @@ impl TenantsService {
             // Already tombstoned — idempotent no-op.
             return Ok(false);
         }
-        self.events.publish(DomainEvent::TenantDeregistered {
+        self.publish_best_effort(DomainEvent::TenantDeregistered {
             tenant_id: tenant_id.to_string(),
-        });
+        })
+        .await;
         tracing::info!(
             tenant_id,
             "tenant deregistered; subscription cancel signalled"
@@ -221,27 +238,14 @@ impl TenantsService {
         Ok(true)
     }
 
-    /// Reconcile desired state — the safety net for any dropped domain event. For
-    /// every live tenant: open a missing trial (only when the tenant has *no*
-    /// subscription history, so a reaped trial is never resurrected); and if the
-    /// tenant has no current subscription, deprovision its networks. Idempotent;
-    /// driven by the periodic reconcile loop.
+    /// All **live** (non-tombstoned) tenant ids — the input the composition root's
+    /// reconcile loop iterates (it spans the tenant *and* license aggregates, so it
+    /// lives at the composition root, not here — ADR-0010).
     ///
     /// # Errors
     /// [`TenantsError::Internal`] on a repository failure.
-    pub async fn reconcile(&self) -> Result<(), TenantsError> {
-        for tenant_id in self.tenants.list_live_ids().await? {
-            if self.subscriptions.current(&tenant_id).await?.is_some() {
-                continue;
-            }
-            // No live subscription: either the trial event was dropped (no history →
-            // create it), or the subscription lapsed (history exists → ensure the
-            // networks are deprovisioning).
-            if !self.subscriptions.create_trial(&tenant_id).await? {
-                self.deprovision_networks_for(&tenant_id).await?;
-            }
-        }
-        Ok(())
+    pub async fn list_live_tenant_ids(&self) -> Result<Vec<String>, TenantsError> {
+        Ok(self.tenants.list_live_ids().await?)
     }
 
     /// Delete tombstoned tenants whose networks are fully deprovisioned (FK-cascading
@@ -274,21 +278,14 @@ impl TenantsService {
         Ok(self.networks.find_by_id(network_id).await?)
     }
 
-    /// Fetch a tenant plus its current subscription (the mesh-plane resource read).
-    /// The subscription is read via the `SubscriptionService` method — this service
-    /// never touches the subscription repository.
+    /// Fetch a tenant by id. The current subscription (a foreign aggregate) is read
+    /// separately by the caller via the [`SubscriptionReader`] port and composed into
+    /// the view — this service never touches the subscription aggregate.
     ///
     /// # Errors
     /// [`TenantsError::Internal`] on a repository failure.
-    pub async fn find_tenant(
-        &self,
-        tenant_id: &str,
-    ) -> Result<Option<(Tenant, Option<Subscription>)>, TenantsError> {
-        let Some(tenant) = self.tenants.find_by_id(tenant_id).await? else {
-            return Ok(None);
-        };
-        let subscription = self.subscriptions.current(tenant_id).await?;
-        Ok(Some((tenant, subscription)))
+    pub async fn find_tenant(&self, tenant_id: &str) -> Result<Option<Tenant>, TenantsError> {
+        Ok(self.tenants.find_by_id(tenant_id).await?)
     }
 
     /// List a tenant's daemons.
@@ -444,9 +441,10 @@ impl TenantsService {
                 tenant_created,
             } => {
                 if tenant_created {
-                    self.events.publish(DomainEvent::TenantCreated {
+                    self.publish_best_effort(DomainEvent::TenantCreated {
                         tenant_id: tenant_id.clone(),
-                    });
+                    })
+                    .await;
                 }
                 Ok(EnrollResult { tenant_id })
             }
@@ -496,9 +494,9 @@ impl TenantsService {
         }
         let entitled = self
             .subscriptions
-            .current(&tenant_id)
-            .await?
-            .is_some_and(|sub| self.subscriptions.is_active(&sub, now));
+            .is_active(&tenant_id)
+            .await
+            .map_err(TenantsError::Internal)?;
         if !entitled {
             return Err(TenantsError::Forbidden(
                 "tenant subscription is not active".to_string(),
@@ -577,11 +575,13 @@ impl TenantsService {
             .ok_or_else(|| TenantsError::NotFound("no such tenant".to_string()))?;
 
         // Entitlement is granted by the current subscription, not the tenant. Reading
-        // it via the SubscriptionService keeps Tenants off the subscription repo.
+        // it via the SubscriptionReader port keeps Tenants off the subscription repo
+        // (and off the subscriptions crate).
         let entitlement = self
             .subscriptions
             .current(tenant_id)
-            .await?
+            .await
+            .map_err(TenantsError::Internal)?
             .ok_or_else(|| {
                 TenantsError::Forbidden("tenant has no active subscription".to_string())
             })?
@@ -707,6 +707,3 @@ fn generate_code() -> (String, String) {
 fn hash_code(code: &str) -> String {
     crate::util::sha256_hex(code)
 }
-
-#[cfg(test)]
-mod tests;

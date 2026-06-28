@@ -147,23 +147,19 @@ pub struct NetworkView {
     pub updated_at: DateTime<Utc>,
 }
 
-/// The full **Subscription** resource — the billing aggregate that grants a
-/// tenant's [`Entitlement`]. Producer: Tenants (account plane + embedded in
-/// [`TenantView`]). A tenant's *current* subscription is its single non-`Canceled`
-/// row; `Canceled` rows are history and are never embedded as current.
+/// The full **Subscription** resource — the **license** aggregate that grants a
+/// tenant's [`Entitlement`]. Provider-agnostic: payment-provider reference ids
+/// (Stripe customer/subscription/price) live in the **Billing** aggregate and are
+/// surfaced by Billing's own read endpoints, not here. Producer: Tenants (account
+/// plane + embedded in [`TenantView`]). A tenant's *current* subscription is its
+/// single non-`Canceled` row; `Canceled` rows are history and are never embedded as
+/// current.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SubscriptionView {
     pub id: String,
     pub status: SubscriptionStatus,
     /// The limits this subscription's plan grants.
     pub entitlement: Entitlement,
-    /// Stripe Customer handle (the tenant's stable billing identity); `None` until
-    /// the tenant first reaches checkout.
-    pub stripe_customer_id: Option<String>,
-    /// Stripe Subscription handle; `None` while still on the card-less trial.
-    pub stripe_subscription_id: Option<String>,
-    /// The purchased Stripe Price id; `None` on the trial.
-    pub price_id: Option<String>,
     /// When the free trial lapses (a `Trialing` subscription only).
     pub trial_expires_at: Option<DateTime<Utc>>,
     /// End of the current paid period (a paid subscription only).

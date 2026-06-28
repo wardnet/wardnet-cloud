@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/common", "crates/tenants", "crates/ddns", "crates/tunneller", "xtask", "end2end-tests/mesh"]
+members = ["crates/common", "crates/subscriptions", "crates/billing", "crates/tenants", "crates/app-tenants", "crates/ddns", "crates/app-ddns", "crates/tunneller", "crates/app-tunneller", "xtask", "end2end-tests/mesh"]
 
 [workspace.package]
 edition = "2024"
@@ -16,6 +16,11 @@ missing_panics_doc = "allow"
 [workspace.dependencies]
 # Internal
 wardnet_common = { path = "crates/common" }
+wardnet-tenants = { path = "crates/tenants" }
+wardnet-subscriptions = { path = "crates/subscriptions" }
+wardnet-billing = { path = "crates/billing" }
+wardnet-ddns = { path = "crates/ddns" }
+wardnet-tunneller = { path = "crates/tunneller" }
 
 # Web stack
 axum = { version = "0.8", features = ["macros", "ws"] }
