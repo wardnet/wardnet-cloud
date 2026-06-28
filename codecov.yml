@@ -1,0 +1,21 @@
+# Codecov configuration.
+#
+# The cloud services' binary entrypoints (`crates/app-*/src/main.rs`) are thin
+# composition roots — process wiring (build repos → services → reactors → listeners)
+# exercised by the mesh e2e harness, not by unit coverage — so they are excluded from
+# coverage accounting. A 1% status threshold keeps sub-percent noise (e.g. a structural
+# refactor that moves uncovered wiring) from failing the patch/project gate; the
+# `All checks passed` aggregator remains the required branch-protection check.
+coverage:
+  status:
+    project:
+      default:
+        threshold: 1%
+    patch:
+      default:
+        threshold: 1%
+
+ignore:
+  - "**/crates/app-tenants/src/main.rs"
+  - "**/crates/app-ddns/src/main.rs"
+  - "**/crates/app-tunneller/src/main.rs"
