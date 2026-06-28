@@ -10,10 +10,6 @@ description = "Wardnet Tenants service — global identity/naming authority + me
 name = "wardnet_tenants"
 path = "src/lib.rs"
 
-[[bin]]
-name = "wardnet-tenants"
-path = "src/main.rs"
-
 [dependencies]
 wardnet_common = { workspace = true }
 

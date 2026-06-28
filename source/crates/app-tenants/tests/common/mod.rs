@@ -1,7 +1,17 @@
-//! Shared test fixtures: a deterministic JWT keypair, in-memory mock repositories
-//! over a single shared store (so cross-aggregate invariants hold), and an
-//! [`AppState`] builder. Doc-hidden; used by both unit tests and the integration
-//! tests in `tests/`.
+//! Shared integration-test fixtures (mock store + Harness wiring the three
+//! aggregates). Per-binary, each test uses a subset, so silence dead-code here.
+
+#![allow(dead_code)]
+
+//! Shared test fixtures for the composition crate: a deterministic JWT keypair, an
+//! in-memory mock store that backs **every** aggregate's repositories (so
+//! cross-aggregate invariants hold), and a fully-wired [`Harness`] (the three
+//! aggregate services + their `common` ports + the [`AppState`]).
+//!
+//! This module is **not** `#[cfg(test)]`: the integration tests in `tests/` are
+//! separate crates and can only see `pub` items (mirroring the old tenants crate's
+//! doc-hidden `test_helpers`). It is the only place that names all three aggregate
+//! crates' concrete types — exactly the job of the composition root.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -10,32 +20,35 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::SigningKey;
-use tokio::sync::broadcast;
 
-use wardnet_common::event::{BroadcastEventBus, DomainEvent, EventPublisher};
+use wardnet_common::contract::{Entitlement, SubscriptionStatus};
+use wardnet_common::event::{DomainEvent, EventBus, EventStream, InProcessEventBus};
+use wardnet_common::ports::{BillingPort, SubscriptionCommands, SubscriptionReader};
 use wardnet_common::token::{Signer, Verifier};
 
-use crate::config::Config;
-use crate::email::EmailSender;
-use crate::identities::IdentitiesService;
-use crate::identities::provider::ExternalIdentityProvider;
-use crate::repository::daemon::{Daemon, DaemonRepository};
-use crate::repository::enrollment::{EnrollOutcome, EnrollmentRepository};
-use crate::repository::identity::{
+use wardnet_billing::BillingService;
+use wardnet_billing::gateway::{CheckoutSession, StripeEvent, StripeGateway};
+use wardnet_billing::repository::BillingRepository;
+use wardnet_subscriptions::{
+    Subscription, SubscriptionRepository, SubscriptionService, TrialPolicy,
+};
+
+use wardnet_tenants::config::Config;
+use wardnet_tenants::email::EmailSender;
+use wardnet_tenants::identities::IdentitiesService;
+use wardnet_tenants::identities::provider::ExternalIdentityProvider;
+use wardnet_tenants::repository::daemon::{Daemon, DaemonRepository};
+use wardnet_tenants::repository::enrollment::{EnrollOutcome, EnrollmentRepository};
+use wardnet_tenants::repository::identity::{
     InsertIdentityOutcome, TenantIdentity, TenantIdentityRepository,
 };
-use crate::repository::network::{
+use wardnet_tenants::repository::network::{
     Network, NetworkRepository, ProvisioningState, RegisterNetworkOutcome,
 };
-use crate::repository::session::{Session, SessionRepository};
-use crate::repository::subscription::{
-    Entitlement, Subscription, SubscriptionRepository, SubscriptionStatus,
-};
-use crate::repository::tenant::{CreateTenantOutcome, Tenant, TenantRepository};
-use crate::service::TenantsService;
-use crate::state::AppState;
-use crate::stripe::{CheckoutSession, StripeEvent, StripeGateway};
-use crate::subscription::{SubscriptionService, TrialPolicy};
+use wardnet_tenants::repository::session::{Session, SessionRepository};
+use wardnet_tenants::repository::tenant::{CreateTenantOutcome, Tenant, TenantRepository};
+use wardnet_tenants::service::TenantsService;
+use wardnet_tenants::state::AppState;
 
 // ── Key material ────────────────────────────────────────────────────────────────
 
@@ -83,6 +96,15 @@ struct PendingRow {
     expires_at: DateTime<Utc>,
 }
 
+/// A Billing-owned provider-reference row (the `stripe_*` ids that moved out of the
+/// subscription into Billing's `billing_customers` table), keyed by tenant id.
+#[derive(Clone, Default)]
+struct BillingCustomer {
+    customer: Option<String>,
+    subscription: Option<String>,
+    price: Option<String>,
+}
+
 #[derive(Default)]
 struct Data {
     tenants: HashMap<String, Tenant>,
@@ -92,7 +114,10 @@ struct Data {
     codes: HashMap<String, CodeRow>,
     pending: HashMap<String, PendingRow>,
     code_log: Vec<(String, DateTime<Utc>)>,
-    processed_events: HashSet<String>,
+    /// Billing provider-reference rows (one per tenant).
+    billing_customers: HashMap<String, BillingCustomer>,
+    /// Billing webhook idempotency ledger.
+    processed_stripe_events: HashSet<String>,
     /// Login methods keyed on `(provider, subject)` (mirrors the PK).
     identities: HashMap<(String, String), TenantIdentity>,
     /// Sessions keyed on `token_hash`.
@@ -100,7 +125,8 @@ struct Data {
 }
 
 /// A shared mock backing store. All mock repositories built from one
-/// [`MockStore`] read/write the same data, so saga invariants hold across them.
+/// [`MockStore`] read/write the same data, so saga invariants hold across them —
+/// including across the now-separate subscription + billing aggregates.
 #[derive(Clone)]
 pub struct MockStore(Arc<Mutex<Data>>);
 
@@ -150,6 +176,31 @@ impl MockStore {
             .values()
             .filter(|s| s.tenant_id == tenant_id)
             .count()
+    }
+
+    /// The tenant a recorded provider subscription id maps to (the `billing_customers`
+    /// webhook→tenant lookup), if any. `None` means no provider ref was recorded for
+    /// that subscription — e.g. a declined (no-metadata) subscription must stay `None`.
+    #[must_use]
+    pub fn billing_tenant_for_subscription(&self, subscription_id: &str) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .billing_customers
+            .iter()
+            .find(|(_, c)| c.subscription.as_deref() == Some(subscription_id))
+            .map(|(tenant_id, _)| tenant_id.clone())
+    }
+
+    /// The provider customer id recorded for a tenant, if any.
+    #[must_use]
+    pub fn billing_customer_id(&self, tenant_id: &str) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .billing_customers
+            .get(tenant_id)
+            .and_then(|c| c.customer.clone())
     }
 
     /// Number of networks currently stored.
@@ -736,47 +787,6 @@ impl SubscriptionRepository for MockStore {
             .cloned())
     }
 
-    async fn find_by_stripe_subscription_id(
-        &self,
-        stripe_subscription_id: &str,
-    ) -> anyhow::Result<Option<Subscription>> {
-        Ok(self
-            .0
-            .lock()
-            .unwrap()
-            .subscriptions
-            .values()
-            .find(|s| s.stripe_subscription_id.as_deref() == Some(stripe_subscription_id))
-            .cloned())
-    }
-
-    async fn latest_customer_id(&self, tenant_id: &str) -> anyhow::Result<Option<String>> {
-        let d = self.0.lock().unwrap();
-        Ok(d.subscriptions
-            .values()
-            .filter(|s| s.tenant_id == tenant_id && s.stripe_customer_id.is_some())
-            .max_by_key(|s| s.created_at)
-            .and_then(|s| s.stripe_customer_id.clone()))
-    }
-
-    async fn stamp_customer_id(
-        &self,
-        tenant_id: &str,
-        stripe_customer_id: &str,
-    ) -> anyhow::Result<bool> {
-        let mut d = self.0.lock().unwrap();
-        if let Some(s) = d
-            .subscriptions
-            .values_mut()
-            .find(|s| s.tenant_id == tenant_id && s.status != SubscriptionStatus::Canceled)
-        {
-            s.stripe_customer_id = Some(stripe_customer_id.to_string());
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
     async fn convert_trial_to_paid(
         &self,
         tenant_id: &str,
@@ -792,9 +802,9 @@ impl SubscriptionRepository for MockStore {
         Ok(())
     }
 
-    async fn update_from_stripe(
+    async fn update_current(
         &self,
-        stripe_subscription_id: &str,
+        tenant_id: &str,
         status: SubscriptionStatus,
         entitlement: Entitlement,
         current_period_end: Option<DateTime<Utc>>,
@@ -803,11 +813,25 @@ impl SubscriptionRepository for MockStore {
         if let Some(s) = d
             .subscriptions
             .values_mut()
-            .find(|s| s.stripe_subscription_id.as_deref() == Some(stripe_subscription_id))
+            .find(|s| s.tenant_id == tenant_id && s.status != SubscriptionStatus::Canceled)
         {
             s.status = status;
             s.entitlement = entitlement;
             s.current_period_end = current_period_end;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn mark_past_due_current(&self, tenant_id: &str) -> anyhow::Result<bool> {
+        let mut d = self.0.lock().unwrap();
+        if let Some(s) = d
+            .subscriptions
+            .values_mut()
+            .find(|s| s.tenant_id == tenant_id && s.status != SubscriptionStatus::Canceled)
+        {
+            s.status = SubscriptionStatus::PastDue;
             Ok(true)
         } else {
             Ok(false)
@@ -851,38 +875,101 @@ impl SubscriptionRepository for MockStore {
             .map(|s| s.tenant_id.clone())
             .collect())
     }
+}
+
+#[async_trait]
+impl BillingRepository for MockStore {
+    async fn upsert_customer(
+        &self,
+        tenant_id: &str,
+        stripe_customer_id: &str,
+    ) -> anyhow::Result<()> {
+        let mut d = self.0.lock().unwrap();
+        d.billing_customers
+            .entry(tenant_id.to_string())
+            .or_default()
+            .customer = Some(stripe_customer_id.to_string());
+        Ok(())
+    }
+
+    async fn upsert_subscription(
+        &self,
+        tenant_id: &str,
+        stripe_customer_id: &str,
+        stripe_subscription_id: &str,
+        price_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let mut d = self.0.lock().unwrap();
+        let row = d
+            .billing_customers
+            .entry(tenant_id.to_string())
+            .or_default();
+        row.customer = Some(stripe_customer_id.to_string());
+        row.subscription = Some(stripe_subscription_id.to_string());
+        row.price = price_id.map(str::to_string);
+        Ok(())
+    }
+
+    async fn customer_id(&self, tenant_id: &str) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .billing_customers
+            .get(tenant_id)
+            .and_then(|r| r.customer.clone()))
+    }
+
+    async fn tenant_for_subscription(
+        &self,
+        stripe_subscription_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .billing_customers
+            .iter()
+            .find(|(_, r)| r.subscription.as_deref() == Some(stripe_subscription_id))
+            .map(|(tenant_id, _)| tenant_id.clone()))
+    }
 
     async fn is_event_processed(&self, event_id: &str) -> anyhow::Result<bool> {
-        Ok(self.0.lock().unwrap().processed_events.contains(event_id))
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .processed_stripe_events
+            .contains(event_id))
     }
 
     async fn record_event(&self, event_id: &str, _now: DateTime<Utc>) -> anyhow::Result<()> {
         self.0
             .lock()
             .unwrap()
-            .processed_events
+            .processed_stripe_events
             .insert(event_id.to_string());
         Ok(())
     }
 }
 
-// ── Recording event publisher ───────────────────────────────────────────────────
+// ── Recording event bus ─────────────────────────────────────────────────────────
 
-/// An [`EventPublisher`] that records every published event (for `published()`
-/// assertions) and queues them for the deterministic [`Harness::pump`] — while also
-/// forwarding to a real broadcast bus so a test can drive the async reactors if it
+/// An [`EventBus`] that records every published event (for `published()` assertions)
+/// and queues them for the deterministic [`Harness::pump`] — while also forwarding to
+/// a real [`InProcessEventBus`] so a test can drive the spawned async reactors if it
 /// wants to.
-pub struct RecordingEventPublisher {
-    bus: BroadcastEventBus,
+pub struct RecordingEventBus {
+    inner: InProcessEventBus,
     log: Mutex<Vec<DomainEvent>>,
     pending: Mutex<VecDeque<DomainEvent>>,
 }
 
-impl RecordingEventPublisher {
+impl RecordingEventBus {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            bus: BroadcastEventBus::new(256),
+            inner: InProcessEventBus::new(256),
             log: Mutex::new(Vec::new()),
             pending: Mutex::new(VecDeque::new()),
         }
@@ -900,33 +987,34 @@ impl RecordingEventPublisher {
     }
 }
 
-impl Default for RecordingEventPublisher {
+impl Default for RecordingEventBus {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl EventPublisher for RecordingEventPublisher {
-    fn publish(&self, event: DomainEvent) {
+#[async_trait]
+impl EventBus for RecordingEventBus {
+    async fn publish(&self, event: &DomainEvent) -> anyhow::Result<()> {
         self.log.lock().unwrap().push(event.clone());
         self.pending.lock().unwrap().push_back(event.clone());
-        self.bus.publish(event);
+        self.inner.publish(event).await
     }
 
-    fn subscribe(&self) -> broadcast::Receiver<DomainEvent> {
-        self.bus.subscribe()
+    async fn subscribe(&self, group: &str) -> anyhow::Result<Box<dyn EventStream>> {
+        self.inner.subscribe(group).await
     }
 }
 
 // ── Mock Stripe gateway ─────────────────────────────────────────────────────────
 
-/// A recording [`StripeGateway`] fake: checkout/portal return canned URLs and record
-/// their calls; `construct_event` returns a pre-set [`StripeEvent`] (set by the
-/// webhook-endpoint test). No real Stripe — the signature crypto is exercised
-/// directly in `stripe::tests`, not re-tested here.
 /// A recorded `create_checkout_session` call: `(customer_id, email, price_id, tenant_id)`.
 pub type CheckoutCall = (Option<String>, String, String, String);
 
+/// A recording [`StripeGateway`] fake: checkout/portal return canned URLs and record
+/// their calls; `construct_event` returns a pre-set [`StripeEvent`] (set by the
+/// webhook-endpoint test). No real Stripe — the signature crypto is exercised directly
+/// in `wardnet_billing::gateway::tests`, not re-tested here.
 pub struct MockStripeGateway {
     checkout_url: String,
     portal_url: String,
@@ -997,8 +1085,8 @@ impl StripeGateway for MockStripeGateway {
 // ── Recording email sender ──────────────────────────────────────────────────────
 
 /// A recording [`EmailSender`] fake: records every `(to, code)` and reports
-/// `delivers() == false` (so the API still echoes the code, keeping mock-backed
-/// HTTP tests exercisable). Use [`sent`](Self::sent) to assert an email was sent.
+/// `delivers() == false` (so the API still echoes the code, keeping mock-backed HTTP
+/// tests exercisable). Use [`sent`](Self::sent) to assert an email was sent.
 pub struct RecordingEmailSender {
     sent: Mutex<Vec<(String, String)>>,
 }
@@ -1086,7 +1174,7 @@ pub fn test_signer(seed: u8) -> Signer {
 pub struct Harness {
     pub state: AppState,
     pub store: MockStore,
-    pub events: Arc<RecordingEventPublisher>,
+    pub events: Arc<RecordingEventBus>,
     pub stripe: Arc<MockStripeGateway>,
     pub email: Arc<RecordingEmailSender>,
     pub subscriptions: Arc<SubscriptionService>,
@@ -1097,18 +1185,27 @@ pub struct Harness {
 impl Harness {
     /// Apply every queued domain event through the reactor handlers, to a fixpoint.
     pub async fn pump(&self) {
-        pump_events(&self.events, &self.subscriptions, &self.tenants).await;
+        pump_events(
+            &self.events,
+            &self.subscriptions,
+            &self.tenants,
+            &self.identities,
+        )
+        .await;
     }
 }
 
-/// Apply every queued domain event through the reactor handlers, to a fixpoint (a
-/// cancel publishes a further `SubscriptionDeactivated`, etc.). The synchronous
-/// stand-in for the spawned reactors, so tests stay deterministic. Shared by the
-/// mock-backed [`Harness`] and the Postgres integration harness.
+/// Apply every queued domain event through the split reactors, to a fixpoint (a cancel
+/// publishes a further `SubscriptionDeactivated`, etc.). The synchronous stand-in for
+/// the spawned reactors, so tests stay deterministic. Spans all three aggregates'
+/// reactors — subscription (open trial / cancel), network (deprovision cascade), and
+/// identities (purge on deregister) — shared by the mock-backed [`Harness`] and the
+/// Postgres integration harness.
 pub async fn pump_events(
-    events: &RecordingEventPublisher,
+    events: &RecordingEventBus,
     subscriptions: &SubscriptionService,
     tenants: &TenantsService,
+    identities: &IdentitiesService,
 ) {
     loop {
         let batch = events.take_pending();
@@ -1116,8 +1213,9 @@ pub async fn pump_events(
             break;
         }
         for event in &batch {
-            crate::subscription::reactor::apply_to_subscription(subscriptions, event).await;
-            crate::subscription::reactor::apply_to_network(tenants, event).await;
+            wardnet_subscriptions::reactor::apply_to_subscription(subscriptions, event).await;
+            wardnet_tenants::reactor::apply_to_network(tenants, event).await;
+            wardnet_tenants::identities::reactor::apply_to_identities(identities, event).await;
         }
     }
 }
@@ -1139,36 +1237,47 @@ pub fn build_harness_with_providers(
     providers: HashMap<String, Arc<dyn ExternalIdentityProvider>>,
 ) -> Harness {
     let store = MockStore::new();
-    let events: Arc<RecordingEventPublisher> = Arc::new(RecordingEventPublisher::new());
+    let events: Arc<RecordingEventBus> = Arc::new(RecordingEventBus::new());
     let stripe: Arc<MockStripeGateway> = Arc::new(MockStripeGateway::new());
     let email: Arc<RecordingEmailSender> = Arc::new(RecordingEmailSender::new());
     let signer = Arc::new(test_signer(seed));
     let verifier = Verifier::from_pem(jwt_keypair_pem(seed).1.as_bytes(), "tenants").unwrap();
 
+    // The license aggregate, shared as both its read + command port.
     let subscriptions = Arc::new(SubscriptionService::new(
-        Arc::new(store.clone()),
-        events.clone(),
-        stripe.clone(),
+        Arc::new(store.clone()) as Arc<dyn SubscriptionRepository>,
+        Arc::clone(&events) as Arc<dyn EventBus>,
         TrialPolicy {
             trial_days: 60,
             trial_grace_days: 15,
             payment_grace_days: 15,
         },
     ));
+    let subscription_reader: Arc<dyn SubscriptionReader> = subscriptions.clone();
+    let subscription_commands: Arc<dyn SubscriptionCommands> = subscriptions.clone();
+
+    // The payment aggregate, driving the license aggregate only through the ports.
+    let billing: Arc<dyn BillingPort> = Arc::new(BillingService::new(
+        Arc::clone(&stripe) as Arc<dyn StripeGateway>,
+        Arc::new(store.clone()) as Arc<dyn BillingRepository>,
+        Arc::clone(&subscription_reader),
+        Arc::clone(&subscription_commands),
+    ));
+
     let tenants = Arc::new(TenantsService::new(
-        Arc::new(store.clone()),
-        Arc::new(store.clone()),
-        Arc::new(store.clone()),
-        Arc::new(store.clone()),
-        subscriptions.clone(),
-        events.clone(),
-        email.clone(),
+        Arc::new(store.clone()) as Arc<dyn TenantRepository>,
+        Arc::new(store.clone()) as Arc<dyn NetworkRepository>,
+        Arc::new(store.clone()) as Arc<dyn DaemonRepository>,
+        Arc::new(store.clone()) as Arc<dyn EnrollmentRepository>,
+        Arc::clone(&subscription_reader),
+        Arc::clone(&events) as Arc<dyn EventBus>,
+        Arc::clone(&email) as Arc<dyn EmailSender>,
         Arc::clone(&signer),
         ["use1".to_string(), "eu1".to_string()],
     ));
     let identities = Arc::new(IdentitiesService::new(
-        Arc::new(store.clone()),
-        Arc::new(store.clone()),
+        Arc::new(store.clone()) as Arc<dyn TenantIdentityRepository>,
+        Arc::new(store.clone()) as Arc<dyn SessionRepository>,
         tenants.clone(),
         providers,
         signer,
@@ -1177,7 +1286,9 @@ pub fn build_harness_with_providers(
     let state = AppState::new(
         test_config(),
         tenants.clone(),
-        subscriptions.clone(),
+        Arc::clone(&subscription_reader),
+        Arc::clone(&subscription_commands),
+        Arc::clone(&billing),
         identities.clone(),
         verifier,
     );
@@ -1193,24 +1304,24 @@ pub fn build_harness_with_providers(
     }
 }
 
-/// A mock [`ExternalIdentityProvider`] returning a preset [`VerifiedIdentity`] from
+/// A mock [`ExternalIdentityProvider`] returning a preset `VerifiedIdentity` from
 /// `exchange` (and a fixed authorize URL) — drives the OIDC-callback tests without a
 /// real provider.
 pub struct MockIdentityProvider {
-    identity: crate::identities::provider::VerifiedIdentity,
+    identity: wardnet_tenants::identities::provider::VerifiedIdentity,
 }
 
 impl MockIdentityProvider {
     #[must_use]
-    pub fn new(identity: crate::identities::provider::VerifiedIdentity) -> Self {
+    pub fn new(identity: wardnet_tenants::identities::provider::VerifiedIdentity) -> Self {
         Self { identity }
     }
 }
 
 #[async_trait]
 impl ExternalIdentityProvider for MockIdentityProvider {
-    fn authorize_url(&self) -> crate::identities::provider::AuthorizeRequest {
-        crate::identities::provider::AuthorizeRequest {
+    fn authorize_url(&self) -> wardnet_tenants::identities::provider::AuthorizeRequest {
+        wardnet_tenants::identities::provider::AuthorizeRequest {
             url: "https://provider.test/authorize".to_string(),
             csrf_state: "test-state".to_string(),
             verifier: String::new(),
@@ -1221,7 +1332,7 @@ impl ExternalIdentityProvider for MockIdentityProvider {
         &self,
         _code: &str,
         _verifier: &str,
-    ) -> anyhow::Result<crate::identities::provider::VerifiedIdentity> {
+    ) -> anyhow::Result<wardnet_tenants::identities::provider::VerifiedIdentity> {
         Ok(self.identity.clone())
     }
 }

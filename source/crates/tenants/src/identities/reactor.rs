@@ -11,10 +11,7 @@
 
 use std::sync::Arc;
 
-use tokio::sync::broadcast::Receiver;
-use tokio::sync::broadcast::error::RecvError;
-
-use wardnet_common::event::DomainEvent;
+use wardnet_common::event::{DomainEvent, EventStream};
 
 use crate::identities::IdentitiesService;
 
@@ -34,18 +31,10 @@ pub async fn apply_to_identities(service: &IdentitiesService, event: &DomainEven
 /// `IdentitiesService → TenantsService`; this reverse side-effect flows as an event.
 pub async fn run_identities_reactor(
     service: Arc<IdentitiesService>,
-    mut events: Receiver<DomainEvent>,
+    mut events: Box<dyn EventStream>,
 ) {
-    loop {
-        match events.recv().await {
-            Ok(event) => apply_to_identities(&service, &event).await,
-            Err(RecvError::Lagged(skipped)) => {
-                tracing::warn!(
-                    skipped,
-                    "identities reactor lagged; FK cascade is the safety net"
-                );
-            }
-            Err(RecvError::Closed) => break,
-        }
+    while let Some(delivery) = events.next().await {
+        apply_to_identities(&service, delivery.event()).await;
+        delivery.ack().await;
     }
 }

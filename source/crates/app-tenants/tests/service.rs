@@ -1,15 +1,19 @@
-//! Unit tests for [`TenantsService`] over the shared mock store + recording event
-//! publisher. Flows that depend on the event-driven trial run [`Harness::pump`] to
-//! apply the reactors deterministically.
+//! Service-level tests for [`TenantsService`] over the fully-wired [`Harness`] (the
+//! tenant + subscription + billing aggregates over one shared mock store + recording
+//! event bus). Flows that depend on the event-driven trial run [`Harness::pump`] to
+//! apply the split reactors deterministically. Lives in the composition crate because
+//! it needs all three aggregates wired together.
 
 use chrono::Utc;
 
+use wardnet_common::contract::{Entitlement, SubscriptionStatus};
 use wardnet_common::token::{PrincipalType, Verifier};
 
-use crate::error::TenantsError;
-use crate::repository::subscription::{Entitlement, Subscription, SubscriptionStatus};
-use crate::repository::{ProvisioningState, Tenant};
-use crate::test_helpers::{Harness, build_harness, build_state, daemon_keypair, jwt_keypair_pem};
+use wardnet_subscriptions::Subscription;
+use wardnet_tenants::error::TenantsError;
+use wardnet_tenants::repository::{ProvisioningState, Tenant};
+mod common;
+use common::{Harness, build_harness, build_state, daemon_keypair, jwt_keypair_pem};
 
 const SEED: u8 = 5;
 const REGION: &str = "use1";
@@ -35,9 +39,6 @@ fn seed_tenant_with_entitlement(h: &Harness, id: &str, max_networks: u32, max_da
             max_networks,
             max_daemons,
         },
-        stripe_customer_id: None,
-        stripe_subscription_id: None,
-        price_id: None,
         trial_expires_at: None,
         current_period_end: None,
         created_at: now,
@@ -349,7 +350,11 @@ async fn mint_jwt_denied_after_subscription_canceled() {
     // Active (trialing) tenant mints fine.
     assert!(h.state.tenants().mint_jwt(&cnf).await.is_ok());
     // After cancel, the daemon's key can no longer mint a token (revocation at refresh).
-    h.state.subscriptions().cancel(&tenant_id).await.unwrap();
+    h.state
+        .subscription_commands()
+        .cancel(&tenant_id)
+        .await
+        .unwrap();
     assert!(matches!(
         h.state.tenants().mint_jwt(&cnf).await,
         Err(TenantsError::Forbidden(_))
@@ -406,7 +411,11 @@ async fn reconcile_provisioner_then_reaper_lifecycle() {
 
     // Cancel deactivates the subscription; the network reactor cascades the network
     // to deprovisioning.
-    h.state.subscriptions().cancel(&tenant_id).await.unwrap();
+    h.state
+        .subscription_commands()
+        .cancel(&tenant_id)
+        .await
+        .unwrap();
     h.pump().await;
     assert_eq!(
         h.store.network_state(&slug),
@@ -583,12 +592,20 @@ async fn reconcile_backfills_a_missing_trial() {
         deregistered_at: None,
     });
     assert!(h.store.current_subscription("drift").is_none());
-    h.state.tenants().reconcile().await.unwrap();
+    wardnet_tenants_app::reconcile(h.tenants.as_ref(), h.subscriptions.as_ref())
+        .await
+        .unwrap();
     assert!(h.store.current_subscription("drift").is_some());
 
     // Reap it, then reconcile again — no fresh trial (history exists).
-    h.state.subscriptions().cancel("drift").await.unwrap();
-    h.state.tenants().reconcile().await.unwrap();
+    h.state
+        .subscription_commands()
+        .cancel("drift")
+        .await
+        .unwrap();
+    wardnet_tenants_app::reconcile(h.tenants.as_ref(), h.subscriptions.as_ref())
+        .await
+        .unwrap();
     assert!(h.store.current_subscription("drift").is_none());
 }
 

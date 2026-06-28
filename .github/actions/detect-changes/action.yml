@@ -47,9 +47,17 @@ runs:
             - 'source/end2end-tests/**'
             - 'source/Makefile'
             - '.github/**'
+          # A "service" deployable spans its domain lib + thin bin crate; the
+          # tenants binary additionally composes the subscriptions + billing libs
+          # (ADR-0010), so a change to any of them rebuilds tenants.
           tenants:
             - 'source/crates/tenants/**'
+            - 'source/crates/app-tenants/**'
+            - 'source/crates/subscriptions/**'
+            - 'source/crates/billing/**'
           ddns:
             - 'source/crates/ddns/**'
+            - 'source/crates/app-ddns/**'
           tunneller:
             - 'source/crates/tunneller/**'
+            - 'source/crates/app-tunneller/**'

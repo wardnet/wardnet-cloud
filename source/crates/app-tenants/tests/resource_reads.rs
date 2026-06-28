@@ -9,11 +9,13 @@ use http_body_util::BodyExt as _;
 use tower::ServiceExt as _;
 
 use wardnet_common::auth::ServiceIdentity;
+use wardnet_common::contract::{Entitlement, SubscriptionStatus};
+use wardnet_subscriptions::Subscription;
 use wardnet_tenants::api::{network, reconcile, tenant};
-use wardnet_tenants::repository::subscription::{Entitlement, Subscription, SubscriptionStatus};
 use wardnet_tenants::repository::tenant::Tenant;
 use wardnet_tenants::state::AppState;
-use wardnet_tenants::test_helpers::{build_state, daemon_keypair};
+mod common;
+use common::{build_state, daemon_keypair};
 
 const SEED: u8 = 5;
 const REGION: &str = "use1";
@@ -37,9 +39,6 @@ async fn seeded() -> (AppState, String) {
             max_networks: 5,
             max_daemons: 5,
         },
-        stripe_customer_id: None,
-        stripe_subscription_id: None,
-        price_id: None,
         trial_expires_at: None,
         current_period_end: None,
         created_at: now,

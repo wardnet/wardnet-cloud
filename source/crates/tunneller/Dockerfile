@@ -7,7 +7,7 @@
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p wardnet-tunneller
+RUN cargo build --release -p wardnet-tunneller-bin
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \

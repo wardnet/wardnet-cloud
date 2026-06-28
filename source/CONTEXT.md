@@ -28,11 +28,21 @@ details. (See `docs/adr/` for the decisions behind these.)
   httpOnly cookie (30-day sliding), created at login. Distinct from the short-lived
   [JWT](#caller-type) it mints via the silent exchange — the session is what logout /
   password-reset / deregister destroys. See `docs/adr/0009`.
-- **Subscription** — the billing aggregate that **grants** a tenant's
-  [entitlement](#entitlement). A tenant has a 1:N history with at most one **live**
-  (non-canceled) row — its *current* subscription. Status is `trialing → active →
-  past_due → canceled` (Stripe-driven once paid). The free [trial](#trial) is itself
-  a subscription row. Owned by `SubscriptionService`; no other service touches it.
+- **Subscription** — the **license**: the provider-agnostic aggregate that **grants** a
+  tenant's [entitlement](#entitlement). A tenant has a 1:N history with at most one
+  **live** (non-canceled) row — its *current* subscription. Status is `trialing → active
+  → past_due → canceled`. The free [trial](#trial) is itself a subscription row. Knows
+  nothing about payment providers (that is [Billing](#billing)); owned by
+  `SubscriptionService` in the `subscriptions` crate. See `docs/adr/0010`.
+- **Billing** — *how* a subscription is paid for: the payment provider (Stripe today),
+  hosted [Checkout](#checkout-session)/[Portal](#billing-portal), the webhook, the
+  idempotency ledger, and the provider-reference ids (the `billing_customers` table).
+  Swappable; owned by `BillingService` in the `billing` crate. Drives the license only
+  through the [SubscriptionCommands](#subscriptionreader--subscriptioncommands) port —
+  Subscription never calls Billing back.
+- **PaymentProvider** — the port behind which a concrete provider sits (`StripeGateway`
+  today). Billing talks to the provider only through it, so the wire format never leaks
+  into the lifecycle logic.
 - **Plan** — a purchasable tier, defined as a Stripe Price whose metadata carries the
   `max_networks` / `max_daemons` it grants. Adding a plan is a Stripe change, no deploy.
 - **Network** — one wardnet network owned by a tenant. Holds a globally-unique
@@ -73,10 +83,22 @@ details. (See `docs/adr/` for the decisions behind these.)
 
 ## Eventing & reconciliation
 
-- **Domain event** — an in-process signal a service raises so another aggregate can
-  react, instead of one service reaching into another's repository (`TenantCreated`,
-  `TenantDeregistered`, `SubscriptionDeactivated`). Best-effort delivery (a broadcast
-  bus); the reconcile is the guarantee. See `docs/adr/0007`.
+- **Domain event** — a signal a service raises so another aggregate can react, instead
+  of one service reaching into another's repository (`TenantCreated`,
+  `TenantDeregistered`, `SubscriptionDeactivated`). Best-effort delivery; the
+  [reconcile](#reconcile) is the guarantee. Serde-serializable with a versioned wire
+  format. See `docs/adr/0007`, `docs/adr/0010`.
+- **EventBus / EventStream** — the transport-free **port** domain events flow through:
+  `publish(&event)` + `subscribe(group) -> EventStream` (no `tokio` type in any
+  signature). One in-process adapter today; a durable broker (using `group` for
+  competing consumers across replicas) drops in later with no reactor change. Supersedes
+  the in-process-only "broadcast bus" framing.
+- **SubscriptionReader / SubscriptionCommands** — the synchronous query/command **ports**
+  over the [license](#subscription) aggregate (in `wardnet_common`). `SubscriptionReader`
+  = entitlement reads (`current` / grace-aware `is_active`); `SubscriptionCommands` = the
+  one-way [Billing](#billing) → Subscription write edge (`convert_trial_to_paid` /
+  `update_paid` / `mark_past_due` / `cancel`). In-proc adapter = a direct call; a
+  mesh-mTLS HTTP adapter later. The crates depend on these ports, never on each other.
 - **Reactor** — a long-running loop subscribed to the event bus that turns a domain
   event into a call on the **owning** service's method (e.g. `TenantCreated` →
   `SubscriptionService::create_trial`; `SubscriptionDeactivated` →

@@ -417,7 +417,16 @@ impl IdentitiesService {
     /// already present (a returning user). For a new method it runs gate 1
     /// (`email_verified`), then gate 2 (match→auto-link / no-match→web-first signup via
     /// the tenant aggregate's `register_tenant`), and inserts the identity row.
-    async fn resolve_identity(
+    ///
+    /// # Errors
+    /// [`IdentitiesError::Unauthorized`] when gate 1 fails (unverified email);
+    /// [`IdentitiesError::Internal`] on a repository / tenant-aggregate failure.
+    ///
+    /// `pub` so the composition crate's integration tests can pin the two-gate branches
+    /// directly; `#[doc(hidden)]` because it is an internal step of the login flows
+    /// (`signup_with_password` / OIDC completion), not part of the intended public API.
+    #[doc(hidden)]
+    pub async fn resolve_identity(
         &self,
         verified: &VerifiedIdentity,
         secret_hash: Option<String>,

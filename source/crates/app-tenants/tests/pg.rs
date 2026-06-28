@@ -1,28 +1,39 @@
 //! Postgres-gated tests for the real SQL repositories (the enroll + register-network
-//! transactions and the reconcile cursor the in-memory mocks can't validate).
+//! transactions and the reconcile cursor the in-memory mocks can't validate), wired
+//! through the composition root's **merged** migrator (tenants + subscriptions +
+//! billing) — the only place the live schema exists.
 //!
 //! `#[ignore]`d by default — they need a `PostgreSQL` server. Run with:
 //!   `TENANTS_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432 \
-//!    cargo test -p wardnet-tenants -- --ignored`
+//!    cargo test -p wardnet-tenants-bin -- --ignored`
 //! The URL is a bare server URL **without** a `/database` suffix; each test creates
-//! a fresh UUID-named database and runs the init migration into it.
+//! a fresh UUID-named database and runs the merged migration into it.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use wardnet_tenants::db::{self, DbPools};
+use wardnet_common::db::DbPools;
+use wardnet_common::event::EventBus;
+use wardnet_common::ports::SubscriptionReader;
+
+use wardnet_subscriptions::{
+    PgSubscriptionRepository, SubscriptionRepository, SubscriptionService, TrialPolicy,
+};
+use wardnet_tenants::email::EmailSender;
+use wardnet_tenants::identities::IdentitiesService;
 use wardnet_tenants::repository::{
     DaemonRepository, EnrollmentRepository, NetworkRepository, PgDaemonRepository,
-    PgEnrollmentRepository, PgNetworkRepository, PgSubscriptionRepository, PgTenantRepository,
-    ProvisioningState, SubscriptionRepository, TenantRepository,
+    PgEnrollmentRepository, PgNetworkRepository, PgSessionRepository, PgTenantIdentityRepository,
+    PgTenantRepository, ProvisioningState, SessionRepository, TenantIdentityRepository,
+    TenantRepository,
 };
 use wardnet_tenants::service::TenantsService;
-use wardnet_tenants::subscription::{SubscriptionService, TrialPolicy};
-use wardnet_tenants::test_helpers::{
-    MockStripeGateway, RecordingEventPublisher, daemon_keypair, pump_events, test_signer,
-};
+use wardnet_tenants_app::db;
+mod common;
+use common::{RecordingEventBus, daemon_keypair, pump_events, test_signer};
 
 const SEED: u8 = 5;
 const REGION: &str = "use1";
@@ -52,13 +63,14 @@ async fn test_pool() -> DbPools {
         .expect("init test database")
 }
 
-/// A Postgres-backed harness mirroring the mock one: the tenant + subscription
-/// services over real repos, plus the recording publisher so flows can be pumped
+/// A Postgres-backed harness mirroring the mock one: the tenant + subscription +
+/// identities services over real repos, plus the recording bus so flows can be pumped
 /// deterministically (the spawned reactors are not running in tests).
 struct PgHarness {
-    events: Arc<RecordingEventPublisher>,
+    events: Arc<RecordingEventBus>,
     subscriptions: Arc<SubscriptionService>,
     tenants: Arc<TenantsService>,
+    identities: Arc<IdentitiesService>,
 }
 
 impl PgHarness {
@@ -67,40 +79,57 @@ impl PgHarness {
     }
 
     async fn pump(&self) {
-        pump_events(&self.events, &self.subscriptions, &self.tenants).await;
+        pump_events(
+            &self.events,
+            &self.subscriptions,
+            &self.tenants,
+            &self.identities,
+        )
+        .await;
     }
 }
 
 fn harness(pools: DbPools) -> PgHarness {
     // Built concretely so the harness keeps the recording handle; the `Arc` coerces
-    // to `Arc<dyn EventPublisher>` at each service call site.
-    let events: Arc<RecordingEventPublisher> = Arc::new(RecordingEventPublisher::new());
+    // to `Arc<dyn EventBus>` at each service call site.
+    let events: Arc<RecordingEventBus> = Arc::new(RecordingEventBus::new());
     let subscriptions = Arc::new(SubscriptionService::new(
         Arc::new(PgSubscriptionRepository::new_pools(pools.clone()))
             as Arc<dyn SubscriptionRepository>,
-        events.clone(),
-        Arc::new(MockStripeGateway::new()),
+        Arc::clone(&events) as Arc<dyn EventBus>,
         TrialPolicy {
             trial_days: 60,
             trial_grace_days: 15,
             payment_grace_days: 15,
         },
     ));
+    let subscription_reader: Arc<dyn SubscriptionReader> = subscriptions.clone();
+    let signer = Arc::new(test_signer(SEED));
     let tenants = Arc::new(TenantsService::new(
         Arc::new(PgTenantRepository::new_pools(pools.clone())) as Arc<dyn TenantRepository>,
         Arc::new(PgNetworkRepository::new_pools(pools.clone())) as Arc<dyn NetworkRepository>,
         Arc::new(PgDaemonRepository::new_pools(pools.clone())) as Arc<dyn DaemonRepository>,
-        Arc::new(PgEnrollmentRepository::new_pools(pools)) as Arc<dyn EnrollmentRepository>,
-        subscriptions.clone(),
-        events.clone(),
-        Arc::new(wardnet_tenants::email::NoopEmailSender),
-        Arc::new(test_signer(SEED)),
+        Arc::new(PgEnrollmentRepository::new_pools(pools.clone())) as Arc<dyn EnrollmentRepository>,
+        Arc::clone(&subscription_reader),
+        Arc::clone(&events) as Arc<dyn EventBus>,
+        Arc::new(wardnet_tenants::email::NoopEmailSender) as Arc<dyn EmailSender>,
+        Arc::clone(&signer),
         ["use1".to_string(), "eu1".to_string()],
+    ));
+    let identities = Arc::new(IdentitiesService::new(
+        Arc::new(PgTenantIdentityRepository::new_pools(pools.clone()))
+            as Arc<dyn TenantIdentityRepository>,
+        Arc::new(PgSessionRepository::new_pools(pools)) as Arc<dyn SessionRepository>,
+        Arc::clone(&tenants),
+        HashMap::new(),
+        signer,
+        300,
     ));
     PgHarness {
         events,
         subscriptions,
         tenants,
+        identities,
     }
 }
 

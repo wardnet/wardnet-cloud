@@ -10,10 +10,6 @@ description = "Wardnet DDNS service — regional DNS reconciler (provisioner + r
 name = "wardnet_ddns"
 path = "src/lib.rs"
 
-[[bin]]
-name = "wardnet-ddns"
-path = "src/main.rs"
-
 [dependencies]
 wardnet_common = { workspace = true }
 

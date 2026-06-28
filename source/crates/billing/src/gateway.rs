@@ -1,12 +1,12 @@
-//! Stripe integration behind a [`StripeGateway`] trait.
+//! Stripe integration behind a [`StripeGateway`] trait (the `PaymentProvider` port).
 //!
-//! The trait normalizes the bits of Stripe we use into our own types so the
-//! [`SubscriptionService`](crate::subscription::SubscriptionService) (and its tests)
-//! never touch Stripe's wire format directly. [`StripeClient`] is the production impl
-//! — a hand-rolled `reqwest` client against the Stripe REST API (the same pattern we
-//! use for GitHub `OAuth2`); tests use a recording fake. Webhook signatures are
-//! verified in-process ([`verify_signature`]) — the signature *is* the credential, so
-//! the ingress endpoint is unauthenticated.
+//! The trait normalizes the bits of Stripe we use into our own types so
+//! [`BillingService`](crate::service::BillingService) (and its tests) never touch
+//! Stripe's wire format directly. [`StripeClient`] is the production impl — a
+//! hand-rolled `reqwest` client against the Stripe REST API (the same pattern we use
+//! for GitHub `OAuth2`); tests use a recording fake. Webhook signatures are verified
+//! in-process ([`verify_signature`]) — the signature *is* the credential, so the
+//! ingress endpoint is unauthenticated.
 
 use std::collections::HashMap;
 
@@ -16,7 +16,7 @@ use hmac::{Hmac, Mac, digest::KeyInit};
 use serde::Deserialize;
 use sha2::Sha256;
 
-use crate::repository::subscription::{Entitlement, SubscriptionStatus};
+use wardnet_common::contract::{Entitlement, SubscriptionStatus};
 
 /// Stripe's webhook signatures are HMAC-SHA256.
 type HmacSha256 = Hmac<Sha256>;

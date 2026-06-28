@@ -18,7 +18,7 @@ use wardnet_common::contract::{
 };
 
 use crate::error::ApiError;
-use crate::repository::{Daemon, Subscription, Tenant};
+use crate::repository::{Daemon, Tenant};
 use crate::state::AppState;
 
 /// Register all account-plane routes.
@@ -36,30 +36,17 @@ pub fn register(router: OpenApiRouter<AppState>) -> OpenApiRouter<AppState> {
 }
 
 // ── Domain → contract conversions (orphan rule OK: the domain type is local) ───
+//
+// `From<Subscription> for SubscriptionView` now lives in the `subscriptions` crate
+// (it owns `Subscription`); handlers receive the `SubscriptionView` straight from the
+// `SubscriptionReader` port.
 
-impl From<Subscription> for SubscriptionView {
-    fn from(s: Subscription) -> Self {
-        Self {
-            id: s.id,
-            status: s.status,
-            entitlement: s.entitlement,
-            stripe_customer_id: s.stripe_customer_id,
-            stripe_subscription_id: s.stripe_subscription_id,
-            price_id: s.price_id,
-            trial_expires_at: s.trial_expires_at,
-            current_period_end: s.current_period_end,
-            created_at: s.created_at,
-            updated_at: s.updated_at,
-        }
-    }
-}
-
-/// Build the full [`TenantView`] from a tenant and its current subscription.
-pub(crate) fn tenant_view(tenant: Tenant, subscription: Option<Subscription>) -> TenantView {
+/// Build the full [`TenantView`] from a tenant and its current subscription view.
+pub(crate) fn tenant_view(tenant: Tenant, subscription: Option<SubscriptionView>) -> TenantView {
     TenantView {
         id: tenant.id,
         email: tenant.email,
-        subscription: subscription.map(Into::into),
+        subscription,
         created_at: tenant.created_at,
     }
 }
@@ -104,15 +91,20 @@ async fn me(
     let Caller::User(user) = &caller else {
         return Err(ApiError::Forbidden("user credential required".to_string()));
     };
-    let (tenant, subscription) = state
+    let tenant = state
         .tenants()
         .find_tenant(&user.tenant_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("no such tenant".to_string()))?;
+    let subscription = state
+        .subscriptions()
+        .current(&user.tenant_id)
+        .await
+        .map_err(ApiError::Internal)?;
     Ok(Json(MeView {
         tenant_id: tenant.id,
         email: tenant.email,
-        subscription: subscription.map(Into::into),
+        subscription,
     }))
 }
 
@@ -212,7 +204,11 @@ async fn update_tenant(
     }
     // Cancelling deactivates the subscription; the network-deprovision cascade follows
     // from the published `SubscriptionDeactivated` event (network reactor).
-    state.subscriptions().cancel(&id).await?;
+    state
+        .subscription_commands()
+        .cancel(&id)
+        .await
+        .map_err(ApiError::Internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -277,13 +273,15 @@ async fn create_checkout_session(
     Json(body): Json<CreateCheckoutSessionRequest>,
 ) -> Result<Json<CheckoutSessionResponse>, ApiError> {
     require_owner(&caller, &id)?;
-    let (tenant, _) = state
+    // Cross-aggregate orchestration: read the tenant email here, then drive Billing
+    // through its port (Billing never depends on the tenant aggregate).
+    let tenant = state
         .tenants()
         .find_tenant(&id)
         .await?
         .ok_or_else(|| ApiError::NotFound("no such tenant".to_string()))?;
     let url = state
-        .subscriptions()
+        .billing()
         .start_checkout(&id, &tenant.email, &body.price_id)
         .await?;
     Ok(Json(CheckoutSessionResponse { url }))
@@ -305,6 +303,6 @@ async fn billing_portal(
     Path(id): Path<String>,
 ) -> Result<Json<BillingPortalResponse>, ApiError> {
     require_owner(&caller, &id)?;
-    let url = state.subscriptions().billing_portal(&id).await?;
+    let url = state.billing().billing_portal(&id).await?;
     Ok(Json(BillingPortalResponse { url }))
 }

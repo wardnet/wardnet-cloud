@@ -3889,6 +3889,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "wardnet-billing"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "hex",
+ "hmac 0.13.0",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "wardnet_common",
+ "wiremock",
+]
+
+[[package]]
 name = "wardnet-ddns"
 version = "0.1.0"
 dependencies = [
@@ -3923,6 +3944,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wardnet-ddns-bin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tokio",
+ "tracing",
+ "wardnet-ddns",
+ "wardnet_common",
+]
+
+[[package]]
 name = "wardnet-e2e-mesh"
 version = "0.1.0"
 dependencies = [
@@ -3932,6 +3964,22 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "wardnet_common",
+]
+
+[[package]]
+name = "wardnet-subscriptions"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
  "wardnet_common",
 ]
 
@@ -3975,6 +4023,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "wardnet-tenants-bin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "ed25519-dalek",
+ "hex",
+ "http-body-util",
+ "opentelemetry",
+ "rcgen",
+ "reqwest 0.12.28",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "tokio",
+ "tokio-rustls",
+ "tower",
+ "tracing",
+ "uuid",
+ "wardnet-billing",
+ "wardnet-subscriptions",
+ "wardnet-tenants",
+ "wardnet_common",
+]
+
+[[package]]
 name = "wardnet-tunneller"
 version = "0.1.0"
 dependencies = [
@@ -4009,6 +4086,18 @@ dependencies = [
  "utoipa",
  "utoipa-axum",
  "uuid",
+ "wardnet_common",
+]
+
+[[package]]
+name = "wardnet-tunneller-bin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "opentelemetry",
+ "tokio",
+ "tracing",
+ "wardnet-tunneller",
  "wardnet_common",
 ]
 
