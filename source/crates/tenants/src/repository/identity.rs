@@ -60,6 +60,17 @@ pub enum InsertIdentityOutcome {
     AlreadyExists,
 }
 
+/// Outcome of an [`unlink_guarded`](TenantIdentityRepository::unlink_guarded) attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UnlinkOutcome {
+    /// The provider's method(s) were removed.
+    Removed,
+    /// Refused — it would have removed the account's only remaining login method.
+    WouldRemoveLast,
+    /// The tenant had no method for that provider (idempotent no-op).
+    NotLinked,
+}
+
 /// Data access for the `tenant_identities` table (Identities aggregate).
 #[async_trait]
 pub trait TenantIdentityRepository: Send + Sync {
@@ -87,6 +98,21 @@ pub trait TenantIdentityRepository: Send + Sync {
     /// Delete every login method for a tenant (the identities-purge on deregister).
     /// Returns the number of rows deleted. Idempotent.
     async fn delete_for_tenant(&self, tenant_id: &str) -> anyhow::Result<u64>;
+
+    /// All login methods for a tenant, oldest first (the `GET /v1/me/identities` read).
+    async fn list_for_tenant(&self, tenant_id: &str) -> anyhow::Result<Vec<TenantIdentity>>;
+
+    /// Atomically unlink the tenant's method(s) for `provider`, enforcing the
+    /// **≥1-login-method** invariant under concurrency: the count check and the delete
+    /// happen in one serialized transaction (locking the tenant's rows), so two
+    /// concurrent unlinks of different providers can never both pass the guard and zero
+    /// the account out. Idempotent ([`UnlinkOutcome::NotLinked`] when the provider isn't
+    /// present).
+    async fn unlink_guarded(
+        &self,
+        tenant_id: &str,
+        provider: &str,
+    ) -> anyhow::Result<UnlinkOutcome>;
 }
 
 /// `PostgreSQL`-backed [`TenantIdentityRepository`].
@@ -120,6 +146,17 @@ const UPDATE_SECRET_HASH: &str =
     "UPDATE tenant_identities SET secret_hash = $3 WHERE provider = $1 AND subject = $2";
 
 const DELETE_FOR_TENANT: &str = "DELETE FROM tenant_identities WHERE tenant_id = $1";
+
+const LIST_FOR_TENANT: &str = "SELECT tenant_id, provider, subject, secret_hash, email, created_at \
+     FROM tenant_identities WHERE tenant_id = $1 ORDER BY created_at";
+
+// Lock the tenant's identity rows for the duration of the unlink decision so the
+// count check and the delete are one atomic step (no TOCTOU between concurrent unlinks).
+const LOCK_TENANT_PROVIDERS: &str =
+    "SELECT provider FROM tenant_identities WHERE tenant_id = $1 FOR UPDATE";
+
+const DELETE_FOR_TENANT_PROVIDER: &str =
+    "DELETE FROM tenant_identities WHERE tenant_id = $1 AND provider = $2";
 
 #[async_trait]
 impl TenantIdentityRepository for PgTenantIdentityRepository {
@@ -177,5 +214,41 @@ impl TenantIdentityRepository for PgTenantIdentityRepository {
             .await?
             .rows_affected();
         Ok(affected)
+    }
+
+    async fn list_for_tenant(&self, tenant_id: &str) -> anyhow::Result<Vec<TenantIdentity>> {
+        let rows = sqlx::query_as::<_, TenantIdentityRow>(LIST_FOR_TENANT)
+            .bind(tenant_id)
+            .fetch_all(&self.pools.read)
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn unlink_guarded(
+        &self,
+        tenant_id: &str,
+        provider: &str,
+    ) -> anyhow::Result<UnlinkOutcome> {
+        let mut tx = self.pools.write.begin().await?;
+        // Snapshot + lock the tenant's methods so a concurrent unlink can't race the guard.
+        let providers: Vec<String> = sqlx::query_scalar(LOCK_TENANT_PROVIDERS)
+            .bind(tenant_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        let victims = providers.iter().filter(|p| *p == provider).count();
+        let outcome = if victims == 0 {
+            UnlinkOutcome::NotLinked
+        } else if providers.len() == victims {
+            UnlinkOutcome::WouldRemoveLast
+        } else {
+            sqlx::query(DELETE_FOR_TENANT_PROVIDER)
+                .bind(tenant_id)
+                .bind(provider)
+                .execute(&mut *tx)
+                .await?;
+            UnlinkOutcome::Removed
+        };
+        tx.commit().await?;
+        Ok(outcome)
     }
 }

@@ -21,7 +21,9 @@ use base64::Engine as _;
 use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::SigningKey;
 
-use wardnet_common::contract::{Entitlement, InvoiceView, PaymentMethodView, SubscriptionStatus};
+use wardnet_common::contract::{
+    CodePurpose, Entitlement, InvoiceView, PaymentMethodView, SubscriptionStatus,
+};
 use wardnet_common::event::{DomainEvent, EventBus, EventStream, InProcessEventBus};
 use wardnet_common::ports::{BillingPort, SubscriptionCommands, SubscriptionReader};
 use wardnet_common::token::{Signer, Verifier};
@@ -40,7 +42,7 @@ use wardnet_tenants::identities::provider::ExternalIdentityProvider;
 use wardnet_tenants::repository::daemon::{Daemon, DaemonRepository};
 use wardnet_tenants::repository::enrollment::{EnrollOutcome, EnrollmentRepository};
 use wardnet_tenants::repository::identity::{
-    InsertIdentityOutcome, TenantIdentity, TenantIdentityRepository,
+    InsertIdentityOutcome, TenantIdentity, TenantIdentityRepository, UnlinkOutcome,
 };
 use wardnet_tenants::repository::network::{
     Network, NetworkRepository, ProvisioningState, RegisterNetworkOutcome,
@@ -86,6 +88,7 @@ pub fn daemon_keypair(seed: u8) -> (SigningKey, String) {
 struct CodeRow {
     email: String,
     tenant_id: Option<String>,
+    purpose: String,
     expires_at: DateTime<Utc>,
     used_at: Option<DateTime<Utc>>,
 }
@@ -143,6 +146,22 @@ impl MockStore {
             .unwrap()
             .tenants
             .insert(tenant.id.clone(), tenant);
+    }
+
+    /// Seed a login method directly (e.g. a federated `google` identity already linked
+    /// to another tenant, for the cross-tenant link-collision test).
+    pub fn seed_identity(&self, tenant_id: &str, provider: &str, subject: &str, email: &str) {
+        self.0.lock().unwrap().identities.insert(
+            (provider.to_string(), subject.to_string()),
+            TenantIdentity {
+                tenant_id: tenant_id.to_string(),
+                provider: provider.to_string(),
+                subject: subject.to_string(),
+                secret_hash: None,
+                email: email.to_string(),
+                created_at: Utc::now(),
+            },
+        );
     }
 
     /// Seed a subscription directly (e.g. an active paid sub with a custom entitlement).
@@ -539,6 +558,7 @@ impl EnrollmentRepository for MockStore {
         code_hash: &str,
         email: &str,
         tenant_id: Option<&str>,
+        purpose: &str,
         expires_at: DateTime<Utc>,
     ) -> anyhow::Result<()> {
         self.0.lock().unwrap().codes.insert(
@@ -546,6 +566,7 @@ impl EnrollmentRepository for MockStore {
             CodeRow {
                 email: email.to_string(),
                 tenant_id: tenant_id.map(str::to_string),
+                purpose: purpose.to_string(),
                 expires_at,
                 used_at: None,
             },
@@ -567,7 +588,8 @@ impl EnrollmentRepository for MockStore {
         let Some(code) = d.codes.get(code_hash) else {
             return Ok(EnrollOutcome::BadCode);
         };
-        if code.used_at.is_some() || code.expires_at <= now {
+        // Only an `enrollment` code can start a daemon enroll (PR3 purpose binding).
+        if code.used_at.is_some() || code.expires_at <= now || code.purpose != "enrollment" {
             return Ok(EnrollOutcome::BadCode);
         }
         let email = code.email.clone();
@@ -614,17 +636,23 @@ impl EnrollmentRepository for MockStore {
         })
     }
 
-    async fn consume_signup_code(
+    async fn consume_code(
         &self,
         code_hash: &str,
+        purpose: &str,
         now: DateTime<Utc>,
     ) -> anyhow::Result<Option<String>> {
         let mut d = self.0.lock().unwrap();
         let Some(code) = d.codes.get_mut(code_hash) else {
             return Ok(None);
         };
-        // Signup codes only (tenant_id None), unused and unexpired.
-        if code.used_at.is_some() || code.expires_at <= now || code.tenant_id.is_some() {
+        // The matching purpose, tenant-less (web codes only), unused and unexpired
+        // (PR3 cross-purpose binding + structural defence-in-depth).
+        if code.used_at.is_some()
+            || code.expires_at <= now
+            || code.purpose != purpose
+            || code.tenant_id.is_some()
+        {
             return Ok(None);
         }
         code.used_at = Some(now);
@@ -726,6 +754,48 @@ impl TenantIdentityRepository for MockStore {
         d.identities.retain(|_, id| id.tenant_id != tenant_id);
         Ok((before - d.identities.len()) as u64)
     }
+
+    async fn list_for_tenant(&self, tenant_id: &str) -> anyhow::Result<Vec<TenantIdentity>> {
+        let mut rows: Vec<TenantIdentity> = self
+            .0
+            .lock()
+            .unwrap()
+            .identities
+            .values()
+            .filter(|id| id.tenant_id == tenant_id)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|id| id.created_at);
+        Ok(rows)
+    }
+
+    async fn unlink_guarded(
+        &self,
+        tenant_id: &str,
+        provider: &str,
+    ) -> anyhow::Result<UnlinkOutcome> {
+        // The Mutex makes this naturally atomic (the Pg impl locks the rows instead).
+        let mut d = self.0.lock().unwrap();
+        let total = d
+            .identities
+            .values()
+            .filter(|id| id.tenant_id == tenant_id)
+            .count();
+        let victims = d
+            .identities
+            .values()
+            .filter(|id| id.tenant_id == tenant_id && id.provider == provider)
+            .count();
+        if victims == 0 {
+            return Ok(UnlinkOutcome::NotLinked);
+        }
+        if total == victims {
+            return Ok(UnlinkOutcome::WouldRemoveLast);
+        }
+        d.identities
+            .retain(|_, id| !(id.tenant_id == tenant_id && id.provider == provider));
+        Ok(UnlinkOutcome::Removed)
+    }
 }
 
 #[async_trait]
@@ -759,6 +829,26 @@ impl SessionRepository for MockStore {
         };
         d.sessions.get_mut(token_hash).unwrap().expires_at = new_expires_at;
         Ok(Some(tenant_id))
+    }
+
+    async fn tenant_for(
+        &self,
+        token_hash: &str,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<Option<String>> {
+        // Read-only: same live-session + live-tenant guard, no expiry slide.
+        let d = self.0.lock().unwrap();
+        let live_tenant = |d: &Data, tid: &str| {
+            d.tenants
+                .get(tid)
+                .is_some_and(|t| t.deregistered_at.is_none())
+        };
+        Ok(match d.sessions.get(token_hash) {
+            Some(s) if s.expires_at > now && live_tenant(&d, &s.tenant_id) => {
+                Some(s.tenant_id.clone())
+            }
+            _ => None,
+        })
     }
 
     async fn delete(&self, token_hash: &str) -> anyhow::Result<bool> {
@@ -1153,7 +1243,7 @@ impl Default for RecordingEmailSender {
 
 #[async_trait]
 impl EmailSender for RecordingEmailSender {
-    async fn send_enrollment_code(&self, to: &str, code: &str) -> anyhow::Result<()> {
+    async fn send_code(&self, to: &str, code: &str, _purpose: CodePurpose) -> anyhow::Result<()> {
         self.sent
             .lock()
             .unwrap()

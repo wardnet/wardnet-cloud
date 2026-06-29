@@ -33,9 +33,9 @@ aggregate uses:
   `IdentitiesService → TenantsService` edge (mirroring `TenantsService →
   SubscriptionService::current`): `find_tenant_by_email` (the join-key read),
   `register_tenant` (web-first signup — the write *and* `TenantCreated` stay in the
-  tenant aggregate), and `consume_signup_code` (the email-proving gate-1 primitive,
-  keeping `enrollment_codes` inside the tenant aggregate). `IdentitiesService` never
-  touches the tenant/network/daemon/subscription repositories.
+  tenant aggregate), and `consume_code` (the purpose-bound email-proving gate-1
+  primitive, keeping `enrollment_codes` inside the tenant aggregate). `IdentitiesService`
+  never touches the tenant/network/daemon/subscription repositories.
 - **The reverse side-effect** rides a domain event: an **identities reactor**
   subscribes to `TenantDeregistered` (already published on deregister) and calls
   `IdentitiesService::purge_for` (delete the tenant's sessions + login methods —
@@ -139,3 +139,40 @@ session-creation tail. Provider `client_id`/`client_secret` arrive as inforge-in
   invites nothing else anticipated); SPA-held refresh+access tokens (XSS-exfiltratable, messy
   OAuth hand-back); cookie authenticating the API directly (forks the auth layer with a second
   USER transport + CSRF + per-call session lookup, losing offline verify).
+
+## Addendum — PR3: verification codes, connected methods, sign-out-all (#18 / #20)
+
+The My-Account **Security tab** is now backed, and the one-time-code surface is unified.
+
+- **Purpose-bound verification codes.** `POST /v1/verification-codes {email, purpose}` is the
+  single RESTful code resource (public, per-IP rate-limited, dev-echoed). A new
+  `enrollment_codes.purpose` column (`signup` | `password_reset` | `enrollment`, CHECK-constrained;
+  the email subject/body is selected from the purpose so a reset code never arrives labelled
+  "enrollment")
+  **binds each code to one flow**: every consume path (`password_signup` → `signup`,
+  `password_reset` → `password_reset`, the daemon `enroll` saga → `enrollment`) filters on its own
+  purpose, so a code issued for one flow can never be replayed against another. `tenant_id` keeps
+  its orthogonal meaning within `enrollment` (NULL = new-signup, set = add-daemon). This
+  **supersedes and removes** `POST /v1/enrollment-codes` and `POST /v1/auth/password/reset-code`;
+  the daemon enrollment-code request converges onto `purpose:enrollment` (#20 — the daemon-repo
+  client migration is a coordinated follow-up).
+- **In-app change-password = email-code-exchange.** No password-change mutation endpoint exists:
+  the Security tab drives `verification-codes{password_reset}` → `POST /v1/auth/password/reset`,
+  which (as before) force-logs-out every session. Proving inbox control is mandatory — there is no
+  current-password path.
+- **Connected sign-in methods (USER plane, `/v1/me/*`).** `GET /v1/me/identities` lists the
+  caller's login methods (`provider` + verified-email `label` + `connected_at`; never the
+  `secret_hash` or subject — invariant #1). `GET /v1/auth/oidc/{provider}/start?mode=link`, when
+  called with the session cookie (a top-level browser navigation carries no bearer JWT), resolves
+  the signed-in tenant **read-only** (a non-sliding `SessionRepository::tenant_for`) and carries it
+  through the **encrypted** OAuth stash; the callback **re-validates** that the session is still live
+  and still that tenant's (it may have been revoked during the provider round-trip → **401**) before
+  it **links** the verified identity to that tenant instead of logging in (no new session). The
+  `(provider, subject)` PK is the collision point: already-this-tenant → idempotent,
+  already-another-tenant → **409**. `DELETE /v1/me/identities/{provider}` unlinks via an **atomic,
+  row-locked** repo step (the ≥1-remaining count check + the delete are one serialized transaction,
+  so concurrent unlinks can't both pass the guard and zero the account): removing the last remaining
+  method → **409**; unlinking an absent provider → idempotent 204.
+- **Sign out of all.** `DELETE /v1/me/sessions` revokes the whole `sessions` collection (incl. the
+  current one) via `logout_all` and clears the cookie; `POST /v1/auth/logout` still ends one
+  session. No device list / per-session revoke (out of design scope).

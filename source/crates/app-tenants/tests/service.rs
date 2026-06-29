@@ -6,7 +6,7 @@
 
 use chrono::Utc;
 
-use wardnet_common::contract::{Entitlement, SubscriptionStatus};
+use wardnet_common::contract::{CodePurpose, Entitlement, SubscriptionStatus};
 use wardnet_common::token::{PrincipalType, Verifier};
 
 use wardnet_subscriptions::Subscription;
@@ -55,7 +55,7 @@ async fn enrolled_and_registered() -> (Harness, String, String, String) {
     let code = h
         .state
         .tenants()
-        .issue_signup_code("user@example.com", "1.2.3.4")
+        .issue_signup_code("user@example.com", "1.2.3.4", CodePurpose::Enrollment)
         .await
         .unwrap();
     let tenant_id = h
@@ -85,7 +85,7 @@ async fn enroll_then_token_is_tenant_scoped_then_network_scoped() {
     let code = h
         .state
         .tenants()
-        .issue_signup_code("a@b.com", "1.2.3.4")
+        .issue_signup_code("a@b.com", "1.2.3.4", CodePurpose::Enrollment)
         .await
         .unwrap();
     let tenant_id = h
@@ -137,7 +137,7 @@ async fn mint_jwt_denied_without_a_subscription() {
     let code = h
         .state
         .tenants()
-        .issue_signup_code("a@b.com", "1.2.3.4")
+        .issue_signup_code("a@b.com", "1.2.3.4", CodePurpose::Enrollment)
         .await
         .unwrap();
     h.state.tenants().enroll(&code, &cnf).await.unwrap();
@@ -154,7 +154,7 @@ async fn issue_signup_code_emails_the_code() {
     let code = h
         .state
         .tenants()
-        .issue_signup_code("mail@b.com", "1.2.3.4")
+        .issue_signup_code("mail@b.com", "1.2.3.4", CodePurpose::Enrollment)
         .await
         .unwrap();
     let sent = h.email.sent();
@@ -179,7 +179,7 @@ async fn enroll_is_single_use() {
     let (_key, cnf) = daemon_keypair(11);
     let code = state
         .tenants()
-        .issue_signup_code("a@b.com", "1.2.3.4")
+        .issue_signup_code("a@b.com", "1.2.3.4", CodePurpose::Enrollment)
         .await
         .unwrap();
     assert!(state.tenants().enroll(&code, &cnf).await.is_ok());
@@ -198,7 +198,7 @@ async fn enroll_publishes_tenant_created_only_for_a_new_tenant() {
     let code = h
         .state
         .tenants()
-        .issue_signup_code("new@b.com", "1.2.3.4")
+        .issue_signup_code("new@b.com", "1.2.3.4", CodePurpose::Enrollment)
         .await
         .unwrap();
     let tenant_id = h
@@ -544,7 +544,7 @@ async fn deregister_frees_email_for_fresh_signup() {
     let code = h
         .state
         .tenants()
-        .issue_signup_code("reuse@example.com", "1.2.3.4")
+        .issue_signup_code("reuse@example.com", "1.2.3.4", CodePurpose::Enrollment)
         .await
         .unwrap();
     let first_id = h
@@ -567,7 +567,7 @@ async fn deregister_frees_email_for_fresh_signup() {
     let code2 = h
         .state
         .tenants()
-        .issue_signup_code("reuse@example.com", "1.2.3.4")
+        .issue_signup_code("reuse@example.com", "1.2.3.4", CodePurpose::Enrollment)
         .await
         .unwrap();
     let second_id = h

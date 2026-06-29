@@ -75,13 +75,21 @@ fn cookie_pair(resp: &axum::response::Response, name: &str) -> String {
         .unwrap_or_else(|| panic!("no Set-Cookie for {name} in {:?}", resp.headers()))
 }
 
-/// Issue a signup code through the public enrollment-code endpoint (dev echoes it).
-async fn signup_code(app: &Router, email: &str) -> String {
-    let mut req = post_json("/v1/enrollment-codes", &json!({ "email": email }));
+/// Issue a verification code of `purpose` through the public endpoint (dev echoes it).
+async fn verification_code(app: &Router, email: &str, purpose: &str) -> String {
+    let mut req = post_json(
+        "/v1/verification-codes",
+        &json!({ "email": email, "purpose": purpose }),
+    );
     req.extensions_mut().insert(connect_info());
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     json_body(resp).await["code"].as_str().unwrap().to_string()
+}
+
+/// Issue a web-signup code (dev echoes it).
+async fn signup_code(app: &Router, email: &str) -> String {
+    verification_code(app, email, "signup").await
 }
 
 // ── Password ────────────────────────────────────────────────────────────────────
@@ -276,13 +284,7 @@ async fn password_reset_changes_the_password() {
         .unwrap();
 
     // Request a reset code (dev echoes it), then reset.
-    let mut req = post_json(
-        "/v1/auth/password/reset-code",
-        &json!({ "email": "dave@example.com" }),
-    );
-    req.extensions_mut().insert(connect_info());
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let reset_code = json_body(resp).await["code"].as_str().unwrap().to_string();
+    let reset_code = verification_code(&app, "dave@example.com", "password_reset").await;
 
     let resp = app
         .clone()
@@ -470,4 +472,472 @@ fn base64_url_decode(s: &str) -> Vec<u8> {
     base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(s)
         .unwrap()
+}
+
+// ── Account security: verification-codes, connected methods, sessions (PR3) ────────
+
+/// Sign up `email` and return the resulting `wardnet_session` cookie pair.
+async fn signup_session(app: &Router, email: &str, password: &str) -> String {
+    let code = signup_code(app, email).await;
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/auth/password/signup",
+            &json!({ "email": email, "code": code, "password": password }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    cookie_pair(&resp, "wardnet_session")
+}
+
+/// Exchange a session cookie for a USER bearer JWT.
+async fn bearer_from_session(app: &Router, session: &str) -> String {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/token")
+                .header(header::COOKIE, session)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    json_body(resp).await["token"].as_str().unwrap().to_string()
+}
+
+/// Status of a session→JWT exchange (200 live, 401 revoked).
+async fn exchange_status(app: &Router, session: &str) -> StatusCode {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/token")
+                .header(header::COOKIE, session)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+/// Drive the OIDC `mode=link` flow with the signed-in `session` cookie; return the
+/// callback response (303 on success, 409 on a cross-tenant collision).
+async fn oidc_link(app: &Router, session: &str) -> axum::response::Response {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/oidc/google/start?mode=link")
+                .header(header::COOKIE, session)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let oauth = cookie_pair(&resp, "wardnet_oauth");
+    // The browser sends both the oauth-state cookie and the (httpOnly) session cookie on
+    // the callback navigation; the callback re-validates the session before linking.
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/oidc/google/callback?code=link-code&state=test-state")
+                .header(header::COOKIE, format!("{oauth}; {session}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn verification_codes_issue_for_every_purpose() {
+    let (app, h) = plain_app();
+    for purpose in ["signup", "password_reset", "enrollment"] {
+        let code = verification_code(&app, "person@example.com", purpose).await;
+        assert!(!code.is_empty());
+    }
+    // Each issuance emailed the code (the dev sender records it).
+    assert_eq!(h.email.sent().len(), 3);
+}
+
+#[tokio::test]
+async fn verification_codes_are_rate_limited_per_ip() {
+    let (app, _h) = plain_app();
+    // The per-IP budget is shared across purposes (all log to the same IP).
+    for _ in 0..10 {
+        let resp = app
+            .clone()
+            .oneshot(post_json(
+                "/v1/verification-codes",
+                &json!({ "email": "flood@example.com", "purpose": "signup" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/verification-codes",
+            &json!({ "email": "flood@example.com", "purpose": "password_reset" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn me_identities_lists_methods_and_never_leaks_secrets() {
+    let (app, _h) = plain_app();
+    let session = signup_session(&app, "list@example.com", "longenough1").await;
+    let jwt = bearer_from_session(&app, &session).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/me/identities")
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let raw = String::from_utf8(bytes.to_vec()).unwrap();
+    // No hashed secret ever crosses the wire.
+    assert!(!raw.contains("secret"));
+    assert!(!raw.contains("argon2"));
+    let body: Value = serde_json::from_str(&raw).unwrap();
+    let methods = body.as_array().unwrap();
+    assert_eq!(methods.len(), 1);
+    assert_eq!(methods[0]["provider"], "password");
+    assert_eq!(methods[0]["label"], "list@example.com");
+}
+
+#[tokio::test]
+async fn oidc_link_attaches_provider_to_current_account() {
+    let identity = VerifiedIdentity {
+        provider: "google".to_string(),
+        subject: "g-link-sub".to_string(),
+        email: "linker@example.com".to_string(),
+        email_verified: true,
+    };
+    let (app, _h) = app_with_google(identity);
+    let session = signup_session(&app, "linker@example.com", "longenough1").await;
+
+    let resp = oidc_link(&app, &session).await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    // The link sets no new session cookie (the user was already signed in).
+    assert!(
+        resp.headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .all(|v| !v.to_str().unwrap().starts_with("wardnet_session="))
+    );
+
+    // The account now lists both methods; the session/tenant is unchanged.
+    let jwt = bearer_from_session(&app, &session).await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/me/identities")
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let methods = json_body(resp).await;
+    let providers: Vec<String> = methods
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["provider"].as_str().unwrap().to_string())
+        .collect();
+    assert!(providers.contains(&"password".to_string()));
+    assert!(providers.contains(&"google".to_string()));
+}
+
+#[tokio::test]
+async fn oidc_link_rejects_a_cross_tenant_collision() {
+    let identity = VerifiedIdentity {
+        provider: "google".to_string(),
+        subject: "g-shared-sub".to_string(),
+        email: "owner-b@example.com".to_string(),
+        email_verified: true,
+    };
+    let (app, h) = app_with_google(identity);
+    // Tenant B already owns this google subject.
+    h.store.seed_tenant(Tenant {
+        id: "tenant-b".to_string(),
+        email: "owner-b@example.com".to_string(),
+        created_at: Utc::now(),
+        deregistered_at: None,
+    });
+    h.store
+        .seed_identity("tenant-b", "google", "g-shared-sub", "owner-b@example.com");
+
+    // User A signs in and tries to link the same subject → 409.
+    let session = signup_session(&app, "user-a@example.com", "longenough1").await;
+    let resp = oidc_link(&app, &session).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn oidc_link_is_idempotent_for_the_same_account() {
+    let identity = VerifiedIdentity {
+        provider: "google".to_string(),
+        subject: "g-idem-sub".to_string(),
+        email: "idem@example.com".to_string(),
+        email_verified: true,
+    };
+    let (app, _h) = app_with_google(identity);
+    let session = signup_session(&app, "idem@example.com", "longenough1").await;
+
+    assert_eq!(
+        oidc_link(&app, &session).await.status(),
+        StatusCode::SEE_OTHER
+    );
+    // Linking the same provider subject again to the same account is a no-op success.
+    assert_eq!(
+        oidc_link(&app, &session).await.status(),
+        StatusCode::SEE_OTHER
+    );
+
+    let jwt = bearer_from_session(&app, &session).await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/me/identities")
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let google = json_body(resp)
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["provider"] == "google")
+        .count();
+    assert_eq!(google, 1);
+}
+
+#[tokio::test]
+async fn oidc_link_without_a_session_is_unauthorized() {
+    let identity = VerifiedIdentity {
+        provider: "google".to_string(),
+        subject: "g-nosess".to_string(),
+        email: "nosess@example.com".to_string(),
+        email_verified: true,
+    };
+    let (app, _h) = app_with_google(identity);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/oidc/google/start?mode=link")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn unlink_endpoint_enforces_the_last_method_guard() {
+    let (app, _h) = plain_app();
+    let session = signup_session(&app, "onlypw@example.com", "longenough1").await;
+    let jwt = bearer_from_session(&app, &session).await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/me/identities/password")
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn signout_all_revokes_every_session() {
+    let (app, _h) = plain_app();
+    // Two independent sessions for the same account (signup opens one; login a second).
+    let session1 = signup_session(&app, "multi-sess@example.com", "longenough1").await;
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/auth/password/login",
+            &json!({ "email": "multi-sess@example.com", "password": "longenough1" }),
+        ))
+        .await
+        .unwrap();
+    let session2 = cookie_pair(&resp, "wardnet_session");
+    assert_eq!(exchange_status(&app, &session1).await, StatusCode::OK);
+    assert_eq!(exchange_status(&app, &session2).await, StatusCode::OK);
+
+    // Sign out of all (the browser sends the bearer + the httpOnly session cookie) →
+    // revokes every session and clears the cookie.
+    let jwt = bearer_from_session(&app, &session2).await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/me/sessions")
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .header(header::COOKIE, &session2)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let cleared = cookie_pair(&resp, "wardnet_session");
+    assert_eq!(cleared, "wardnet_session=");
+
+    // Both prior sessions can no longer exchange.
+    assert_eq!(
+        exchange_status(&app, &session1).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        exchange_status(&app, &session2).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn in_app_change_password_revokes_all_sessions_then_new_password_works() {
+    let (app, _h) = plain_app();
+    let session1 = signup_session(&app, "changer@example.com", "originalpass").await;
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/auth/password/login",
+            &json!({ "email": "changer@example.com", "password": "originalpass" }),
+        ))
+        .await
+        .unwrap();
+    let session2 = cookie_pair(&resp, "wardnet_session");
+
+    // Drive the in-app change-password = email-code-exchange flow.
+    let reset_code = verification_code(&app, "changer@example.com", "password_reset").await;
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/auth/password/reset",
+            &json!({ "code": reset_code, "password": "brandnewpass" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // The reset revoked every session.
+    assert_eq!(
+        exchange_status(&app, &session1).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        exchange_status(&app, &session2).await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // The new password logs in; the old one does not.
+    let ok = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/auth/password/login",
+            &json!({ "email": "changer@example.com", "password": "brandnewpass" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::NO_CONTENT);
+    let bad = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/auth/password/login",
+            &json!({ "email": "changer@example.com", "password": "originalpass" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn oidc_link_aborts_if_session_revoked_mid_flight() {
+    let identity = VerifiedIdentity {
+        provider: "google".to_string(),
+        subject: "g-revoke-sub".to_string(),
+        email: "revoke@example.com".to_string(),
+        email_verified: true,
+    };
+    let (app, _h) = app_with_google(identity);
+    let session = signup_session(&app, "revoke@example.com", "longenough1").await;
+
+    // Begin the link → obtain the oauth-state cookie.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/oidc/google/start?mode=link")
+                .header(header::COOKIE, &session)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let oauth = cookie_pair(&resp, "wardnet_oauth");
+
+    // The session is revoked (e.g. sign-out-all) during the provider round-trip.
+    let jwt = bearer_from_session(&app, &session).await;
+    let revoked = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/me/sessions")
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .header(header::COOKIE, &session)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
+
+    // The callback must refuse to link against the now-dead session.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/oidc/google/callback?code=c&state=test-state")
+                .header(header::COOKIE, format!("{oauth}; {session}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

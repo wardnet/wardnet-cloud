@@ -96,7 +96,7 @@ impl From<IdentitiesError> for ApiError {
 }
 
 /// Bridge so the Identities aggregate can surface a `TenantsService` edge-call failure
-/// (`find_tenant_by_email` / `register_tenant` / `consume_signup_code`) as its own
+/// (`find_tenant_by_email` / `register_tenant` / `consume_code`) as its own
 /// error without leaking the tenant aggregate's error type.
 impl From<TenantsError> for IdentitiesError {
     fn from(e: TenantsError) -> Self {

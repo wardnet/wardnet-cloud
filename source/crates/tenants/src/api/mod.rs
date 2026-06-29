@@ -9,14 +9,16 @@
 mod auth;
 mod availability;
 mod billing;
-mod codes;
+mod cookies;
 mod enroll;
+mod me;
 pub mod network;
 pub mod networks;
 pub mod reconcile;
 pub mod tenant;
 pub mod tenants;
 mod token;
+mod verification_codes;
 
 use axum::Router;
 use axum::extract::State;
@@ -51,9 +53,9 @@ pub fn router(state: AppState) -> Router {
     // Bootstrap: health + credential-minting endpoints + the Stripe webhook + the
     // web-auth surface. No auth middleware — each verifies its own one-time code / key
     // PoP / Stripe signature / session cookie / OAuth state.
-    let bootstrap = auth::register(billing::register(codes::register(token::register(
-        enroll::register(health::register(OpenApiRouter::new())),
-    ))));
+    let bootstrap = auth::register(billing::register(verification_codes::register(
+        token::register(enroll::register(health::register(OpenApiRouter::new()))),
+    )));
 
     // Availability accepts a daemon (wizard) or a user (account plane).
     let daemon_or_user = availability::register(OpenApiRouter::new()).route_layer(
@@ -68,11 +70,12 @@ pub fn router(state: AppState) -> Router {
         |st: State<AppState>, r, n| authenticate(CallerType::DAEMON, st, r, n),
     ));
 
-    // The account plane is user-only.
-    let user = tenants::register(OpenApiRouter::new()).route_layer(from_fn_with_state(
-        state.clone(),
-        |st: State<AppState>, r, n| authenticate(CallerType::USER, st, r, n),
-    ));
+    // The account plane is user-only (incl. the `/v1/me/*` security endpoints).
+    let user = me::register(tenants::register(OpenApiRouter::new())).route_layer(
+        from_fn_with_state(state.clone(), |st: State<AppState>, r, n| {
+            authenticate(CallerType::USER, st, r, n)
+        }),
+    );
 
     let (router, _openapi) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .merge(bootstrap)

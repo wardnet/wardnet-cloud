@@ -8,7 +8,7 @@
 //! subscription aggregate uses (invariant #23, ADR-0007):
 //! - **Reads / create-delegation** are direct method calls on the owner
 //!   ([`TenantsService::find_tenant_by_email`], [`TenantsService::register_tenant`],
-//!   [`TenantsService::consume_signup_code`]) — a one-way `IdentitiesService →
+//!   [`TenantsService::consume_code`]) — a one-way `IdentitiesService →
 //!   TenantsService` edge, mirroring `TenantsService → SubscriptionService::current`.
 //! - **The reverse side-effect** (deregister → force-logout) rides a domain event: the
 //!   identities reactor reacts to `TenantDeregistered` by calling
@@ -25,11 +25,12 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{Duration, Utc};
 
+use wardnet_common::contract::CodePurpose;
 use wardnet_common::token::{ClaimsSpec, PrincipalType, Signer};
 
 use crate::error::{IdentitiesError, TenantsError};
 use crate::repository::identity::{
-    InsertIdentityOutcome, TenantIdentity, TenantIdentityRepository,
+    InsertIdentityOutcome, TenantIdentity, TenantIdentityRepository, UnlinkOutcome,
 };
 use crate::repository::session::{Session, SessionRepository};
 use crate::service::TenantsService;
@@ -131,7 +132,7 @@ impl IdentitiesService {
         // aggregate, which owns the enrollment_codes table).
         let code_email = self
             .tenants
-            .consume_signup_code(code)
+            .consume_code(code, CodePurpose::Signup)
             .await?
             .ok_or_else(|| IdentitiesError::BadCode("invalid or expired code".to_string()))?;
         if code_email != normalize_email(email)? {
@@ -224,7 +225,10 @@ impl IdentitiesService {
         email: &str,
         remote_ip: &str,
     ) -> Result<String, IdentitiesError> {
-        Ok(self.tenants.issue_signup_code(email, remote_ip).await?)
+        Ok(self
+            .tenants
+            .issue_signup_code(email, remote_ip, CodePurpose::PasswordReset)
+            .await?)
     }
 
     /// Reset (or set) a password from a one-time `code`. Burns the code (gate 1),
@@ -243,7 +247,7 @@ impl IdentitiesService {
         check_password(new_password)?;
         let email = self
             .tenants
-            .consume_signup_code(code)
+            .consume_code(code, CodePurpose::PasswordReset)
             .await?
             .ok_or_else(|| IdentitiesError::BadCode("invalid or expired code".to_string()))?;
         let Some(tenant) = self.tenants.find_tenant_by_email(&email).await? else {
@@ -327,6 +331,117 @@ impl IdentitiesService {
         self.create_session(&tenant_id).await
     }
 
+    /// Link a freshly-verified federated identity to an **already-authenticated**
+    /// tenant (the `mode=link` callback, PR3). Unlike [`oidc_callback`](Self::oidc_callback)
+    /// this never creates a session or a tenant — the caller is already signed in; it
+    /// only attaches the `(provider, subject)` login method to `tenant_id`. Gate 1
+    /// (`email_verified`) still applies. Idempotent when the method is already linked to
+    /// **this** tenant; rejects a method already linked to a **different** tenant.
+    ///
+    /// # Errors
+    /// [`IdentitiesError::BadRequest`] for an unknown provider;
+    /// [`IdentitiesError::Unauthorized`] if the provider did not verify the email;
+    /// [`IdentitiesError::Conflict`] if the identity is already linked to another
+    /// account; [`IdentitiesError::Internal`] on an exchange / repository failure.
+    pub async fn link_identity(
+        &self,
+        provider: &str,
+        code: &str,
+        verifier: &str,
+        tenant_id: &str,
+    ) -> Result<(), IdentitiesError> {
+        let identity = self
+            .provider(provider)?
+            .exchange(code, verifier)
+            .await
+            .map_err(IdentitiesError::Internal)?;
+        if !identity.email_verified {
+            return Err(IdentitiesError::Unauthorized(
+                "provider did not verify the email".to_string(),
+            ));
+        }
+        let email = normalize_email(&identity.email)?;
+        // The `(provider, subject)` PK is the collision point: already ours → idempotent
+        // success; already someone else's → reject (a provider account links to at most
+        // one tenant). Resolve-then-insert in a loop so an insert that loses a race
+        // (`AlreadyExists`) re-resolves against the now-present row rather than guessing —
+        // a row that vanishes again just retries the insert.
+        loop {
+            if let Some(existing) = self
+                .identities
+                .find_by_provider_subject(&identity.provider, &identity.subject)
+                .await
+                .map_err(IdentitiesError::Internal)?
+            {
+                return if existing.tenant_id == tenant_id {
+                    Ok(())
+                } else {
+                    Err(IdentitiesError::Conflict(
+                        "this login method is already linked to another account".to_string(),
+                    ))
+                };
+            }
+            let outcome = self
+                .identities
+                .insert(&TenantIdentity {
+                    tenant_id: tenant_id.to_string(),
+                    provider: identity.provider.clone(),
+                    subject: identity.subject.clone(),
+                    secret_hash: None,
+                    email: email.clone(),
+                    created_at: Utc::now(),
+                })
+                .await
+                .map_err(IdentitiesError::Internal)?;
+            if outcome == InsertIdentityOutcome::Created {
+                return Ok(());
+            }
+            // AlreadyExists: a concurrent insert won — loop to re-resolve who owns it.
+        }
+    }
+
+    /// Unlink a tenant's login method for `provider`, refusing to remove its **last**
+    /// remaining method (the ≥1-login-method invariant, PR3). Idempotent: unlinking a
+    /// provider the tenant has no method for is a no-op success.
+    ///
+    /// # Errors
+    /// [`IdentitiesError::Conflict`] if it would remove the only remaining method;
+    /// [`IdentitiesError::Internal`] on a repository failure.
+    pub async fn unlink_identity(
+        &self,
+        tenant_id: &str,
+        provider: &str,
+    ) -> Result<(), IdentitiesError> {
+        // The ≥1-remaining guard + delete are one atomic, row-locked step in the repo —
+        // concurrent unlinks of different providers can't both pass and zero the account.
+        match self
+            .identities
+            .unlink_guarded(tenant_id, provider)
+            .await
+            .map_err(IdentitiesError::Internal)?
+        {
+            // Removed, or nothing linked for this provider (idempotent no-op success).
+            UnlinkOutcome::Removed | UnlinkOutcome::NotLinked => Ok(()),
+            UnlinkOutcome::WouldRemoveLast => Err(IdentitiesError::Conflict(
+                "cannot remove your last login method".to_string(),
+            )),
+        }
+    }
+
+    /// All connected login methods for a tenant (the `GET /v1/me/identities` read).
+    ///
+    /// # Errors
+    /// [`IdentitiesError::Internal`] on a repository failure.
+    pub async fn list_identities(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Vec<TenantIdentity>, IdentitiesError> {
+        self.identities
+            .list_for_tenant(tenant_id)
+            .await
+            .map_err(IdentitiesError::Internal)
+    }
+
     // ── Session lifecycle ──────────────────────────────────────────────────────────
 
     /// Silent exchange: resolve the cookie's session token to a tenant (sliding its
@@ -360,6 +475,24 @@ impl IdentitiesService {
         };
         self.signer
             .sign(&spec, now.timestamp(), self.user_jwt_ttl_secs)
+            .map_err(IdentitiesError::Internal)
+    }
+
+    /// Resolve a session cookie to the tenant it authenticates, **read-only** (no JWT
+    /// minted, no expiry slide) — the OIDC `mode=link` start/callback needs only the
+    /// current tenant, and a top-level browser navigation carries no bearer token (only
+    /// the cookie). Uses the live-tenant + not-expired guard of
+    /// [`SessionRepository::tenant_for`]. `None` when there is no live session.
+    ///
+    /// # Errors
+    /// [`IdentitiesError::Internal`] on a repository failure.
+    pub async fn tenant_for_session(
+        &self,
+        raw_token: &str,
+    ) -> Result<Option<String>, IdentitiesError> {
+        self.sessions
+            .tenant_for(&hash_token(raw_token), Utc::now())
+            .await
             .map_err(IdentitiesError::Internal)
     }
 
