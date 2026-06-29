@@ -16,7 +16,9 @@ use hmac::{Hmac, Mac, digest::KeyInit};
 use serde::Deserialize;
 use sha2::Sha256;
 
-use wardnet_common::contract::{Entitlement, SubscriptionStatus};
+use wardnet_common::contract::{
+    Entitlement, InvoiceStatus, InvoiceView, PaymentMethodView, SubscriptionStatus,
+};
 
 /// Stripe's webhook signatures are HMAC-SHA256.
 type HmacSha256 = Hmac<Sha256>;
@@ -28,6 +30,10 @@ const SIGNATURE_TOLERANCE_SECS: i64 = 300;
 /// The production Stripe API base. Overridable via [`StripeClient::from_url`] (the e2e
 /// wiremock seam).
 const STRIPE_API_BASE: &str = "https://api.stripe.com";
+
+/// How many invoices the history endpoint pulls (newest first). A bounded page keeps the
+/// account-page table small; Stripe's max is 100.
+const INVOICE_PAGE_LIMIT: &str = "24";
 
 /// The URL of a created Stripe session (checkout or billing portal), plus the Stripe
 /// Customer id when the session surfaced one.
@@ -94,6 +100,17 @@ pub trait StripeGateway: Send + Sync {
     /// Verify the webhook signature and normalize the event. The signature is the
     /// credential — a bad signature is an error (the handler returns `400`).
     fn construct_event(&self, payload: &[u8], sig_header: &str) -> anyhow::Result<StripeEvent>;
+
+    /// Retrieve `customer_id`'s default payment method as a provider-agnostic summary,
+    /// or `None` when the customer has none on file. A **read** — never PAN/CVC, only the
+    /// brand/last4/expiry (SAQ-A safe).
+    async fn default_payment_method(
+        &self,
+        customer_id: &str,
+    ) -> anyhow::Result<Option<PaymentMethodView>>;
+
+    /// List `customer_id`'s recent invoices, newest first, as provider-agnostic rows.
+    async fn list_invoices(&self, customer_id: &str) -> anyhow::Result<Vec<InvoiceView>>;
 }
 
 /// Production [`StripeGateway`] — a hand-rolled `reqwest` client over the Stripe REST
@@ -226,6 +243,43 @@ impl StripeGateway for StripeClient {
             .map_err(|e| anyhow::anyhow!("malformed Stripe webhook payload: {e}"))?;
         normalize_event(event)
     }
+
+    async fn default_payment_method(
+        &self,
+        customer_id: &str,
+    ) -> anyhow::Result<Option<PaymentMethodView>> {
+        // Retrieve the customer with the default payment method expanded — one call gets
+        // both the pointer (`invoice_settings.default_payment_method`) and the card fields.
+        let customer: StripeCustomer = self
+            .get_json(
+                &format!("/v1/customers/{customer_id}"),
+                &[("expand[]", "invoice_settings.default_payment_method")],
+            )
+            .await?;
+        Ok(customer
+            .invoice_settings
+            .and_then(|s| s.default_payment_method)
+            .and_then(|pm| pm.card)
+            .map(|card| PaymentMethodView {
+                brand: card.brand,
+                last4: card.last4,
+                exp_month: card.exp_month,
+                exp_year: card.exp_year,
+            }))
+    }
+
+    async fn list_invoices(&self, customer_id: &str) -> anyhow::Result<Vec<InvoiceView>> {
+        // Stripe returns invoices newest first; cap the page so the history table is bounded.
+        let page: StripeList<StripeInvoiceRow> = self
+            .get_json(
+                "/v1/invoices",
+                &[("customer", customer_id), ("limit", INVOICE_PAGE_LIMIT)],
+            )
+            .await?;
+        // `draft` invoices (and any status we don't model) are skipped — the table shows
+        // only issued invoices the user can act on.
+        Ok(page.data.into_iter().filter_map(map_invoice).collect())
+    }
 }
 
 impl StripeClient {
@@ -247,6 +301,39 @@ impl StripeClient {
             .form(form)
             .send()
             .await?;
+        Self::decode_response(path, resp).await
+    }
+
+    /// GET `path` with the Bearer secret key and the given query params, decoding the JSON
+    /// response. Same PII-safe error contract as [`post_form`](Self::post_form): a non-2xx
+    /// surfaces only the status + Stripe's machine-readable `type`/`code`, never the raw
+    /// body (invariant #9).
+    async fn get_json<R: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> anyhow::Result<R> {
+        let resp = self
+            .http
+            .get(format!("{}{path}", self.api_base))
+            .bearer_auth(&self.secret_key)
+            .query(query)
+            .send()
+            .await?;
+        Self::decode_response(path, resp).await
+    }
+
+    /// Shared response tail for [`post_form`](Self::post_form) / [`get_json`](Self::get_json):
+    /// decode the JSON body, surfacing a non-2xx as an error.
+    ///
+    /// On failure the error carries only the HTTP status and Stripe's machine-readable
+    /// error `type`/`code` — **never the raw response body**, which can echo customer
+    /// email / ids (PII) and would leak into logs (invariant #9). Both verbs route through
+    /// here so the sanitization lives in exactly one place.
+    async fn decode_response<R: serde::de::DeserializeOwned>(
+        path: &str,
+        resp: reqwest::Response,
+    ) -> anyhow::Result<R> {
         let status = resp.status();
         let body = resp.text().await?;
         if !status.is_success() {
@@ -412,6 +499,39 @@ fn map_status(status: &str) -> SubscriptionStatus {
     }
 }
 
+/// Map a Stripe invoice list row to our [`InvoiceView`]. Returns `None` for an invoice we
+/// don't surface (a `draft`, or any status we don't model) — the caller skips it.
+fn map_invoice(row: StripeInvoiceRow) -> Option<InvoiceView> {
+    let status = match row.status.as_deref() {
+        Some("paid") => InvoiceStatus::Paid,
+        Some("open") => InvoiceStatus::Open,
+        Some("void") => InvoiceStatus::Void,
+        Some("uncollectible") => InvoiceStatus::Uncollectible,
+        // `draft` is not yet issued — a legitimate, expected skip.
+        Some("draft") | None => return None,
+        // Any *other* value is a status Stripe added that we don't model yet: skip it (so
+        // the history table stays consistent) but warn, so a silently-dropped real invoice
+        // is visible in logs rather than vanishing (cf. `map_status`' safe-close). The
+        // status string is a small closed enum, not PII (invariant #9).
+        Some(other) => {
+            tracing::warn!(status = %other, "unrecognized Stripe invoice status; skipping row");
+            return None;
+        }
+    };
+    let date = Utc
+        .timestamp_opt(row.created?, 0)
+        .single()?
+        .format("%Y-%m-%d")
+        .to_string();
+    Some(InvoiceView {
+        date,
+        amount_cents: row.total,
+        currency: row.currency,
+        status,
+        hosted_url: row.hosted_invoice_url,
+    })
+}
+
 // ── Stripe wire types (only the fields we read) ─────────────────────────────────
 
 /// `checkout.Session` / `billing_portal.Session` response — both surface a `url`; the
@@ -536,6 +656,65 @@ impl StripeApiError {
             ),
         }
     }
+}
+
+/// A Stripe `list` envelope (`{"object":"list","data":[…]}`) — we read only `data`.
+#[derive(Deserialize)]
+struct StripeList<T> {
+    // The path form (not bare `#[serde(default)]`) avoids serde deriving a spurious
+    // `T: Default` bound on the generic — `Vec::new` needs no bound on `T`.
+    #[serde(default = "Vec::new")]
+    data: Vec<T>,
+}
+
+/// A Stripe `Customer` — we read only its default-payment-method pointer (expanded).
+#[derive(Deserialize)]
+struct StripeCustomer {
+    #[serde(default)]
+    invoice_settings: Option<StripeInvoiceSettings>,
+}
+
+#[derive(Deserialize)]
+struct StripeInvoiceSettings {
+    /// Expanded via `expand[]=invoice_settings.default_payment_method`; `None` when the
+    /// customer has no default card on file.
+    #[serde(default)]
+    default_payment_method: Option<StripePaymentMethod>,
+}
+
+#[derive(Deserialize)]
+struct StripePaymentMethod {
+    /// Present for card payment methods (the only kind we render).
+    #[serde(default)]
+    card: Option<StripeCard>,
+}
+
+#[derive(Deserialize)]
+struct StripeCard {
+    brand: String,
+    last4: String,
+    exp_month: u32,
+    exp_year: u32,
+}
+
+/// A Stripe `Invoice` as it appears in the **list** endpoint (distinct from the
+/// webhook-shaped [`StripeInvoice`] above, which only carries the subscription ref).
+#[derive(Deserialize)]
+struct StripeInvoiceRow {
+    /// Creation time (unix seconds). Optional so one degenerate row (e.g. API drift that
+    /// omits it) is skipped by `map_invoice` rather than failing the whole page parse.
+    #[serde(default)]
+    created: Option<i64>,
+    /// Invoice total in the currency's minor units.
+    #[serde(default)]
+    total: i64,
+    #[serde(default)]
+    currency: String,
+    /// `draft` | `open` | `paid` | `void` | `uncollectible`.
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    hosted_invoice_url: Option<String>,
 }
 
 /// A Stripe "expandable" reference: either the bare id string, or — if the request

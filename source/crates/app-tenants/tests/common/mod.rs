@@ -21,7 +21,7 @@ use base64::Engine as _;
 use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::SigningKey;
 
-use wardnet_common::contract::{Entitlement, SubscriptionStatus};
+use wardnet_common::contract::{Entitlement, InvoiceView, PaymentMethodView, SubscriptionStatus};
 use wardnet_common::event::{DomainEvent, EventBus, EventStream, InProcessEventBus};
 use wardnet_common::ports::{BillingPort, SubscriptionCommands, SubscriptionReader};
 use wardnet_common::token::{Signer, Verifier};
@@ -190,6 +190,18 @@ impl MockStore {
             .iter()
             .find(|(_, c)| c.subscription.as_deref() == Some(subscription_id))
             .map(|(tenant_id, _)| tenant_id.clone())
+    }
+
+    /// Seed a provider customer id for a tenant (so `customer_id` resolves it — e.g. a
+    /// tenant that has reached Checkout and has a Stripe customer on file).
+    pub fn seed_billing_customer(&self, tenant_id: &str, customer_id: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .billing_customers
+            .entry(tenant_id.to_string())
+            .or_default()
+            .customer = Some(customer_id.to_string());
     }
 
     /// The provider customer id recorded for a tenant, if any.
@@ -1022,6 +1034,10 @@ pub struct MockStripeGateway {
     event: Mutex<Option<StripeEvent>>,
     /// Recorded `create_checkout_session` calls.
     pub checkouts: Mutex<Vec<CheckoutCall>>,
+    /// Canned `default_payment_method` result (defaults to `None`).
+    payment_method: Mutex<Option<PaymentMethodView>>,
+    /// Canned `list_invoices` result (defaults to empty).
+    invoices: Mutex<Vec<InvoiceView>>,
 }
 
 impl MockStripeGateway {
@@ -1033,12 +1049,24 @@ impl MockStripeGateway {
             checkout_customer_id: None,
             event: Mutex::new(None),
             checkouts: Mutex::new(Vec::new()),
+            payment_method: Mutex::new(None),
+            invoices: Mutex::new(Vec::new()),
         }
     }
 
     /// Set the event `construct_event` will return (webhook-endpoint tests).
     pub fn set_event(&self, event: StripeEvent) {
         *self.event.lock().unwrap() = Some(event);
+    }
+
+    /// Set the payment method `default_payment_method` will return.
+    pub fn set_payment_method(&self, pm: PaymentMethodView) {
+        *self.payment_method.lock().unwrap() = Some(pm);
+    }
+
+    /// Set the invoices `list_invoices` will return (newest first).
+    pub fn set_invoices(&self, invoices: Vec<InvoiceView>) {
+        *self.invoices.lock().unwrap() = invoices;
     }
 }
 
@@ -1079,6 +1107,17 @@ impl StripeGateway for MockStripeGateway {
             .unwrap()
             .clone()
             .ok_or_else(|| anyhow::anyhow!("no canned event set on MockStripeGateway"))
+    }
+
+    async fn default_payment_method(
+        &self,
+        _customer_id: &str,
+    ) -> anyhow::Result<Option<PaymentMethodView>> {
+        Ok(self.payment_method.lock().unwrap().clone())
+    }
+
+    async fn list_invoices(&self, _customer_id: &str) -> anyhow::Result<Vec<InvoiceView>> {
+        Ok(self.invoices.lock().unwrap().clone())
     }
 }
 

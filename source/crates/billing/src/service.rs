@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
-use wardnet_common::contract::{Entitlement, SubscriptionStatus};
+use wardnet_common::contract::{Entitlement, InvoiceView, PaymentMethodView, SubscriptionStatus};
 use wardnet_common::ports::{BillingError, BillingPort, SubscriptionCommands, SubscriptionReader};
 
 use crate::gateway::{StripeEvent, StripeEventKind, StripeGateway, SubscriptionData};
@@ -242,5 +242,31 @@ impl BillingPort for BillingService {
             .construct_event(payload, signature)
             .map_err(|e| BillingError::InvalidRequest(format!("invalid Stripe webhook: {e}")))?;
         self.apply_event(event).await
+    }
+
+    async fn payment_method(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<PaymentMethodView>, BillingError> {
+        // A tenant with no provider customer (e.g. a card-less trial) has no payment
+        // method — `null`, not an error.
+        let Some(customer_id) = self.billing.customer_id(tenant_id).await? else {
+            return Ok(None);
+        };
+        self.stripe
+            .default_payment_method(&customer_id)
+            .await
+            .map_err(BillingError::Internal)
+    }
+
+    async fn invoices(&self, tenant_id: &str) -> Result<Vec<InvoiceView>, BillingError> {
+        // No provider customer yet → no invoices (empty list, not an error).
+        let Some(customer_id) = self.billing.customer_id(tenant_id).await? else {
+            return Ok(Vec::new());
+        };
+        self.stripe
+            .list_invoices(&customer_id)
+            .await
+            .map_err(BillingError::Internal)
     }
 }

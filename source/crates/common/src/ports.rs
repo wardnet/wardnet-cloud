@@ -23,7 +23,9 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use crate::contract::{Entitlement, SubscriptionStatus, SubscriptionView};
+use crate::contract::{
+    Entitlement, InvoiceView, PaymentMethodView, SubscriptionStatus, SubscriptionView,
+};
 use crate::error::ApiError;
 
 /// Read port over the **license** (subscription) aggregate. In-process adapter =
@@ -156,4 +158,22 @@ pub trait BillingPort: Send + Sync {
     /// [`BillingError::InvalidRequest`] on an unverifiable/malformed payload;
     /// [`BillingError::Internal`] on a repository failure.
     async fn handle_webhook(&self, payload: &[u8], signature: &str) -> Result<(), BillingError>;
+
+    /// The tenant's default payment-method summary (provider-proxied read), or `None`
+    /// when the tenant has no provider customer / default card yet. Never PAN/CVC — only
+    /// the brand/last4/expiry the SPA renders (SAQ-A safe).
+    ///
+    /// # Errors
+    /// [`BillingError::Internal`] on a provider/repository failure.
+    async fn payment_method(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<PaymentMethodView>, BillingError>;
+
+    /// The tenant's recent invoices, newest first (provider-proxied read). An empty list
+    /// when the tenant has no provider customer / invoices.
+    ///
+    /// # Errors
+    /// [`BillingError::Internal`] on a provider/repository failure.
+    async fn invoices(&self, tenant_id: &str) -> Result<Vec<InvoiceView>, BillingError>;
 }
