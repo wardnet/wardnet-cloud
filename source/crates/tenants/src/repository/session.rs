@@ -42,6 +42,16 @@ pub trait SessionRepository: Send + Sync {
         new_expires_at: DateTime<Utc>,
     ) -> anyhow::Result<Option<String>>;
 
+    /// Resolve a **live** session of a **live** tenant to its tenant id **without**
+    /// sliding the expiry — a read-only variant of [`touch_and_get_tenant`] for callers
+    /// that only need to know who the cookie belongs to (the OIDC `mode=link` start /
+    /// callback). Same deregistered-tenant + not-expired guards; `None` otherwise.
+    async fn tenant_for(
+        &self,
+        token_hash: &str,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<Option<String>>;
+
     /// Delete a single session by its token hash (logout). Returns whether a row was
     /// removed.
     async fn delete(&self, token_hash: &str) -> anyhow::Result<bool>;
@@ -81,6 +91,13 @@ const TOUCH_AND_GET_TENANT: &str = "UPDATE sessions SET expires_at = $3 \
        ) \
      RETURNING tenant_id";
 
+const TENANT_FOR: &str = "SELECT tenant_id FROM sessions \
+     WHERE token_hash = $1 AND expires_at > $2 \
+       AND EXISTS ( \
+         SELECT 1 FROM tenants t \
+         WHERE t.id = sessions.tenant_id AND t.deregistered_at IS NULL \
+       )";
+
 const DELETE: &str = "DELETE FROM sessions WHERE token_hash = $1";
 
 const DELETE_FOR_TENANT: &str = "DELETE FROM sessions WHERE tenant_id = $1";
@@ -109,6 +126,19 @@ impl SessionRepository for PgSessionRepository {
             .bind(now)
             .bind(new_expires_at)
             .fetch_optional(&self.pools.write)
+            .await?;
+        Ok(tenant_id)
+    }
+
+    async fn tenant_for(
+        &self,
+        token_hash: &str,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<Option<String>> {
+        let tenant_id: Option<String> = sqlx::query_scalar(TENANT_FOR)
+            .bind(token_hash)
+            .bind(now)
+            .fetch_optional(&self.pools.read)
             .await?;
         Ok(tenant_id)
     }

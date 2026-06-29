@@ -19,6 +19,7 @@ use std::sync::Arc;
 use chrono::{Duration, Utc};
 use uuid::Uuid;
 
+use wardnet_common::contract::CodePurpose;
 use wardnet_common::event::{DomainEvent, EventBus};
 use wardnet_common::ports::SubscriptionReader;
 use wardnet_common::token::{ClaimsSpec, PrincipalType, Signer};
@@ -178,17 +179,23 @@ impl TenantsService {
             .is_some_and(|t| t.deregistered_at.is_none()))
     }
 
-    /// Validate + burn a one-time signup code, returning the email it proves control
-    /// of (`None` if unknown / expired / used). The email-proving gate-1 the Identities
-    /// aggregate calls for web password signup/reset (ADR-0009) — a one-way edge that
-    /// keeps the `enrollment_codes` table inside the tenant aggregate.
+    /// Validate + burn a one-time code **of `purpose`**, returning the email it proves
+    /// control of (`None` if unknown / expired / used / issued for another purpose). The
+    /// email-proving gate-1 the Identities aggregate calls for web password
+    /// signup/reset (ADR-0009) — a one-way edge that keeps the `enrollment_codes` table
+    /// inside the tenant aggregate. The `purpose` bind is what stops cross-flow replay
+    /// (PR3).
     ///
     /// # Errors
     /// [`TenantsError::Internal`] on a repository failure.
-    pub async fn consume_signup_code(&self, code: &str) -> Result<Option<String>, TenantsError> {
+    pub async fn consume_code(
+        &self,
+        code: &str,
+        purpose: CodePurpose,
+    ) -> Result<Option<String>, TenantsError> {
         Ok(self
             .enrollment
-            .consume_signup_code(&hash_code(code), Utc::now())
+            .consume_code(&hash_code(code), purpose.as_str(), Utc::now())
             .await?)
     }
 
@@ -345,6 +352,7 @@ impl TenantsService {
         &self,
         email: &str,
         remote_ip: &str,
+        purpose: CodePurpose,
     ) -> Result<String, TenantsError> {
         let email = normalize_email(email)?;
         let since = Utc::now() - Duration::hours(1);
@@ -367,11 +375,12 @@ impl TenantsService {
                 &code_hash,
                 &email,
                 None,
+                purpose.as_str(),
                 Utc::now() + Duration::seconds(CODE_TTL_SECS),
             )
             .await?;
         self.email
-            .send_enrollment_code(&email, &code)
+            .send_code(&email, &code, purpose)
             .await
             .map_err(TenantsError::Internal)?;
         Ok(code)
@@ -401,11 +410,12 @@ impl TenantsService {
                 &code_hash,
                 &tenant.email,
                 Some(tenant_id),
+                CodePurpose::Enrollment.as_str(),
                 Utc::now() + Duration::seconds(CODE_TTL_SECS),
             )
             .await?;
         self.email
-            .send_enrollment_code(&tenant.email, &code)
+            .send_code(&tenant.email, &code, CodePurpose::Enrollment)
             .await
             .map_err(TenantsError::Internal)?;
         Ok(code)

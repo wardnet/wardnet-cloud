@@ -15,6 +15,7 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use wardnet_common::contract::CodePurpose;
 use wardnet_common::db::DbPools;
 use wardnet_common::event::EventBus;
 use wardnet_common::ports::SubscriptionReader;
@@ -142,7 +143,7 @@ async fn enroll_register_reconcile_lifecycle_on_postgres() {
 
     // Signup → enroll → token (tenant-scoped) → register-network.
     let code = svc
-        .issue_signup_code("user@example.com", "1.2.3.4")
+        .issue_signup_code("user@example.com", "1.2.3.4", CodePurpose::Enrollment)
         .await
         .unwrap();
     let tenant_id = svc.enroll(&code, &cnf).await.unwrap().tenant_id;
@@ -184,7 +185,10 @@ async fn slug_uniqueness_and_single_use_code_on_postgres() {
     let svc = h.tenants();
     let (_k1, c1) = daemon_keypair(11);
 
-    let code = svc.issue_signup_code("a@b.com", "1.2.3.4").await.unwrap();
+    let code = svc
+        .issue_signup_code("a@b.com", "1.2.3.4", CodePurpose::Enrollment)
+        .await
+        .unwrap();
     let tenant_id = svc.enroll(&code, &c1).await.unwrap().tenant_id;
     h.pump().await;
     // Single-use: the burned code is rejected on reuse.
@@ -195,7 +199,10 @@ async fn slug_uniqueness_and_single_use_code_on_postgres() {
         .await
         .unwrap();
     // A second tenant cannot claim the same slug.
-    let code2 = svc.issue_signup_code("c@d.com", "5.6.7.8").await.unwrap();
+    let code2 = svc
+        .issue_signup_code("c@d.com", "5.6.7.8", CodePurpose::Enrollment)
+        .await
+        .unwrap();
     let (_k3, c3) = daemon_keypair(33);
     let tenant2 = svc.enroll(&code2, &c3).await.unwrap().tenant_id;
     h.pump().await;
@@ -214,7 +221,7 @@ async fn deregister_tombstone_sweep_and_email_reuse_on_postgres() {
 
     // Signup → enroll → register-network.
     let code = svc
-        .issue_signup_code("reuse@example.com", "1.2.3.4")
+        .issue_signup_code("reuse@example.com", "1.2.3.4", CodePurpose::Enrollment)
         .await
         .unwrap();
     let first_id = svc.enroll(&code, &c1).await.unwrap().tenant_id;
@@ -243,7 +250,7 @@ async fn deregister_tombstone_sweep_and_email_reuse_on_postgres() {
 
     // The partial unique index frees the email: a fresh signup gets a new tenant id.
     let code2 = svc
-        .issue_signup_code("reuse@example.com", "1.2.3.4")
+        .issue_signup_code("reuse@example.com", "1.2.3.4", CodePurpose::Enrollment)
         .await
         .unwrap();
     let (_k2, c2) = daemon_keypair(22);

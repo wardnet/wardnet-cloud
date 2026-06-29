@@ -16,70 +16,29 @@ use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Redirect;
 use axum_extra::extract::PrivateCookieJar;
-use axum_extra::extract::cookie::{Cookie, SameSite};
 use serde::{Deserialize, Serialize};
-use time::Duration;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use wardnet_common::contract::{
-    PasswordLoginRequest, PasswordResetRequest, PasswordSignupRequest, SignupCodeRequest,
-    SignupCodeResponse, TokenResponse,
+    PasswordLoginRequest, PasswordResetRequest, PasswordSignupRequest, TokenResponse,
 };
 use wardnet_common::proxy_protocol::client_ip;
 
+use super::cookies::{OAUTH_COOKIE, SESSION_COOKIE, cleared, oauth_cookie, session_cookie};
 use crate::error::ApiError;
 use crate::state::AppState;
-
-/// The encrypted session cookie (the browser-durable web credential).
-const SESSION_COOKIE: &str = "wardnet_session";
-/// The short-lived OAuth `state`/PKCE cookie (one in-flight federated login).
-const OAUTH_COOKIE: &str = "wardnet_oauth";
-/// Session cookie lifetime — 30 days (the server-side row slides on each exchange).
-const SESSION_COOKIE_DAYS: i64 = 30;
-/// OAuth `state` cookie lifetime — long enough to complete the provider round-trip.
-const OAUTH_COOKIE_MINUTES: i64 = 10;
 
 /// Register all web-auth bootstrap routes.
 pub fn register(router: OpenApiRouter<AppState>) -> OpenApiRouter<AppState> {
     router
         .routes(routes!(password_signup))
         .routes(routes!(password_login))
-        .routes(routes!(request_password_reset))
         .routes(routes!(password_reset))
         .routes(routes!(oidc_start))
         .routes(routes!(oidc_callback))
         .routes(routes!(token))
         .routes(routes!(logout))
-}
-
-// ── Cookie helpers ──────────────────────────────────────────────────────────────
-
-/// Build the session cookie carrying `token` (httpOnly + Secure + SameSite=Lax).
-fn session_cookie(token: String) -> Cookie<'static> {
-    Cookie::build((SESSION_COOKIE, token))
-        .http_only(true)
-        .secure(true)
-        .same_site(SameSite::Lax)
-        .path("/")
-        .max_age(Duration::days(SESSION_COOKIE_DAYS))
-        .build()
-}
-
-/// Build the short-lived OAuth `state`/PKCE cookie carrying `value`.
-fn oauth_cookie(value: String) -> Cookie<'static> {
-    Cookie::build((OAUTH_COOKIE, value))
-        .http_only(true)
-        .secure(true)
-        .same_site(SameSite::Lax)
-        .path("/")
-        .max_age(Duration::minutes(OAUTH_COOKIE_MINUTES))
-        .build()
-}
-
-/// A removal cookie for `name` (Path=/ so it matches the one we set).
-fn cleared(name: &'static str) -> Cookie<'static> {
-    Cookie::build((name, "")).path("/").build()
 }
 
 // ── Password ────────────────────────────────────────────────────────────────────
@@ -135,34 +94,6 @@ async fn password_login(
 }
 
 #[utoipa::path(
-    post, path = "/v1/auth/password/reset-code", tag = "auth",
-    description = "Request a one-time password-reset code for an email (public, per-IP \
-                   rate-limited). Emailed in production; returned here in dev.",
-    request_body = SignupCodeRequest,
-    responses(
-        (status = 200, description = "Code issued", body = SignupCodeResponse),
-        (status = 400, description = "Invalid email"),
-        (status = 429, description = "Per-IP rate limit exceeded"),
-    ),
-    security(()),
-)]
-async fn request_password_reset(
-    State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(body): Json<SignupCodeRequest>,
-) -> Result<Json<SignupCodeResponse>, ApiError> {
-    let remote_ip = client_ip(&headers, addr);
-    let code = state
-        .identities()
-        .request_password_reset(&body.email, &remote_ip)
-        .await?;
-    // Emailed in production → don't echo it; dev/no-op sender → return it.
-    let code = (!state.tenants().email_delivers()).then_some(code);
-    Ok(Json(SignupCodeResponse { code }))
-}
-
-#[utoipa::path(
     post, path = "/v1/auth/password/reset", tag = "auth",
     description = "Reset (or set) the account password from a one-time code; force-logs-out \
                    every existing session.",
@@ -187,11 +118,23 @@ async fn password_reset(
 
 // ── Federated (OIDC / OAuth2) ─────────────────────────────────────────────────────
 
-/// The CSRF/PKCE bundle stashed in the OAuth cookie across the redirect.
+/// The CSRF/PKCE bundle stashed in the OAuth cookie across the redirect. When
+/// `link_tenant` is set, the callback **links** the verified identity to that
+/// already-authenticated tenant instead of logging in (the `mode=link` flow, PR3).
 #[derive(Serialize, Deserialize)]
 struct OauthStash {
     csrf_state: String,
     verifier: String,
+    /// The tenant to link the verified identity to (`mode=link`), or `None` for login.
+    #[serde(default)]
+    link_tenant: Option<String>,
+}
+
+/// Start query params (`?mode=link` to link to the signed-in account, else login).
+#[derive(Deserialize)]
+struct StartQuery {
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 /// Callback query params (`?code=...&state=...`).
@@ -204,23 +147,47 @@ struct CallbackQuery {
 #[utoipa::path(
     get, path = "/v1/auth/oidc/{provider}/start", tag = "auth",
     description = "Begin federated login: stash CSRF/PKCE in a signed cookie and 302 to \
-                   the provider.",
-    params(("provider" = String, Path, description = "google | github")),
+                   the provider. With ?mode=link (called while signed in via the session \
+                   cookie) the callback links the verified identity to the current account.",
+    params(
+        ("provider" = String, Path, description = "google | github"),
+        ("mode" = Option<String>, Query, description = "\"link\" to link to the signed-in account"),
+    ),
     responses(
         (status = 302, description = "Redirect to the provider"),
         (status = 400, description = "Unknown/unconfigured provider"),
+        (status = 401, description = "mode=link without an active session"),
     ),
     security(()),
 )]
 async fn oidc_start(
     State(state): State<AppState>,
     Path(provider): Path<String>,
+    Query(query): Query<StartQuery>,
     jar: PrivateCookieJar,
 ) -> Result<(PrivateCookieJar, Redirect), ApiError> {
+    // mode=link carries the current tenant through the (encrypted) stash. A top-level
+    // browser navigation can't send a bearer JWT, so the signed-in tenant is resolved
+    // from the session cookie (ADR-0009).
+    let link_tenant = if query.mode.as_deref() == Some("link") {
+        let session = jar
+            .get(SESSION_COOKIE)
+            .ok_or_else(|| ApiError::Unauthorized("must be signed in to link".to_string()))?;
+        Some(
+            state
+                .identities()
+                .tenant_for_session(session.value())
+                .await?
+                .ok_or_else(|| ApiError::Unauthorized("no active session".to_string()))?,
+        )
+    } else {
+        None
+    };
     let authorize = state.identities().oidc_start(&provider)?;
     let stash = serde_json::to_string(&OauthStash {
         csrf_state: authorize.csrf_state,
         verifier: authorize.verifier,
+        link_tenant,
     })
     .map_err(|e| ApiError::Internal(anyhow::anyhow!("serialize oauth stash: {e}")))?;
     Ok((jar.add(oauth_cookie(stash)), Redirect::to(&authorize.url)))
@@ -228,12 +195,14 @@ async fn oidc_start(
 
 #[utoipa::path(
     get, path = "/v1/auth/oidc/{provider}/callback", tag = "auth",
-    description = "Federated-login callback: validate state, exchange the code, set the \
-                   session cookie, and 302 back to the account SPA.",
+    description = "Federated callback: validate state, exchange the code, then either log \
+                   in (set the session cookie) or — for a mode=link flow — link the \
+                   verified identity to the current account. 302s back to the account SPA.",
     params(("provider" = String, Path, description = "google | github")),
     responses(
-        (status = 302, description = "Logged in; redirect to the SPA"),
+        (status = 302, description = "Logged in / linked; redirect to the SPA"),
         (status = 401, description = "State mismatch / unverified email / exchange failure"),
+        (status = 409, description = "Provider identity already linked to another account"),
     ),
     security(()),
 )]
@@ -252,12 +221,41 @@ async fn oidc_callback(
     if params.state != stash.csrf_state {
         return Err(ApiError::Unauthorized("oauth state mismatch".to_string()));
     }
-    let token = state
-        .identities()
-        .oidc_callback(&provider, &params.code, &stash.verifier)
-        .await?;
-    let jar = jar.remove(cleared(OAUTH_COOKIE)).add(session_cookie(token));
-    Ok((jar, Redirect::to(state.config().account_base_url.as_str())))
+    let account_spa = state.config().account_base_url.as_str();
+    if let Some(tenant_id) = stash.link_tenant {
+        // Re-check the session is still live and still this tenant's at callback time —
+        // it may have been revoked (sign-out-all / deregister) during the provider
+        // round-trip, in which case the link must not complete.
+        let still_signed_in = match jar.get(SESSION_COOKIE) {
+            Some(session) => {
+                state
+                    .identities()
+                    .tenant_for_session(session.value())
+                    .await?
+                    == Some(tenant_id.clone())
+            }
+            None => false,
+        };
+        let jar = jar.remove(cleared(OAUTH_COOKIE));
+        if !still_signed_in {
+            return Err(ApiError::Unauthorized(
+                "session is no longer valid; sign in again to link".to_string(),
+            ));
+        }
+        // Already signed in: attach the verified identity, no new session.
+        state
+            .identities()
+            .link_identity(&provider, &params.code, &stash.verifier, &tenant_id)
+            .await?;
+        Ok((jar, Redirect::to(account_spa)))
+    } else {
+        let jar = jar.remove(cleared(OAUTH_COOKIE));
+        let token = state
+            .identities()
+            .oidc_callback(&provider, &params.code, &stash.verifier)
+            .await?;
+        Ok((jar.add(session_cookie(token)), Redirect::to(account_spa)))
+    }
 }
 
 // ── Session lifecycle ──────────────────────────────────────────────────────────────

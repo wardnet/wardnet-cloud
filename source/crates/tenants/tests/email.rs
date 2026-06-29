@@ -1,6 +1,7 @@
 //! `ResendEmailSender` against a wiremock Resend — validates the request shape
 //! (path, Bearer auth, JSON body) without touching the real API.
 
+use wardnet_common::contract::CodePurpose;
 use wardnet_tenants::email::{EmailSender, ResendEmailSender};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -23,7 +24,11 @@ async fn resend_posts_the_code_with_auth() {
     )
     .unwrap();
     sender
-        .send_enrollment_code("user@example.com", "abcdef123456")
+        .send_code(
+            "user@example.com",
+            "abcdef123456",
+            CodePurpose::PasswordReset,
+        )
         .await
         .unwrap();
     assert!(sender.delivers());
@@ -34,6 +39,9 @@ async fn resend_posts_the_code_with_auth() {
     let body: serde_json::Value = received[0].body_json().unwrap();
     assert_eq!(body["to"][0], "user@example.com");
     assert!(body["text"].as_str().unwrap().contains("abcdef123456"));
+    // The subject/body match the purpose (a reset code is not labelled "enrollment").
+    assert_eq!(body["subject"], "Your wardnet password-reset code");
+    assert!(body["text"].as_str().unwrap().contains("password-reset"));
 }
 
 #[tokio::test]
@@ -50,7 +58,7 @@ async fn resend_surfaces_provider_errors() {
     let sender = ResendEmailSender::with_base_url("re_x", "from@x.io", &server.uri()).unwrap();
     assert!(
         sender
-            .send_enrollment_code("u@e.com", "code")
+            .send_code("u@e.com", "code", CodePurpose::Enrollment)
             .await
             .is_err()
     );

@@ -108,9 +108,16 @@ details. (See `docs/adr/` for the decisions behind these.)
 
 ## Enrollment credentials
 
-- **One-time code** — a short-lived, single-use, email-proving credential. A
-  *new-signup* code (no tenant yet) or an *add-daemon* code (existing tenant).
-  Consumed once, at enroll.
+- **One-time code / verification code** — a short-lived, single-use, email-proving
+  credential, issued via the unified `POST /v1/verification-codes {email, purpose}`
+  resource. Its [purpose](#code-purpose) binds it to exactly one flow. Within
+  `enrollment`, a *new-signup* code (no tenant yet) or an *add-daemon* code (existing
+  tenant). Consumed once.
+- **Code purpose** — the flow a [one-time code](#enrollment-credentials) is bound to:
+  `signup` (web password signup), `password_reset` (web password reset), or `enrollment`
+  (daemon enroll). A code is consumable by exactly its own purpose, so a code issued for
+  one flow can never be replayed against another. (The old `/v1/enrollment-codes` and
+  `/v1/auth/password/reset-code` endpoints are removed; see `docs/adr/0009`.)
 - **Pending enrollment** — a TTL'd binding of a daemon's public key to a tenant,
   written at enroll. Lets a not-yet-registered daemon authenticate (mint a
   tenant-scoped token) before it has a network. Self-expires.

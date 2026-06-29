@@ -56,6 +56,34 @@ impl ProvisioningState {
     }
 }
 
+/// The flow a one-time [verification code](VerificationCodeRequest) is bound to
+/// (PR3). A code issued for one purpose can never be consumed by another, closing
+/// cross-purpose replay. Doubles as the `enrollment_codes.purpose` DB value (the
+/// [`ProvisioningState`] pattern). `enrollment` covers both daemon paths (new-signup
+/// and add-daemon), which the orthogonal `tenant_id` column already distinguishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodePurpose {
+    /// Web password signup (`POST /v1/auth/password/signup`).
+    Signup,
+    /// Web password reset (`POST /v1/auth/password/reset`).
+    PasswordReset,
+    /// Daemon enrollment (`POST /v1/enroll`).
+    Enrollment,
+}
+
+impl CodePurpose {
+    /// The DB/text form.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CodePurpose::Signup => "signup",
+            CodePurpose::PasswordReset => "password_reset",
+            CodePurpose::Enrollment => "enrollment",
+        }
+    }
+}
+
 /// Per-tenant limits. JSONB-stored so new dimensions need no migration; `serde`
 /// defaults keep old rows readable as dimensions are added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -206,19 +234,35 @@ pub struct DaemonView {
 
 // ── Tenants — bootstrap plane ───────────────────────────────────────────────────
 
-/// Request body for `POST /v1/enrollment-codes`.
+/// Request body for `POST /v1/verification-codes` — the unified, `RESTful` one-time
+/// code resource (PR3). `purpose` binds the issued code so it can only be consumed
+/// by the matching flow.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct SignupCodeRequest {
+pub struct VerificationCodeRequest {
     /// The account email a code should be issued for.
     pub email: String,
+    /// What the code may be exchanged for (`signup` / `password_reset` / `enrollment`).
+    pub purpose: CodePurpose,
 }
 
-/// Response body for `POST /v1/enrollment-codes`.
+/// Response body for `POST /v1/verification-codes`.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct SignupCodeResponse {
+pub struct VerificationCodeResponse {
     /// The one-time code — `None` once it has been **emailed** (production), `Some`
     /// only in the dev/no-op email path so the flow stays exercisable without a mailbox.
     pub code: Option<String>,
+}
+
+/// One connected login method for `GET /v1/me/identities`. Deliberately omits the
+/// stored secret (invariant #1): never carries a password hash or provider subject.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ConnectedIdentityView {
+    /// The login-method provider (`password` / `google` / `github`).
+    pub provider: String,
+    /// A human-facing label — the provider-verified email.
+    pub label: String,
+    /// When this method was linked to the account.
+    pub connected_at: DateTime<Utc>,
 }
 
 /// Request body for `POST /v1/enroll`.
@@ -303,7 +347,8 @@ pub struct UpdateTenantRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PasswordSignupRequest {
     pub email: String,
-    /// The one-time signup code issued to `email` (via `POST /v1/enrollment-codes`).
+    /// The one-time signup code issued to `email` (via
+    /// `POST /v1/verification-codes {purpose: "signup"}`).
     pub code: String,
     /// Plaintext password (hashed server-side; never stored or logged).
     pub password: String,

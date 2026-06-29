@@ -109,10 +109,10 @@ async fn full_daemon_flow() {
     // 1. signup code (public; needs the PROXY-derived ConnectInfo).
     let mut signup = Request::builder()
         .method("POST")
-        .uri("/v1/enrollment-codes")
+        .uri("/v1/verification-codes")
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::to_vec(&json!({"email": "a@b.com"})).unwrap(),
+            serde_json::to_vec(&json!({"email": "a@b.com", "purpose": "enrollment"})).unwrap(),
         ))
         .unwrap();
     signup
@@ -246,10 +246,10 @@ async fn delete_tenant_is_owner_scoped_and_idempotent() {
     // Enroll a tenant via the full bootstrap flow so it exists in the store.
     let mut signup = Request::builder()
         .method("POST")
-        .uri("/v1/enrollment-codes")
+        .uri("/v1/verification-codes")
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::to_vec(&json!({"email": "del@b.com"})).unwrap(),
+            serde_json::to_vec(&json!({"email": "del@b.com", "purpose": "enrollment"})).unwrap(),
         ))
         .unwrap();
     signup

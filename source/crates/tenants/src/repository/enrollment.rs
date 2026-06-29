@@ -32,12 +32,15 @@ pub enum EnrollOutcome {
 #[async_trait]
 pub trait EnrollmentRepository: Send + Sync {
     /// Persist a one-time code. `tenant_id` is `None` for a new-signup code (enroll
-    /// then creates the tenant) or `Some` for an add-daemon code.
+    /// then creates the tenant) or `Some` for an add-daemon code. `purpose` binds the
+    /// code to the flow it may be consumed by (`signup` / `password_reset` /
+    /// `enrollment`), closing cross-purpose replay (PR3).
     async fn issue_code(
         &self,
         code_hash: &str,
         email: &str,
         tenant_id: Option<&str>,
+        purpose: &str,
         expires_at: DateTime<Utc>,
     ) -> anyhow::Result<()>;
 
@@ -57,14 +60,17 @@ pub trait EnrollmentRepository: Send + Sync {
         pending_ttl_secs: i64,
     ) -> anyhow::Result<EnrollOutcome>;
 
-    /// Atomically validate + **burn** a one-time code, returning the email it was
-    /// issued for (`None` if unknown, expired, or already used). The
-    /// email-proving primitive reused by the web password signup/reset gate-1
-    /// (ADR-0009): unlike [`enroll`](Self::enroll), it creates no pending binding and
-    /// resolves no tenant — it only proves control of the email.
-    async fn consume_signup_code(
+    /// Atomically validate + **burn** a one-time code **of the given `purpose`**,
+    /// returning the email it was issued for (`None` if unknown, expired, already
+    /// used, **or issued for a different purpose**). The email-proving primitive
+    /// reused by the web password signup/reset gate-1 (ADR-0009): unlike
+    /// [`enroll`](Self::enroll), it creates no pending binding and resolves no tenant —
+    /// it only proves control of the email. The `purpose` filter is what stops a
+    /// `password_reset` code being replayed at signup and vice-versa (PR3).
+    async fn consume_code(
         &self,
         code_hash: &str,
+        purpose: &str,
         now: DateTime<Utc>,
     ) -> anyhow::Result<Option<String>>;
 
@@ -117,15 +123,17 @@ impl EnrollmentRepository for PgEnrollmentRepository {
         code_hash: &str,
         email: &str,
         tenant_id: Option<&str>,
+        purpose: &str,
         expires_at: DateTime<Utc>,
     ) -> anyhow::Result<()> {
         sqlx::query(
-            "INSERT INTO enrollment_codes (code_hash, email, tenant_id, expires_at, used_at)
-             VALUES ($1, $2, $3, $4, NULL)",
+            "INSERT INTO enrollment_codes (code_hash, email, tenant_id, purpose, expires_at, used_at)
+             VALUES ($1, $2, $3, $4, $5, NULL)",
         )
         .bind(code_hash)
         .bind(email)
         .bind(tenant_id)
+        .bind(purpose)
         .bind(expires_at)
         .execute(&self.pools.write)
         .await?;
@@ -143,9 +151,12 @@ impl EnrollmentRepository for PgEnrollmentRepository {
         let mut tx = self.pools.write.begin().await?;
 
         // Atomically validate + burn the code, recovering its email + tenant scope.
+        // Only an `enrollment` code can start a daemon enroll — a signup or
+        // password_reset code is bound to its own web flow (PR3, invariant #1/#25).
         let burned: Option<(String, Option<String>)> = sqlx::query_as(
             "UPDATE enrollment_codes SET used_at = $2 \
              WHERE code_hash = $1 AND used_at IS NULL AND expires_at > $2 \
+               AND purpose = 'enrollment' \
              RETURNING email, tenant_id",
         )
         .bind(code_hash)
@@ -222,20 +233,26 @@ impl EnrollmentRepository for PgEnrollmentRepository {
         })
     }
 
-    async fn consume_signup_code(
+    async fn consume_code(
         &self,
         code_hash: &str,
+        purpose: &str,
         now: DateTime<Utc>,
     ) -> anyhow::Result<Option<String>> {
-        // A signup code (tenant_id IS NULL) only — an add-daemon code is not a web
-        // login credential. Burns it atomically, mirroring the enroll saga's first step.
+        // Burn a code of exactly `purpose` (the binding that stops cross-purpose
+        // replay), atomically, mirroring the enroll saga's first step. The web-consume
+        // purposes (signup / password_reset) are always issued tenant-less, so the
+        // `tenant_id IS NULL` predicate is kept as structural defence-in-depth: an
+        // add-daemon (tenant-scoped) code can never be drained by a web flow even if a
+        // future issuance path mislabels a purpose.
         let email: Option<String> = sqlx::query_scalar(
-            "UPDATE enrollment_codes SET used_at = $2 \
-             WHERE code_hash = $1 AND used_at IS NULL AND expires_at > $2 \
-               AND tenant_id IS NULL \
+            "UPDATE enrollment_codes SET used_at = $3 \
+             WHERE code_hash = $1 AND used_at IS NULL AND expires_at > $3 \
+               AND purpose = $2 AND tenant_id IS NULL \
              RETURNING email",
         )
         .bind(code_hash)
+        .bind(purpose)
         .bind(now)
         .fetch_optional(&self.pools.write)
         .await?;

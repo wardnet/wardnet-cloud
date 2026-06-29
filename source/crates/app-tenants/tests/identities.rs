@@ -5,13 +5,15 @@
 
 use chrono::Utc;
 
+use wardnet_common::contract::CodePurpose;
 use wardnet_common::token::Verifier;
 
 use wardnet_tenants::error::IdentitiesError;
 use wardnet_tenants::identities::provider::VerifiedIdentity;
+use wardnet_tenants::repository::identity::{TenantIdentity, TenantIdentityRepository};
 use wardnet_tenants::repository::tenant::Tenant;
 mod common;
-use common::{Harness, build_harness, jwt_keypair_pem};
+use common::{Harness, build_harness, daemon_keypair, jwt_keypair_pem};
 
 const SEED: u8 = 5;
 
@@ -99,7 +101,7 @@ async fn resolve_unverified_email_is_rejected() {
 /// Issue a real signup code through the tenant aggregate (the gate-1 primitive).
 async fn signup_code(h: &Harness, email: &str) -> String {
     h.tenants
-        .issue_signup_code(email, "203.0.113.7")
+        .issue_signup_code(email, "203.0.113.7", CodePurpose::Signup)
         .await
         .unwrap()
 }
@@ -312,4 +314,191 @@ async fn password_login_is_rate_limited_per_ip() {
             .await
             .is_ok()
     );
+}
+
+// ── Purpose binding (PR3) ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn password_reset_code_cannot_be_used_for_signup() {
+    let h = build_harness(SEED);
+    let code = h
+        .tenants
+        .issue_signup_code(
+            "cross@example.com",
+            "203.0.113.7",
+            CodePurpose::PasswordReset,
+        )
+        .await
+        .unwrap();
+    // A reset-purpose code is not a signup credential.
+    assert!(matches!(
+        h.identities
+            .password_signup("cross@example.com", &code, "longenough1")
+            .await
+            .unwrap_err(),
+        IdentitiesError::BadCode(_)
+    ));
+}
+
+#[tokio::test]
+async fn signup_code_cannot_reset_a_password() {
+    let h = build_harness(SEED);
+    // Establish an account with a password so a reset would otherwise have a target.
+    let signup = h
+        .tenants
+        .issue_signup_code(
+            "reset-cross@example.com",
+            "203.0.113.7",
+            CodePurpose::Signup,
+        )
+        .await
+        .unwrap();
+    h.identities
+        .password_signup("reset-cross@example.com", &signup, "originalpass")
+        .await
+        .unwrap();
+    // A signup-purpose code is not a reset credential.
+    let signup2 = h
+        .tenants
+        .issue_signup_code(
+            "reset-cross@example.com",
+            "203.0.113.7",
+            CodePurpose::Signup,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        h.identities
+            .password_reset(&signup2, "brandnewpass")
+            .await
+            .unwrap_err(),
+        IdentitiesError::BadCode(_)
+    ));
+}
+
+#[tokio::test]
+async fn signup_code_cannot_enroll_a_daemon() {
+    let h = build_harness(SEED);
+    let (_key, cnf) = daemon_keypair(11);
+    let code = h
+        .tenants
+        .issue_signup_code(
+            "daemon-cross@example.com",
+            "203.0.113.7",
+            CodePurpose::Signup,
+        )
+        .await
+        .unwrap();
+    // A web-signup code can never start a daemon enroll (only `enrollment` may).
+    assert!(matches!(
+        h.tenants.enroll(&code, &cnf).await.unwrap_err(),
+        wardnet_tenants::error::TenantsError::BadCode(_)
+    ));
+}
+
+// ── Connected sign-in methods (PR3) ───────────────────────────────────────────────
+
+/// Seed a federated `google` identity for `tenant_id` (a second login method).
+async fn seed_google(h: &Harness, tenant_id: &str, email: &str, subject: &str) {
+    let store: &dyn TenantIdentityRepository = &h.store;
+    store
+        .insert(&TenantIdentity {
+            tenant_id: tenant_id.to_string(),
+            provider: "google".to_string(),
+            subject: subject.to_string(),
+            secret_hash: None,
+            email: email.to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn list_identities_returns_every_method() {
+    let h = build_harness(SEED);
+    let code = h
+        .tenants
+        .issue_signup_code("multi@example.com", "203.0.113.7", CodePurpose::Signup)
+        .await
+        .unwrap();
+    h.identities
+        .password_signup("multi@example.com", &code, "longenough1")
+        .await
+        .unwrap();
+    let tenant = h
+        .tenants
+        .find_tenant_by_email("multi@example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    seed_google(&h, &tenant.id, "multi@example.com", "g-sub-multi").await;
+
+    let methods = h.identities.list_identities(&tenant.id).await.unwrap();
+    let providers: Vec<&str> = methods.iter().map(|m| m.provider.as_str()).collect();
+    assert!(providers.contains(&"password"));
+    assert!(providers.contains(&"google"));
+}
+
+#[tokio::test]
+async fn unlink_refuses_the_last_login_method() {
+    let h = build_harness(SEED);
+    let code = h
+        .tenants
+        .issue_signup_code("solo@example.com", "203.0.113.7", CodePurpose::Signup)
+        .await
+        .unwrap();
+    h.identities
+        .password_signup("solo@example.com", &code, "longenough1")
+        .await
+        .unwrap();
+    let tenant = h
+        .tenants
+        .find_tenant_by_email("solo@example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    // The only method cannot be removed.
+    assert!(matches!(
+        h.identities
+            .unlink_identity(&tenant.id, "password")
+            .await
+            .unwrap_err(),
+        IdentitiesError::Conflict(_)
+    ));
+}
+
+#[tokio::test]
+async fn unlink_removes_one_of_several_and_is_idempotent() {
+    let h = build_harness(SEED);
+    let code = h
+        .tenants
+        .issue_signup_code("pair@example.com", "203.0.113.7", CodePurpose::Signup)
+        .await
+        .unwrap();
+    h.identities
+        .password_signup("pair@example.com", &code, "longenough1")
+        .await
+        .unwrap();
+    let tenant = h
+        .tenants
+        .find_tenant_by_email("pair@example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    seed_google(&h, &tenant.id, "pair@example.com", "g-sub-pair").await;
+
+    // Removing one of two leaves the other (the ≥1 invariant holds).
+    h.identities
+        .unlink_identity(&tenant.id, "google")
+        .await
+        .unwrap();
+    let remaining = h.identities.list_identities(&tenant.id).await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].provider, "password");
+    // Unlinking the already-absent provider is a no-op success.
+    h.identities
+        .unlink_identity(&tenant.id, "google")
+        .await
+        .unwrap();
 }
