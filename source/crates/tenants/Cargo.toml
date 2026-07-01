@@ -48,6 +48,7 @@ utoipa-axum = { workspace = true }
 # Internal mesh-mTLS work-queue listener (hyper plumbing lives in wardnet_common::serve)
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
+askama = { workspace = true }
 
 [dev-dependencies]
 http-body-util = { workspace = true }

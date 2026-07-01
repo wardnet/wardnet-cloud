@@ -76,9 +76,27 @@ impl From<SubscriptionRow> for Subscription {
 const SUBSCRIPTION_COLS: &str = "id, tenant_id, status, entitlement, \
      trial_expires_at, current_period_end, created_at, updated_at";
 
+/// Insert the paid row. `convert_trial_to_paid` cancels the tenant's live trial first,
+/// so on the normal path this is a plain insert. Under a concurrent conversion (two
+/// racing checkout webhooks), the losing transaction's snapshot predates the winner's
+/// paid row, so its cancel misses it and this insert would otherwise collide on
+/// `uq_subscriptions_live`; the `ON CONFLICT` folds it into an in-place update of the
+/// already-live row, keeping exactly one live row instead of erroring.
+///
+/// Semantics: this is **last-writer-wins** on the value columns (the winner's `id` /
+/// `created_at` are kept). That is correct for the race it targets — the two racing
+/// checkout webhooks carry the same freshly-created subscription state — but a concurrent
+/// conversion is reconciled by commit order, not event order. It is only ever reached from
+/// `apply_upsert`'s convert branch (current status trialing/none), so it can never
+/// overwrite an existing *paid* row; a future caller that misrouted an update through this
+/// path would be absorbed here rather than surfacing as a unique violation.
 const INSERT_SUBSCRIPTION: &str = "INSERT INTO subscriptions \
      (id, tenant_id, status, entitlement, trial_expires_at, current_period_end, created_at, updated_at) \
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)";
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+     ON CONFLICT (tenant_id) WHERE status <> 'canceled' DO UPDATE SET \
+     status = EXCLUDED.status, entitlement = EXCLUDED.entitlement, \
+     trial_expires_at = EXCLUDED.trial_expires_at, \
+     current_period_end = EXCLUDED.current_period_end, updated_at = EXCLUDED.updated_at";
 
 /// Data access for the `subscriptions` table (license columns only).
 #[async_trait]

@@ -26,7 +26,7 @@ wardnet-tunneller = { path = "crates/tunneller" }
 axum = { version = "0.8", features = ["macros", "ws"] }
 tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.7", features = ["trace"] }
+tower-http = { version = "0.7", features = ["trace", "catch-panic"] }
 
 # Database
 sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "uuid", "chrono", "migrate", "json"] }
@@ -71,6 +71,7 @@ thiserror = "2"
 anyhow = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 async-trait = "0.1"
+askama = "0.16"
 bitflags = "2"
 dashmap = "6"
 arc-swap = "1"

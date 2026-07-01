@@ -1,0 +1,57 @@
+.statusCard {
+  padding: 0;
+  overflow: hidden;
+}
+.statusInner {
+  display: flex;
+}
+.stripe {
+  width: 4px;
+  flex: none;
+}
+.statusBody {
+  flex: 1;
+  padding: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.statusLabelRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.statusCta {
+  margin-top: 6px;
+  display: flex;
+  justify-content: flex-end;
+}
+.tiles {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+.networkRow {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 13px 0;
+}
+.networkRow + .networkRow {
+  border-top: 1px solid var(--line);
+}
+.networkMeta {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.networkName {
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
+@media (max-width: 640px) {
+  .tiles {
+    grid-template-columns: 1fr;
+  }
+}

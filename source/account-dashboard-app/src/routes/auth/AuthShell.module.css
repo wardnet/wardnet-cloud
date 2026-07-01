@@ -1,0 +1,34 @@
+.shell {
+  position: relative;
+  min-height: 100vh;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 20px;
+}
+.fab {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+}
+.column {
+  width: 100%;
+  /* Matches the admin-site / admin-app auth card (`Card` + Tailwind `max-w-sm`). */
+  max-width: 384px;
+}
+.logo {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 22px;
+}
+.cardBody {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.footer {
+  text-align: center;
+  margin-top: 18px;
+}

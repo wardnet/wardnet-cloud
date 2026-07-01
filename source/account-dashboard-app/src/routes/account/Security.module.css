@@ -1,0 +1,64 @@
+.methodRow {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 0;
+}
+.methodRow + .methodRow {
+  border-top: 1px solid var(--line);
+}
+.methodIcon {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  color: var(--ink-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+.methodMeta {
+  flex: 1;
+  /* Allow the column to shrink below its content width so a long email doesn't
+     push the Connected pill + Disconnect button out of the card on mobile. */
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.methodMeta > * {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Both the idle (explanatory) and code-entry steps fill the card width — so the
+   form doesn't sit as a narrow mobile-width strip in a wide desktop card. */
+.form,
+.intro {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.sessionsRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+/* Action-button row — right-aligned, matching the app convention. */
+.actions {
+  display: flex;
+  justify-content: flex-end;
+}
+.success {
+  margin: 0;
+}
+.codeWrap {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: flex-start;
+}

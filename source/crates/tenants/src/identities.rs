@@ -293,6 +293,82 @@ impl IdentitiesService {
         Ok(())
     }
 
+    /// Set or change the password for an **already-authenticated** USER, proven by a
+    /// fresh purpose-bound email code. Unlike [`Self::password_reset`] (unauthenticated
+    /// recovery, which force-logs-out *everything*), this keeps the user signed in: it
+    /// revokes every existing session — evicting other devices and rotating the current
+    /// credential so no pre-existing session token survives the change — then mints a
+    /// new session and returns its raw token for the caller to set as the cookie.
+    ///
+    /// The code must prove **this tenant's own** account email; a code for any other
+    /// inbox is rejected, so a hijacked live session still cannot add a password without
+    /// control of the account's email.
+    ///
+    /// # Errors
+    /// [`IdentitiesError::Unauthorized`] if the tenant no longer exists;
+    /// [`IdentitiesError::BadCode`] on a bad/expired code or an email mismatch;
+    /// [`IdentitiesError::BadRequest`] on a too-weak password.
+    pub async fn set_password_authenticated(
+        &self,
+        tenant_id: &str,
+        code: &str,
+        new_password: &str,
+    ) -> Result<String, IdentitiesError> {
+        check_password(new_password)?;
+        let tenant = self
+            .tenants
+            .find_tenant(tenant_id)
+            .await?
+            .ok_or_else(|| IdentitiesError::Unauthorized("account not found".to_string()))?;
+        let proven_email = self
+            .tenants
+            .consume_code(code, CodePurpose::PasswordChange)
+            .await?
+            .ok_or_else(|| IdentitiesError::BadCode("invalid or expired code".to_string()))?;
+        // The proof must be for the caller's own account email — never let an
+        // authenticated session set a password using a code that proves a different inbox.
+        if !proven_email.eq_ignore_ascii_case(&tenant.email) {
+            return Err(IdentitiesError::BadCode(
+                "code does not match your account email".to_string(),
+            ));
+        }
+        let hash = hash_password(new_password)?;
+        // Upsert the password identity (sets the first password for an OIDC-born account,
+        // or replaces an existing one).
+        if !self
+            .identities
+            .update_secret_hash(PROVIDER_PASSWORD, &tenant.email, &hash)
+            .await
+            .map_err(IdentitiesError::Internal)?
+        {
+            let inserted = self
+                .identities
+                .insert(&TenantIdentity {
+                    tenant_id: tenant.id.clone(),
+                    provider: PROVIDER_PASSWORD.to_string(),
+                    subject: tenant.email.clone(),
+                    secret_hash: Some(hash.clone()),
+                    email: tenant.email.clone(),
+                    created_at: Utc::now(),
+                })
+                .await
+                .map_err(IdentitiesError::Internal)?;
+            if inserted == InsertIdentityOutcome::AlreadyExists {
+                self.identities
+                    .update_secret_hash(PROVIDER_PASSWORD, &tenant.email, &hash)
+                    .await
+                    .map_err(IdentitiesError::Internal)?;
+            }
+        }
+        // Revoke every existing session (evict other devices + rotate the current token),
+        // then mint a fresh session for the current browser so the user stays signed in.
+        self.sessions
+            .delete_for_tenant(&tenant.id)
+            .await
+            .map_err(IdentitiesError::Internal)?;
+        self.create_session(&tenant.id).await
+    }
+
     // ── Federated (OIDC / OAuth2) ──────────────────────────────────────────────────
 
     /// Begin a federated login: the authorize redirect + the CSRF/PKCE secrets the

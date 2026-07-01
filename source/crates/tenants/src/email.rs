@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use askama::Template;
 use async_trait::async_trait;
 use serde::Serialize;
 use wardnet_common::contract::CodePurpose;
@@ -34,32 +35,52 @@ pub trait EmailSender: Send + Sync {
     fn delivers(&self) -> bool;
 }
 
-/// The subject + body text for a one-time code of `purpose`.
-fn code_email(purpose: CodePurpose, code: &str) -> (&'static str, String) {
+/// Per-purpose copy: `(subject, intro, note)`. `intro` is the line above the code,
+/// `note` the reassurance line below it — shared by the plain-text and HTML bodies.
+fn code_copy(purpose: CodePurpose) -> (&'static str, &'static str, &'static str) {
     match purpose {
         CodePurpose::Signup => (
-            "Your wardnet sign-up code",
-            format!(
-                "Your one-time wardnet sign-up code is:\n\n    {code}\n\n\
-                 Enter it to finish creating your account. It expires shortly."
-            ),
+            "Your Wardnet sign-up code",
+            "Use this code to finish creating your Wardnet account:",
+            "It expires shortly. If you didn't request this, you can ignore this email.",
         ),
         CodePurpose::PasswordReset => (
-            "Your wardnet password-reset code",
-            format!(
-                "Your one-time wardnet password-reset code is:\n\n    {code}\n\n\
-                 Enter it to set a new password. It expires shortly. If you did not \
-                 request this, you can ignore this email."
-            ),
+            "Your Wardnet password-reset code",
+            "Use this code to set a new password on your Wardnet account:",
+            "It expires shortly. If you didn't request this, you can ignore this email.",
+        ),
+        CodePurpose::PasswordChange => (
+            "Confirm your Wardnet password change",
+            "Use this code to confirm the password change on your Wardnet account:",
+            "It expires shortly. If you didn't request this, ignore this email and your \
+             password stays unchanged.",
         ),
         CodePurpose::Enrollment => (
-            "Your wardnet enrollment code",
-            format!(
-                "Your one-time wardnet enrollment code is:\n\n    {code}\n\n\
-                 Enter it in the install wizard to continue. It expires shortly."
-            ),
+            "Your Wardnet enrollment code",
+            "Use this code in the install wizard to continue:",
+            "It expires shortly.",
         ),
     }
+}
+
+/// Branded HTML body (extends the shared `_layout.html`). `logo_url` empty → CSS
+/// wordmark; set → hosted `<img>`.
+#[derive(Template)]
+#[template(path = "email/verification_code.html")]
+struct VerificationCodeHtml<'a> {
+    logo_url: &'a str,
+    intro: &'a str,
+    code: &'a str,
+    note: &'a str,
+}
+
+/// Plain-text fallback body (for clients that don't render HTML).
+#[derive(Template)]
+#[template(path = "email/verification_code.txt")]
+struct VerificationCodeText<'a> {
+    intro: &'a str,
+    code: &'a str,
+    note: &'a str,
 }
 
 /// Production [`EmailSender`] over Resend's REST API.
@@ -67,23 +88,31 @@ pub struct ResendEmailSender {
     http: reqwest::Client,
     from: String,
     base_url: String,
+    /// Absolute logo URL for the HTML email (empty → CSS wordmark fallback).
+    logo_url: String,
 }
 
 impl ResendEmailSender {
-    /// Build a sender from a Resend API key and a verified `from` address.
+    /// Build a sender from a Resend API key, a verified `from` address, and the brand
+    /// `logo_url` (empty for the wordmark fallback).
     ///
     /// # Errors
     /// Returns an error if the API key contains invalid header characters or the HTTP
     /// client cannot be built.
-    pub fn new(api_key: &str, from: &str) -> anyhow::Result<Self> {
-        Self::with_base_url(api_key, from, RESEND_API_BASE)
+    pub fn new(api_key: &str, from: &str, logo_url: &str) -> anyhow::Result<Self> {
+        Self::with_base_url(api_key, from, logo_url, RESEND_API_BASE)
     }
 
     /// Build a sender against `base_url` (the e2e wiremock seam).
     ///
     /// # Errors
     /// As [`ResendEmailSender::new`].
-    pub fn with_base_url(api_key: &str, from: &str, base_url: &str) -> anyhow::Result<Self> {
+    pub fn with_base_url(
+        api_key: &str,
+        from: &str,
+        logo_url: &str,
+        base_url: &str,
+    ) -> anyhow::Result<Self> {
         use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
         let mut headers = HeaderMap::new();
@@ -99,27 +128,42 @@ impl ResendEmailSender {
             http,
             from: from.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
+            logo_url: logo_url.to_string(),
         })
     }
 }
 
-/// Resend `POST /emails` request body.
+/// Resend `POST /emails` request body. Both `html` (rendered by most clients) and
+/// `text` (fallback) are sent.
 #[derive(Serialize)]
 struct ResendEmail<'a> {
     from: &'a str,
     to: [&'a str; 1],
     subject: &'a str,
+    html: String,
     text: String,
 }
 
 #[async_trait]
 impl EmailSender for ResendEmailSender {
     async fn send_code(&self, to: &str, code: &str, purpose: CodePurpose) -> anyhow::Result<()> {
-        let (subject, text) = code_email(purpose, code);
+        let (subject, intro, note) = code_copy(purpose);
+        let html = VerificationCodeHtml {
+            logo_url: &self.logo_url,
+            intro,
+            code,
+            note,
+        }
+        .render()
+        .map_err(|e| anyhow::anyhow!("email HTML template render failed: {e}"))?;
+        let text = VerificationCodeText { intro, code, note }
+            .render()
+            .map_err(|e| anyhow::anyhow!("email text template render failed: {e}"))?;
         let body = ResendEmail {
             from: &self.from,
             to: [to],
             subject,
+            html,
             text,
         };
         let resp = self

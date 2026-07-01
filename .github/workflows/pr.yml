@@ -41,6 +41,7 @@ jobs:
       tenants: ${{ steps.detect.outputs.tenants }}
       ddns: ${{ steps.detect.outputs.ddns }}
       tunneller: ${{ steps.detect.outputs.tunneller }}
+      account-dashboard-app: ${{ steps.detect.outputs.account-dashboard-app }}
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -90,6 +91,16 @@ jobs:
       service: tunneller
     secrets: inherit
 
+  account-dashboard-app:
+    name: Account dashboard app
+    needs: preflight
+    if: needs.preflight.outputs.account-dashboard-app == 'true' || needs.preflight.outputs.all == 'true'
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/account-dashboard-app.yml
+    secrets: inherit
+
   # NOTE: the mesh e2e harness is intentionally NOT a PR leaf. It is heavy and
   # flaky on shared runners (see .github/workflows/e2e.yml), so it runs nightly
   # on a schedule + on demand (workflow_dispatch) instead of gating every merge.
@@ -122,7 +133,15 @@ jobs:
   # never reports and blocks the PR forever.
   all-checks-passed:
     name: All checks passed
-    needs: [preflight, build-tenants, build-ddns, build-tunneller, coverage]
+    needs:
+      [
+        preflight,
+        build-tenants,
+        build-ddns,
+        build-tunneller,
+        account-dashboard-app,
+        coverage,
+      ]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 2

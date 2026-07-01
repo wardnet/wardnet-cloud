@@ -884,6 +884,99 @@ async fn in_app_change_password_revokes_all_sessions_then_new_password_works() {
     assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// `POST /v1/me/password` with a Bearer JWT + a `password_change` code body.
+async fn post_me_password(
+    app: &Router,
+    jwt: &str,
+    code: &str,
+    password: &str,
+) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/me/password")
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "code": code, "password": password })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn authenticated_set_password_rotates_sessions_and_keeps_caller_signed_in() {
+    let (app, _h) = plain_app();
+    // Two devices for the same account; session2 is the "current browser".
+    let session1 = signup_session(&app, "setter@example.com", "originalpass").await;
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/auth/password/login",
+            &json!({ "email": "setter@example.com", "password": "originalpass" }),
+        ))
+        .await
+        .unwrap();
+    let session2 = cookie_pair(&resp, "wardnet_session");
+    let jwt = bearer_from_session(&app, &session2).await;
+
+    // A fresh password_change code for the caller's own email.
+    let code = verification_code(&app, "setter@example.com", "password_change").await;
+    let resp = post_me_password(&app, &jwt, &code, "brandnewpass").await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // A fresh session cookie is issued and works — the caller stays signed in.
+    let new_session = cookie_pair(&resp, "wardnet_session");
+    assert!(!new_session.is_empty());
+    assert_eq!(exchange_status(&app, &new_session).await, StatusCode::OK);
+
+    // Every prior session is revoked — even the current token is rotated out.
+    assert_eq!(
+        exchange_status(&app, &session1).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        exchange_status(&app, &session2).await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // The new password logs in.
+    let ok = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/auth/password/login",
+            &json!({ "email": "setter@example.com", "password": "brandnewpass" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn authenticated_set_password_rejects_wrong_purpose_and_foreign_email_codes() {
+    let (app, _h) = plain_app();
+    let session = signup_session(&app, "owner@example.com", "originalpass").await;
+    let jwt = bearer_from_session(&app, &session).await;
+
+    // A password_reset code (wrong purpose) must NOT be accepted by /v1/me/password —
+    // purpose-binding keeps recovery codes out of the authenticated change flow.
+    let reset_code = verification_code(&app, "owner@example.com", "password_reset").await;
+    let resp = post_me_password(&app, &jwt, &reset_code, "brandnewpass").await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // A password_change code for a DIFFERENT inbox must be rejected (email mismatch),
+    // so a hijacked session can't set a password with someone else's proof.
+    let foreign = verification_code(&app, "intruder@example.com", "password_change").await;
+    let resp = post_me_password(&app, &jwt, &foreign, "brandnewpass").await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Both attempts failed → nothing rotated, the caller's session still works.
+    assert_eq!(exchange_status(&app, &session).await, StatusCode::OK);
+}
+
 #[tokio::test]
 async fn oidc_link_aborts_if_session_revoked_mid_flight() {
     let identity = VerifiedIdentity {

@@ -60,9 +60,83 @@ pub enum StripeEventKind {
     SubscriptionDeleted { stripe_subscription_id: String },
     /// `invoice.payment_failed` — move the matching subscription to `past_due`.
     PaymentFailed { stripe_subscription_id: String },
+    /// `checkout.session.completed` for a **`setup`-mode** session — the user added/replaced
+    /// a card. The new payment method must be promoted to the customer's (and its
+    /// subscription's) default, or renewals keep charging the old card.
+    CardSetupCompleted {
+        stripe_customer_id: String,
+        setup_intent_id: String,
+    },
+    /// A catalog object changed in Stripe (`price.*` / `product.*` / `coupon.*` /
+    /// `promotion_code.*`) — trigger a projection resync. The event carries no data we
+    /// need (we re-list the whole catalog), so it is a unit variant.
+    CatalogChanged,
     /// Any other event type.
     Ignored,
 }
+
+/// One purchasable plan as read from Stripe's price catalog (the pre-projection shape).
+/// `level` / `entitlement` are `Option` so an ill-formed price is dropped by the sync
+/// (safe-closed) rather than failing the whole list.
+#[derive(Debug, Clone)]
+pub struct PlanData {
+    pub price_id: String,
+    pub product_id: String,
+    pub name: String,
+    pub level: Option<u32>,
+    pub entitlement: Option<Entitlement>,
+    pub amount_cents: i64,
+    pub currency: String,
+    pub interval: String,
+    pub active: bool,
+}
+
+/// One promotion (Stripe coupon) as read from the catalog. The active window is
+/// `[start, redeem_by]`; `auto_apply` gates whether it participates in the auto-applied
+/// catalog at all.
+#[derive(Debug, Clone)]
+pub struct PromotionData {
+    pub coupon_id: String,
+    pub name: String,
+    pub percent_off: Option<f64>,
+    pub amount_off: Option<i64>,
+    pub currency: Option<String>,
+    pub applies_to_products: Vec<String>,
+    pub start: Option<DateTime<Utc>>,
+    pub redeem_by: Option<DateTime<Utc>>,
+    pub auto_apply: bool,
+}
+
+/// Live details of a Stripe subscription needed to change its plan.
+#[derive(Debug, Clone)]
+pub struct SubscriptionDetails {
+    /// The (single) subscription item id — the target of a price swap.
+    pub item_id: String,
+    /// The price the subscription is currently billed at.
+    pub price_id: String,
+    /// End of the current paid period — when a scheduled downgrade takes effect.
+    pub current_period_end: DateTime<Utc>,
+    /// The attached subscription schedule id, if any (a pending change exists).
+    pub schedule_id: Option<String>,
+    /// Whether the subscription is still in its Stripe trial (a trial-preserving sub,
+    /// ADR-0012). An upgrade of such a sub must end the trial so it charges now.
+    pub trialing: bool,
+}
+
+/// A pending scheduled plan change read from a subscription schedule's future phase.
+#[derive(Debug, Clone)]
+pub struct ScheduledChange {
+    pub price_id: String,
+    pub effective_at: DateTime<Utc>,
+}
+
+/// Marker error: Stripe rejected an applied coupon (expired / invalid / exhausted). The
+/// billing service downcasts the `anyhow::Error` to this to surface
+/// [`BillingError::PromoUnavailable`](wardnet_common::ports::BillingError::PromoUnavailable)
+/// and offer a full-price retry, rather than silently charging full price.
+#[derive(Debug, thiserror::Error)]
+#[error("stripe rejected the applied coupon")]
+pub struct CouponRejected;
 
 /// The fields we extract from a Stripe `Subscription` object.
 #[derive(Debug, Clone)]
@@ -86,16 +160,94 @@ pub trait StripeGateway: Send + Sync {
     /// Create a subscription-mode Checkout Session for `price_id`, reusing
     /// `customer_id` when known (else collecting via `email`), and stamping
     /// `tenant_id` into the subscription metadata so the webhook can resolve it.
+    /// When `coupon` is `Some`, it is auto-applied (`discounts[0][coupon]`); a Stripe
+    /// rejection of the coupon surfaces as a [`CouponRejected`] error.
+    /// When `trial_end` is `Some` (a future unix timestamp), the subscription is created
+    /// with `subscription_data[trial_end]` so the first charge defers to that date — the
+    /// trial-preserving subscribe of ADR-0012.
     async fn create_checkout_session(
         &self,
         customer_id: Option<&str>,
         email: &str,
         price_id: &str,
         tenant_id: &str,
+        coupon: Option<&str>,
+        trial_end: Option<i64>,
     ) -> anyhow::Result<CheckoutSession>;
 
-    /// Create a Billing Portal session for `customer_id`, returning its URL.
-    async fn create_billing_portal_session(&self, customer_id: &str) -> anyhow::Result<String>;
+    /// Create a `setup`-mode Checkout Session for `customer_id` (collect/replace a card,
+    /// no purchase), returning its URL. Replaces the removed Billing Portal card-update.
+    /// `currency` is required by Stripe for setup mode (no line items to infer it from) and
+    /// should match the customer's subscription currency.
+    async fn create_setup_checkout_session(
+        &self,
+        customer_id: &str,
+        currency: &str,
+    ) -> anyhow::Result<String>;
+
+    /// List the purchasable plans from Stripe (active recurring prices + their products).
+    /// The sync worker filters/validates these into the projection.
+    async fn list_plans(&self) -> anyhow::Result<Vec<PlanData>>;
+
+    /// List the promotions (coupons) from Stripe. The sync worker keeps only the
+    /// `auto_apply` ones.
+    async fn list_promotions(&self) -> anyhow::Result<Vec<PromotionData>>;
+
+    /// Read the live details of a subscription needed to change its plan (item id,
+    /// current price, period end, attached schedule).
+    async fn get_subscription(&self, subscription_id: &str) -> anyhow::Result<SubscriptionDetails>;
+
+    /// The pending scheduled change (a schedule's future phase), or `None`. Used for the
+    /// account-page "downgrades on DATE" surface. Takes the `schedule_id` and
+    /// `current_period_end` the caller already has from [`get_subscription`](Self::get_subscription)
+    /// so it need not re-fetch the subscription.
+    async fn pending_scheduled_change(
+        &self,
+        schedule_id: &str,
+        current_period_end: DateTime<Utc>,
+    ) -> anyhow::Result<Option<ScheduledChange>>;
+
+    /// Apply an **immediate** price change (an upgrade) to `subscription_id`'s item,
+    /// prorating onto the next invoice. When `coupon` is `Some` it is applied; a Stripe
+    /// rejection of the coupon surfaces as a [`CouponRejected`] error. When `end_trial` is
+    /// true (upgrading a subscription still in its Stripe trial) the trial is ended now so
+    /// the upgrade charges immediately (ADR-0012).
+    async fn upgrade_subscription(
+        &self,
+        subscription_id: &str,
+        item_id: &str,
+        new_price_id: &str,
+        coupon: Option<&str>,
+        end_trial: bool,
+    ) -> anyhow::Result<()>;
+
+    /// Schedule a **downgrade** of `subscription_id` to `new_price_id` taking effect at
+    /// `current_period_end` (a Stripe subscription schedule; the tenant keeps the current
+    /// entitlement until then). Returns the effective time. `current_price_id` seeds the
+    /// preserved current phase.
+    async fn schedule_downgrade(
+        &self,
+        subscription_id: &str,
+        current_price_id: &str,
+        new_price_id: &str,
+        current_period_end: DateTime<Utc>,
+    ) -> anyhow::Result<DateTime<Utc>>;
+
+    /// Release the subscription schedule `schedule_id` (cancel a pending change),
+    /// returning the subscription to plain billing. Idempotent from the caller's view.
+    async fn release_schedule(&self, schedule_id: &str) -> anyhow::Result<()>;
+
+    /// Promote the card collected by a completed setup-mode Checkout to the default:
+    /// resolve the `setup_intent`'s payment method, set it as `customer_id`'s
+    /// `invoice_settings.default_payment_method`, and — when `subscription_id` is given —
+    /// as that subscription's `default_payment_method` (so the next renewal uses the new
+    /// card, not the old one).
+    async fn set_default_payment_method_from_setup(
+        &self,
+        customer_id: &str,
+        subscription_id: Option<&str>,
+        setup_intent_id: &str,
+    ) -> anyhow::Result<()>;
 
     /// Verify the webhook signature and normalize the event. The signature is the
     /// credential — a bad signature is an error (the handler returns `400`).
@@ -188,6 +340,8 @@ impl StripeGateway for StripeClient {
         email: &str,
         price_id: &str,
         tenant_id: &str,
+        coupon: Option<&str>,
+        trial_end: Option<i64>,
     ) -> anyhow::Result<CheckoutSession> {
         let success_url = format!("{}/billing/success", self.account_base_url);
         let cancel_url = format!("{}/billing/cancel", self.account_base_url);
@@ -209,8 +363,20 @@ impl StripeGateway for StripeClient {
             Some(cid) => form.push(("customer".into(), cid.to_string())),
             None => form.push(("customer_email".into(), email.to_string())),
         }
+        // Auto-apply the promotion (the user never passes a code; we re-derive server-side).
+        if let Some(c) = coupon {
+            form.push(("discounts[0][coupon]".into(), c.to_string()));
+        }
+        // Trial-preserving subscribe (ADR-0012): defer the first charge to the tenant's
+        // original trial end. Stripe keeps the subscription `trialing` (entitling, no
+        // charge) until then.
+        if let Some(ts) = trial_end {
+            form.push(("subscription_data[trial_end]".into(), ts.to_string()));
+        }
 
-        let session: SessionResponse = self.post_form("/v1/checkout/sessions", &form).await?;
+        let session: SessionResponse = self
+            .post_form_coupon_aware("/v1/checkout/sessions", &form, coupon.is_some())
+            .await?;
         let url = session
             .url
             .ok_or_else(|| anyhow::anyhow!("Stripe checkout session has no URL"))?;
@@ -220,16 +386,234 @@ impl StripeGateway for StripeClient {
         })
     }
 
-    async fn create_billing_portal_session(&self, customer_id: &str) -> anyhow::Result<String> {
-        let return_url = format!("{}/billing", self.account_base_url);
+    async fn create_setup_checkout_session(
+        &self,
+        customer_id: &str,
+        currency: &str,
+    ) -> anyhow::Result<String> {
+        let success_url = format!("{}/billing/success", self.account_base_url);
+        let cancel_url = format!("{}/billing", self.account_base_url);
         let form = [
+            ("mode", "setup"),
             ("customer", customer_id),
-            ("return_url", return_url.as_str()),
+            // Setup mode has no line items to infer the currency from, so Stripe requires
+            // it explicitly (a 400 `parameter_missing` otherwise) — matched to the plan.
+            ("currency", currency),
+            ("success_url", success_url.as_str()),
+            ("cancel_url", cancel_url.as_str()),
         ];
-        let session: SessionResponse = self.post_form("/v1/billing_portal/sessions", &form).await?;
+        let session: SessionResponse = self.post_form("/v1/checkout/sessions", &form).await?;
         session
             .url
-            .ok_or_else(|| anyhow::anyhow!("Stripe billing portal session has no URL"))
+            .ok_or_else(|| anyhow::anyhow!("Stripe setup session has no URL"))
+    }
+
+    async fn list_plans(&self) -> anyhow::Result<Vec<PlanData>> {
+        // Active recurring prices with their product expanded — one call gives id, amount,
+        // currency, interval, metadata, and the product name.
+        let page: StripeList<StripePriceFull> = self
+            .get_json(
+                "/v1/prices",
+                &[
+                    ("active", "true"),
+                    ("type", "recurring"),
+                    ("limit", "100"),
+                    ("expand[]", "data.product"),
+                ],
+            )
+            .await?;
+        Ok(page.data.into_iter().filter_map(map_plan).collect())
+    }
+
+    async fn list_promotions(&self) -> anyhow::Result<Vec<PromotionData>> {
+        let page: StripeList<StripeCoupon> =
+            self.get_json("/v1/coupons", &[("limit", "100")]).await?;
+        Ok(page.data.into_iter().map(map_coupon).collect())
+    }
+
+    async fn get_subscription(&self, subscription_id: &str) -> anyhow::Result<SubscriptionDetails> {
+        let sub: StripeSubscription = self
+            .get_json(
+                &format!("/v1/subscriptions/{subscription_id}"),
+                &[("expand[]", "schedule")],
+            )
+            .await?;
+        let item = sub
+            .items
+            .data
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("Stripe subscription has no items"))?;
+        let item_id = item
+            .id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Stripe subscription item has no id"))?;
+        let price_id = item
+            .price
+            .as_ref()
+            .map(|p| p.id.clone())
+            .ok_or_else(|| anyhow::anyhow!("Stripe subscription item has no price"))?;
+        let period_end_ts = sub
+            .current_period_end
+            .or(item.current_period_end)
+            .ok_or_else(|| anyhow::anyhow!("Stripe subscription has no current_period_end"))?;
+        let current_period_end = Utc
+            .timestamp_opt(period_end_ts, 0)
+            .single()
+            .ok_or_else(|| anyhow::anyhow!("invalid current_period_end timestamp"))?;
+        Ok(SubscriptionDetails {
+            item_id,
+            price_id,
+            current_period_end,
+            schedule_id: sub.schedule.map(Expandable::into_id),
+            trialing: sub.status == "trialing",
+        })
+    }
+
+    async fn pending_scheduled_change(
+        &self,
+        schedule_id: &str,
+        current_period_end: DateTime<Utc>,
+    ) -> anyhow::Result<Option<ScheduledChange>> {
+        let schedule: StripeSubscriptionSchedule = self
+            .get_json(&format!("/v1/subscription_schedules/{schedule_id}"), &[])
+            .await?;
+        // The future phase is the one whose start is at/after the current period end.
+        let cutoff = current_period_end.timestamp();
+        let future = schedule
+            .phases
+            .into_iter()
+            .find(|p| p.start_date.is_some_and(|s| s >= cutoff));
+        Ok(future.and_then(|phase| {
+            let price_id = phase.items.first().and_then(|i| i.price.clone())?;
+            let effective_at = phase
+                .start_date
+                .and_then(|s| Utc.timestamp_opt(s, 0).single())?;
+            Some(ScheduledChange {
+                price_id,
+                effective_at,
+            })
+        }))
+    }
+
+    async fn upgrade_subscription(
+        &self,
+        subscription_id: &str,
+        item_id: &str,
+        new_price_id: &str,
+        coupon: Option<&str>,
+        end_trial: bool,
+    ) -> anyhow::Result<()> {
+        let mut form: Vec<(String, String)> = vec![
+            ("items[0][id]".into(), item_id.to_string()),
+            ("items[0][price]".into(), new_price_id.to_string()),
+            ("proration_behavior".into(), "create_prorations".into()),
+        ];
+        if let Some(c) = coupon {
+            form.push(("discounts[0][coupon]".into(), c.to_string()));
+        }
+        // Ending the trial now makes the upgrade bill immediately (ADR-0012).
+        if end_trial {
+            form.push(("trial_end".into(), "now".into()));
+        }
+        let _: serde_json::Value = self
+            .post_form_coupon_aware(
+                &format!("/v1/subscriptions/{subscription_id}"),
+                &form,
+                coupon.is_some(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn schedule_downgrade(
+        &self,
+        subscription_id: &str,
+        current_price_id: &str,
+        new_price_id: &str,
+        current_period_end: DateTime<Utc>,
+    ) -> anyhow::Result<DateTime<Utc>> {
+        // 1. Wrap the subscription in a schedule (seeds phase[0] from the live sub).
+        let created: StripeSubscriptionSchedule = self
+            .post_form(
+                "/v1/subscription_schedules",
+                &[("from_subscription", subscription_id)],
+            )
+            .await?;
+        let phase0_start = created
+            .phases
+            .first()
+            .and_then(|p| p.start_date)
+            .ok_or_else(|| anyhow::anyhow!("Stripe schedule has no seeded phase"))?;
+        let boundary = current_period_end.timestamp();
+
+        // 2. Replace phases: keep the current price until the period end, then the new one.
+        //    `proration_behavior=none` (no credit/charge at the boundary) and
+        //    `end_behavior=release` (return to plain billing after the new phase).
+        let form: Vec<(String, String)> = vec![
+            ("end_behavior".into(), "release".into()),
+            ("proration_behavior".into(), "none".into()),
+            (
+                "phases[0][items][0][price]".into(),
+                current_price_id.to_string(),
+            ),
+            ("phases[0][start_date]".into(), phase0_start.to_string()),
+            ("phases[0][end_date]".into(), boundary.to_string()),
+            (
+                "phases[1][items][0][price]".into(),
+                new_price_id.to_string(),
+            ),
+            ("phases[1][start_date]".into(), boundary.to_string()),
+        ];
+        let _: serde_json::Value = self
+            .post_form(&format!("/v1/subscription_schedules/{}", created.id), &form)
+            .await?;
+        Ok(current_period_end)
+    }
+
+    async fn release_schedule(&self, schedule_id: &str) -> anyhow::Result<()> {
+        let _: serde_json::Value = self
+            .post_form::<[(&str, &str)], _>(
+                &format!("/v1/subscription_schedules/{schedule_id}/release"),
+                &[],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn set_default_payment_method_from_setup(
+        &self,
+        customer_id: &str,
+        subscription_id: Option<&str>,
+        setup_intent_id: &str,
+    ) -> anyhow::Result<()> {
+        // 1. Resolve the payment method the setup session collected.
+        let setup: StripeSetupIntent = self
+            .get_json(&format!("/v1/setup_intents/{setup_intent_id}"), &[])
+            .await?;
+        let payment_method = setup
+            .payment_method
+            .map(Expandable::into_id)
+            .ok_or_else(|| anyhow::anyhow!("setup intent has no payment method"))?;
+        // 2. Make it the customer's default for future invoices.
+        let _: serde_json::Value = self
+            .post_form(
+                &format!("/v1/customers/{customer_id}"),
+                &[(
+                    "invoice_settings[default_payment_method]",
+                    payment_method.as_str(),
+                )],
+            )
+            .await?;
+        // 3. And the subscription's own default (Stripe prefers it over the customer's).
+        if let Some(sub_id) = subscription_id {
+            let _: serde_json::Value = self
+                .post_form(
+                    &format!("/v1/subscriptions/{sub_id}"),
+                    &[("default_payment_method", payment_method.as_str())],
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     fn construct_event(&self, payload: &[u8], sig_header: &str) -> anyhow::Result<StripeEvent> {
@@ -302,6 +686,48 @@ impl StripeClient {
             .send()
             .await?;
         Self::decode_response(path, resp).await
+    }
+
+    /// POST like [`post_form`](Self::post_form), but when `coupon_applied` is set and
+    /// Stripe rejects the request **specifically because of the coupon** (a `400` whose
+    /// machine-readable error is coupon/discount-related — see
+    /// [`StripeApiError::is_coupon_related`]), surface a [`CouponRejected`] marker instead
+    /// of a generic error. The service downcasts this to a `PromoUnavailable` and re-tries
+    /// at full price. A `400` from any *other* cause (e.g. an archived price) falls through
+    /// to the normal error path, so it is not misreported as a lapsed promotion.
+    async fn post_form_coupon_aware<
+        T: serde::Serialize + ?Sized,
+        R: serde::de::DeserializeOwned,
+    >(
+        &self,
+        path: &str,
+        form: &T,
+        coupon_applied: bool,
+    ) -> anyhow::Result<R> {
+        let resp = self
+            .http
+            .post(format!("{}{path}", self.api_base))
+            .bearer_auth(&self.secret_key)
+            .form(form)
+            .send()
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        if status.is_success() {
+            return serde_json::from_str(&body)
+                .map_err(|e| anyhow::anyhow!("malformed Stripe response from {path}: {e}"));
+        }
+        let envelope = serde_json::from_str::<StripeErrorEnvelope>(&body).ok();
+        if coupon_applied
+            && status == reqwest::StatusCode::BAD_REQUEST
+            && envelope
+                .as_ref()
+                .is_some_and(|e| e.error.is_coupon_related())
+        {
+            return Err(anyhow::Error::new(CouponRejected));
+        }
+        let detail = envelope.map_or_else(String::new, |e| e.error.describe());
+        anyhow::bail!("Stripe {path} returned {status}{detail}");
     }
 
     /// GET `path` with the Bearer secret key and the given query params, decoding the JSON
@@ -441,9 +867,40 @@ fn normalize_event(event: WebhookEvent) -> anyhow::Result<StripeEvent> {
                 None => StripeEventKind::Ignored,
             }
         }
+        "checkout.session.completed" => {
+            let session: CheckoutSessionObject =
+                parse_object(event.data.object, &event.event_type)?;
+            // Only a setup-mode session is a card update; a subscription-mode completion is
+            // handled via customer.subscription.created. Ignore anything without the refs.
+            match (
+                session.mode.as_deref(),
+                session.customer.map(Expandable::into_id),
+                session.setup_intent.map(Expandable::into_id),
+            ) {
+                (Some("setup"), Some(customer), Some(setup_intent)) => {
+                    StripeEventKind::CardSetupCompleted {
+                        stripe_customer_id: customer,
+                        setup_intent_id: setup_intent,
+                    }
+                }
+                _ => StripeEventKind::Ignored,
+            }
+        }
+        // A catalog object changed in Stripe → resync the projection. We re-list the whole
+        // (small) catalog, so the object body is irrelevant and is not parsed.
+        t if is_catalog_event(t) => StripeEventKind::CatalogChanged,
         _ => StripeEventKind::Ignored,
     };
     Ok(StripeEvent { id: event.id, kind })
+}
+
+/// Whether a Stripe event type signals a catalog change (a price / product / coupon /
+/// promotion-code create/update/delete) — any of which should resync the projection.
+fn is_catalog_event(event_type: &str) -> bool {
+    event_type.starts_with("price.")
+        || event_type.starts_with("product.")
+        || event_type.starts_with("coupon.")
+        || event_type.starts_with("promotion_code.")
 }
 
 /// Deserialize a webhook `data.object`, turning a parse failure into a descriptive
@@ -479,12 +936,63 @@ fn map_subscription(sub: &StripeSubscription) -> SubscriptionData {
 /// Read `{max_networks, max_daemons}` from a price's metadata; `None` if either is
 /// missing or unparseable (so the caller declines to grant rather than guess).
 fn entitlement_from_price(price: &StripePrice) -> Option<Entitlement> {
-    let max_networks = price.metadata.get("max_networks")?.parse().ok()?;
-    let max_daemons = price.metadata.get("max_daemons")?.parse().ok()?;
+    entitlement_from_meta(&price.metadata)
+}
+
+/// Read `{max_networks, max_daemons}` from a metadata map (shared by the webhook price
+/// path and the catalog list path).
+fn entitlement_from_meta(metadata: &HashMap<String, String>) -> Option<Entitlement> {
+    let max_networks = metadata.get("max_networks")?.parse().ok()?;
+    let max_daemons = metadata.get("max_daemons")?.parse().ok()?;
     Some(Entitlement {
         max_networks,
         max_daemons,
     })
+}
+
+/// Map a Stripe catalog price (with expanded product) to our [`PlanData`]. Returns `None`
+/// for a price that can't be a plan — no amount, no recurring interval, or no product.
+/// `level` / `entitlement` are passed through as `Option` (the sync worker drops a price
+/// missing either, safe-closed).
+fn map_plan(price: StripePriceFull) -> Option<PlanData> {
+    let product = price.product?;
+    let amount_cents = price.unit_amount?;
+    let interval = price.recurring?.interval;
+    Some(PlanData {
+        level: price.metadata.get("level").and_then(|v| v.parse().ok()),
+        entitlement: entitlement_from_meta(&price.metadata),
+        price_id: price.id,
+        product_id: product.id,
+        name: product.name.unwrap_or_default(),
+        amount_cents,
+        currency: price.currency,
+        interval,
+        active: price.active,
+    })
+}
+
+/// Map a Stripe coupon to our [`PromotionData`]. The active window start comes from the
+/// `wardnet_promo_start` metadata (RFC3339); the end from the native `redeem_by`; the
+/// `wardnet_auto_apply` metadata flag gates participation in the auto-applied catalog.
+fn map_coupon(c: StripeCoupon) -> PromotionData {
+    PromotionData {
+        coupon_id: c.id,
+        name: c.name.unwrap_or_default(),
+        percent_off: c.percent_off,
+        amount_off: c.amount_off,
+        currency: c.currency,
+        applies_to_products: c.applies_to.map(|a| a.products).unwrap_or_default(),
+        start: c
+            .metadata
+            .get("wardnet_promo_start")
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc)),
+        redeem_by: c.redeem_by.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
+        auto_apply: c
+            .metadata
+            .get("wardnet_auto_apply")
+            .is_some_and(|v| v == "true"),
+    }
 }
 
 /// Map Stripe's subscription status string to ours. Stripe `trialing` (a paid sub in
@@ -551,6 +1059,25 @@ struct WebhookEvent {
     data: WebhookData,
 }
 
+/// The `checkout.session.completed` event object — we read only the fields needed to
+/// recognize a setup-mode card update.
+#[derive(Deserialize)]
+struct CheckoutSessionObject {
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    customer: Option<Expandable>,
+    #[serde(default)]
+    setup_intent: Option<Expandable>,
+}
+
+/// A Stripe `SetupIntent` — we read only its resulting payment method.
+#[derive(Deserialize)]
+struct StripeSetupIntent {
+    #[serde(default)]
+    payment_method: Option<Expandable>,
+}
+
 #[derive(Deserialize)]
 struct WebhookData {
     object: serde_json::Value,
@@ -568,6 +1095,10 @@ struct StripeSubscription {
     metadata: HashMap<String, String>,
     #[serde(default)]
     items: StripeSubscriptionItems,
+    /// The attached subscription schedule (expanded via `expand[]=schedule`), if any. We
+    /// read only its id; `None` when the subscription has no pending scheduled change.
+    #[serde(default)]
+    schedule: Option<Expandable>,
 }
 
 #[derive(Deserialize, Default)]
@@ -578,11 +1109,97 @@ struct StripeSubscriptionItems {
 
 #[derive(Deserialize)]
 struct StripeSubscriptionItem {
+    /// The item id — needed to target a price swap on a subscription update.
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     price: Option<StripePrice>,
     /// Where `current_period_end` lives on Stripe API 2025-03-31+.
     #[serde(default)]
     current_period_end: Option<i64>,
+}
+
+/// A Stripe catalog `Price` (the `/v1/prices` list shape) with its product expanded —
+/// distinct from the webhook-embedded [`StripePrice`], which carries only id + metadata.
+#[derive(Deserialize)]
+struct StripePriceFull {
+    id: String,
+    #[serde(default)]
+    unit_amount: Option<i64>,
+    #[serde(default)]
+    currency: String,
+    #[serde(default)]
+    recurring: Option<StripeRecurring>,
+    #[serde(default)]
+    active: bool,
+    /// Expanded via `expand[]=data.product`.
+    #[serde(default)]
+    product: Option<StripeProduct>,
+    #[serde(default)]
+    metadata: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct StripeRecurring {
+    #[serde(default)]
+    interval: String,
+}
+
+#[derive(Deserialize)]
+struct StripeProduct {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// A Stripe `Coupon` (the `/v1/coupons` list shape).
+#[derive(Deserialize)]
+struct StripeCoupon {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    percent_off: Option<f64>,
+    #[serde(default)]
+    amount_off: Option<i64>,
+    #[serde(default)]
+    currency: Option<String>,
+    #[serde(default)]
+    redeem_by: Option<i64>,
+    #[serde(default)]
+    applies_to: Option<StripeAppliesTo>,
+    #[serde(default)]
+    metadata: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct StripeAppliesTo {
+    #[serde(default)]
+    products: Vec<String>,
+}
+
+/// A Stripe `SubscriptionSchedule` — we read its id and phases (each phase's start +
+/// price) to drive downgrades and surface a pending change.
+#[derive(Deserialize)]
+struct StripeSubscriptionSchedule {
+    id: String,
+    #[serde(default)]
+    phases: Vec<StripeSchedulePhase>,
+}
+
+#[derive(Deserialize)]
+struct StripeSchedulePhase {
+    #[serde(default)]
+    start_date: Option<i64>,
+    #[serde(default)]
+    items: Vec<StripeSchedulePhaseItem>,
+}
+
+#[derive(Deserialize)]
+struct StripeSchedulePhaseItem {
+    /// The phase item's price id (unexpanded — a bare id string).
+    #[serde(default)]
+    price: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -642,6 +1259,10 @@ struct StripeApiError {
     error_type: Option<String>,
     #[serde(default)]
     code: Option<String>,
+    /// The offending request parameter (e.g. `discounts[0][coupon]`), when Stripe reports
+    /// one. Used to attribute a `400` to the coupon vs some other field.
+    #[serde(default)]
+    param: Option<String>,
 }
 
 impl StripeApiError {
@@ -655,6 +1276,22 @@ impl StripeApiError {
                 c.as_deref().unwrap_or("?")
             ),
         }
+    }
+
+    /// Whether this error is specifically about the applied coupon/discount — either a
+    /// coupon-specific `code` (e.g. `coupon_expired`) or a `param` pointing at the
+    /// `discounts`/`coupon` field. Used to distinguish a lapsed promo (retryable at full
+    /// price) from an unrelated `400` (e.g. an archived price).
+    fn is_coupon_related(&self) -> bool {
+        let code_hit = self
+            .code
+            .as_deref()
+            .is_some_and(|c| c.contains("coupon") || c.contains("promotion"));
+        let param_hit = self
+            .param
+            .as_deref()
+            .is_some_and(|p| p.contains("coupon") || p.contains("discount"));
+        code_hit || param_hit
     }
 }
 

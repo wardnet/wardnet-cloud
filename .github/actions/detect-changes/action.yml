@@ -25,6 +25,9 @@ outputs:
   tunneller:
     description: "'true' when the tunneller service crate changed."
     value: ${{ steps.filter.outputs.tunneller }}
+  account-dashboard-app:
+    description: "'true' when the My Account SPA changed."
+    value: ${{ steps.filter.outputs.account-dashboard-app }}
 
 runs:
   using: composite
@@ -61,3 +64,7 @@ runs:
           tunneller:
             - 'source/crates/tunneller/**'
             - 'source/crates/app-tunneller/**'
+          # The My Account SPA is a self-contained yarn project; its own changes
+          # only need the frontend leaf (Rust services are unaffected).
+          account-dashboard-app:
+            - 'source/account-dashboard-app/**'

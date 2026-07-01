@@ -1,0 +1,842 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="_ds/wardnet-design-system-f1bae332-fde1-48e9-9d9d-f7f2a072b351/styles.css">
+<script src="_ds/wardnet-design-system-f1bae332-fde1-48e9-9d9d-f7f2a072b351/_ds_bundle.js"></script>
+<style>
+  @keyframes wn-shimmer { 0% { background-position: -400px 0; } 100% { background-position: 400px 0; } }
+  @keyframes wn-fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+</style>
+</helmet>
+<div id="wn-app">{{ app }}</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1100,&quot;height&quot;:820}}">
+class Component extends DCLogic {
+  state = {
+    booting: true,
+    signedIn: false,
+    authScreen: 'signin',        // signin | register | confirm | setpw
+    pendingEmail: 'pedro@example.com',
+    accountTab: 'overview',      // overview | subscription | security
+    theme: 'light',              // light | dark
+    subState: 'trial',           // trial | active | grace | cancelled
+    dataState: 'ready',          // ready | loading | error | empty
+    code: ['', '', '', '', '', ''],
+    codeError: '',
+    emailError: '',
+    pw: '', pw2: '', pwErrors: {},
+    flow: 'signup',          // signup | reset
+    signinNote: '',
+    resendIn: 42,
+    payModalOpen: false,
+    pwSaved: false,
+  };
+
+  componentDidMount() {
+    // wait for the DS bundle, then reveal
+    this._poll = setInterval(() => {
+      if (window.WardnetUi && window.WardnetUi.Button) {
+        clearInterval(this._poll);
+        this.applyTheme();
+        // brief boot so the shell paints once tokens are live
+        setTimeout(() => this.setState({ booting: false }), 60);
+      }
+    }, 60);
+    // global 1s tick for the resend cooldown
+    this._tick = setInterval(() => {
+      this.setState(s => (s.resendIn > 0 ? { resendIn: s.resendIn - 1 } : null));
+    }, 1000);
+    this._codeRefs = [];
+  }
+  componentDidUpdate() { this.applyTheme(); }
+  componentWillUnmount() { clearInterval(this._poll); clearInterval(this._tick); }
+  applyTheme() {
+    // set on <html> so Radix portals (modals, menus, selects) inherit the tokens too
+    try { document.documentElement.setAttribute('data-theme', this.state.theme); } catch (e) {}
+  }
+
+  // ---- sample data -------------------------------------------------------
+  get data() {
+    return {
+      user: { name: 'Pedro', email: 'pedro@example.com', initial: 'P' },
+      plan: { name: 'Pro', price: '$8', interval: 'mo' },
+      ent: { netUsed: 2, netMax: 3, devUsed: 24, devMax: 25 },
+      card: { brand: 'Visa', last4: '4242', exp: '08 / 27' },
+      dates: { trialEnd: 'Jun 25', trialDays: 5, renews: 'Jul 1', expired: 'Jun 20', graceDays: 4, cancelled: 'Jun 24' },
+      networks: [
+        { name: 'home-lab', region: 'EU West · Amsterdam', status: 'ok', label: 'Online', devices: 14 },
+        { name: 'parents-house', region: 'EU West · Amsterdam', status: 'warn', label: 'Degraded', devices: 10 },
+      ],
+      invoices: [
+        { date: 'Jun 1, 2026', amount: '$8.00', status: 'ok', label: 'Paid' },
+        { date: 'May 1, 2026', amount: '$8.00', status: 'ok', label: 'Paid' },
+        { date: 'Apr 1, 2026', amount: '$8.00', status: 'ok', label: 'Paid' },
+        { date: 'Mar 1, 2026', amount: '$0.00', status: 'info', label: 'Trial' },
+      ],
+    };
+  }
+
+  // ---- icons -------------------------------------------------------------
+  ic(children, o = {}) {
+    return React.createElement('svg', Object.assign({
+      width: 16, height: 16, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
+      strokeWidth: 1.8, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true,
+    }, o), children);
+  }
+  get icons() {
+    const h = React.createElement, ic = (c, o) => this.ic(c, o);
+    return {
+      google: h('svg', { width: 16, height: 16, viewBox: '0 0 18 18', 'aria-hidden': true }, [
+        h('path', { key: 1, fill: '#4285F4', d: 'M17.64 9.205c0-.638-.057-1.252-.164-1.841H9v3.481h4.844a4.14 4.14 0 0 1-1.796 2.716v2.258h2.908c1.702-1.567 2.684-3.874 2.684-6.614z' }),
+        h('path', { key: 2, fill: '#34A853', d: 'M9 18c2.43 0 4.467-.806 5.956-2.18l-2.908-2.259c-.806.54-1.837.859-3.048.859-2.344 0-4.328-1.583-5.036-3.71H.957v2.332A8.997 8.997 0 0 0 9 18z' }),
+        h('path', { key: 3, fill: '#FBBC05', d: 'M3.964 10.71A5.41 5.41 0 0 1 3.682 9c0-.593.102-1.17.282-1.71V4.958H.957A8.996 8.996 0 0 0 0 9c0 1.452.348 2.827.957 4.042l3.007-2.332z' }),
+        h('path', { key: 4, fill: '#EA4335', d: 'M9 3.58c1.321 0 2.508.454 3.44 1.346l2.582-2.581C13.463.891 11.426 0 9 0A8.997 8.997 0 0 0 .957 4.958L3.964 7.29C4.672 5.163 6.656 3.58 9 3.58z' }),
+      ]),
+      github: h('svg', { width: 16, height: 16, viewBox: '0 0 16 16', 'aria-hidden': true }, h('path', {
+        fill: 'currentColor', d: 'M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.6 7.6 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z' })),
+      sun: ic([h('circle', { key: 1, cx: 12, cy: 12, r: 4 }), h('path', { key: 2, d: 'M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41' })]),
+      moon: ic(h('path', { d: 'M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z' })),
+      chevron: ic(h('path', { d: 'm6 9 6 6 6-6' })),
+      check: ic(h('path', { d: 'M20 6 9 17l-5-5' })),
+      download: ic([h('path', { key: 1, d: 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4' }), h('path', { key: 2, d: 'M7 10l5 5 5-5' }), h('path', { key: 3, d: 'M12 15V3' })]),
+      shield: ic([h('path', { key: 1, d: 'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z' }), h('path', { key: 2, d: 'm9 12 2 2 4-4' })]),
+      arrowRight: ic(h('path', { d: 'M5 12h14M13 6l6 6-6 6' })),
+      logout: ic([h('path', { key: 1, d: 'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4' }), h('path', { key: 2, d: 'M16 17l5-5-5-5M21 12H9' })]),
+      key: ic([h('circle', { key: 1, cx: 7.5, cy: 15.5, r: 4.5 }), h('path', { key: 2, d: 'm10.7 12.3 9.3-9.3M16 6l3 3M14 8l2 2' })]),
+      flask: ic([h('path', { key: 1, d: 'M9 3h6M10 3v6.5L5 18a2 2 0 0 0 1.8 3h10.4A2 2 0 0 0 19 18l-5-8.5V3' })]),
+      card: ic([h('rect', { key: 1, x: 2.5, y: 5, width: 19, height: 14, rx: 2 }), h('path', { key: 2, d: 'M2.5 10h19' })]),
+      alert: ic([h('path', { key: 1, d: 'M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z' }), h('path', { key: 2, d: 'M12 9v4M12 17h.01' })]),
+      clock: ic([h('circle', { key: 1, cx: 12, cy: 12, r: 9 }), h('path', { key: 2, d: 'M12 7v5l3 2' })]),
+      plus: ic(h('path', { d: 'M12 5v14M5 12h14' })),
+      info: ic([h('circle', { key: 1, cx: 12, cy: 12, r: 9 }), h('path', { key: 2, d: 'M12 11v5M12 8h.01' })]),
+    };
+  }
+
+  // ---- small layout helpers ---------------------------------------------
+  divider(label) {
+    const h = React.createElement, ui = window.WardnetUi;
+    const line = () => h('div', { style: { flex: 1, height: 1, background: 'var(--line)' } });
+    return h('div', { style: { display: 'flex', alignItems: 'center', gap: 12, margin: '4px 0' } },
+      line(),
+      h(ui.Text, { variant: 'micro', color: 'ink-3', style: { letterSpacing: '.08em' } }, label),
+      line());
+  }
+  hairline() { return React.createElement('div', { style: { height: 1, background: 'var(--line)' } }); }
+
+  // usage meter (layout glue, token-styled; tone-aware)
+  meter(used, max, tone) {
+    const h = React.createElement;
+    const pct = Math.min(100, Math.round((used / max) * 100));
+    const col = tone === 'warn' ? 'var(--warn)' : tone === 'danger' ? 'var(--danger)' : 'var(--accent)';
+    return h('div', { style: { height: 6, borderRadius: 999, background: 'var(--bg-sunken)', overflow: 'hidden' } },
+      h('div', { style: { width: pct + '%', height: '100%', borderRadius: 999, background: col, transition: 'width .4s ease' } }));
+  }
+
+  providerButtons() {
+    const h = React.createElement, ui = window.WardnetUi, I = this.icons;
+    const btn = (icon, label) => h(ui.Button, { variant: 'ghost', style: { width: '100%', justifyContent: 'center', gap: 8 } }, icon, h('span', null, label));
+    return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+      btn(I.google, 'Continue with Google'),
+      btn(I.github, 'Continue with GitHub'));
+  }
+
+  authShell(children, foot) {
+    const h = React.createElement, ui = window.WardnetUi;
+    const dark = this.state.theme === 'dark';
+    return h('div', {
+      'data-theme': this.state.theme,
+      style: {
+        minHeight: '100vh', background: 'var(--bg)', display: 'flex', flexDirection: 'column',
+        alignItems: 'center', justifyContent: 'center', padding: '40px 20px', boxSizing: 'border-box',
+        fontFamily: 'var(--font-sans)', position: 'relative',
+      },
+    },
+      this.themeFab(),
+      h('div', { style: { width: '100%', maxWidth: 392 } },
+        h('div', { style: { display: 'flex', justifyContent: 'center', marginBottom: 22 } },
+          h(ui.Logo, { height: 26, variant: dark ? 'dark' : 'light' })),
+        h(ui.Card, { style: { padding: 26 } }, children),
+        foot ? h('div', { style: { textAlign: 'center', marginTop: 18 } }, foot) : null));
+  }
+
+  themeFab() {
+    const h = React.createElement, ui = window.WardnetUi, I = this.icons;
+    const dark = this.state.theme === 'dark';
+    return h('div', { style: { position: 'absolute', top: 18, right: 18 } },
+      h(ui.Button, { variant: 'ghost', size: 'icon-sm', 'aria-label': 'Toggle theme',
+        onClick: () => this.setState({ theme: dark ? 'light' : 'dark' }) }, dark ? I.sun : I.moon));
+  }
+
+  link(label, onClick) {
+    const h = React.createElement, ui = window.WardnetUi;
+    return h('a', { href: '#', onClick: (e) => { e.preventDefault(); onClick && onClick(); },
+      style: { color: 'var(--accent)', textDecoration: 'none', fontWeight: 500, fontSize: 13, fontFamily: 'var(--font-sans)' } }, label);
+  }
+
+  // ====================================================================
+  //  AUTH
+  // ====================================================================
+  renderAuth() {
+    const s = this.state;
+    if (s.authScreen === 'register') return this.renderRegister();
+    if (s.authScreen === 'forgot') return this.renderForgot();
+    if (s.authScreen === 'confirm') return this.renderConfirm();
+    if (s.authScreen === 'setpw') return this.renderSetPw();
+    return this.renderSignIn();
+  }
+
+  renderSignIn() {
+    const h = React.createElement, ui = window.WardnetUi, self = this;
+    const note = self.state.signinNote;
+    const body = h('div', { style: { display: 'flex', flexDirection: 'column', gap: 18 } },
+      h('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
+        h(ui.Heading, { level: 2 }, 'Sign in'),
+        h(ui.Text, { variant: 'caption' }, 'Access your Wardnet Cloud account.')),
+      note ? h(ui.Banner, { tone: 'info', role: 'status', icon: self.icons.check }, note) : null,
+      this.providerButtons(),
+      this.divider('or'),
+      h('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } },
+        h(ui.Field, { label: 'Email', htmlFor: 'si-email' },
+          h(ui.Input, { id: 'si-email', type: 'email', placeholder: 'you@example.com', defaultValue: 'pedro@example.com' })),
+        h(ui.Field, { label: 'Password', htmlFor: 'si-pw' },
+          h(ui.Input, { id: 'si-pw', type: 'password', placeholder: '••••••••' })),
+        h('div', { style: { display: 'flex', justifyContent: 'flex-end', marginTop: -4 } },
+          this.link('Forgot password?', () => self.setState({ authScreen: 'forgot', emailError: '', signinNote: '' }))),
+        h(ui.Button, { style: { width: '100%' }, onClick: () => self.setState({ signedIn: true, accountTab: 'overview', signinNote: '' }) }, 'Sign in')));
+    const foot = h(ui.Text, { variant: 'caption' }, "Don't have an account?  ",
+      this.link('Create an account', () => self.setState({ authScreen: 'register', signinNote: '' })));
+    return this.authShell(body, foot);
+  }
+
+  renderForgot() {
+    const h = React.createElement, ui = window.WardnetUi, self = this;
+    const body = h('div', { style: { display: 'flex', flexDirection: 'column', gap: 18 } },
+      h('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
+        h(ui.Heading, { level: 2 }, 'Reset your password'),
+        h(ui.Text, { variant: 'caption' }, 'Enter your account email and we’ll send a 6-digit code to reset your password.')),
+      h('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } },
+        h(ui.Field, { label: 'Email', htmlFor: 'fp-email', help: self.state.emailError ? null : 'Use the email you sign in with.', error: self.state.emailError || undefined },
+          h(ui.Input, { id: 'fp-email', type: 'email', placeholder: 'you@example.com',
+            value: self.state.pendingEmail,
+            onChange: (e) => self.setState({ pendingEmail: e.target.value, emailError: '' }),
+            onKeyDown: (e) => { if (e.key === 'Enter') self.requestCode('reset'); } })),
+        h(ui.Button, { style: { width: '100%' }, onClick: () => self.requestCode('reset') }, 'Send reset code')));
+    const foot = h(ui.Text, { variant: 'caption' }, 'Remember your password?  ',
+      this.link('Back to sign in', () => self.setState({ authScreen: 'signin', emailError: '' })));
+    return this.authShell(body, foot);
+  }
+
+  renderRegister() {
+    const h = React.createElement, ui = window.WardnetUi, self = this;
+    const body = h('div', { style: { display: 'flex', flexDirection: 'column', gap: 18 } },
+      h('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
+        h(ui.Heading, { level: 2 }, 'Create an account'),
+        h(ui.Text, { variant: 'caption' }, 'Unlock dynamic DNS and secure remote tunneling.')),
+      this.providerButtons(),
+      this.divider('or'),
+      h('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } },
+        h(ui.Field, { label: 'Email', htmlFor: 'rg-email', help: self.state.emailError ? null : "We'll send a 6-digit confirmation code.", error: self.state.emailError || undefined },
+          h(ui.Input, { id: 'rg-email', type: 'email', placeholder: 'you@example.com',
+            value: self.state.pendingEmail,
+            onChange: (e) => self.setState({ pendingEmail: e.target.value, emailError: '' }),
+            onKeyDown: (e) => { if (e.key === 'Enter') self.requestCode('signup'); } })),
+        h(ui.Button, { style: { width: '100%' }, onClick: () => self.requestCode('signup') }, 'Send confirmation code')));
+    const foot = h(ui.Text, { variant: 'caption' }, 'Already have an account?  ',
+      this.link('Sign in', () => self.setState({ authScreen: 'signin' })));
+    return this.authShell(body, foot);
+  }
+
+  requestCode(flow) {
+    const email = (this.state.pendingEmail || '').trim();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+      this.setState({ emailError: 'Enter a valid email address.' });
+      return;
+    }
+    this.setState({ authScreen: 'confirm', flow: flow, resendIn: 42, code: ['', '', '', '', '', ''], codeError: '', emailError: '' });
+  }
+  setCode(i, v) {
+    const digit = (v || '').replace(/\D/g, '').slice(-1);
+    const code = this.state.code.slice();
+    code[i] = digit;
+    this.setState({ code, codeError: '' });
+    if (digit && this._codeRefs[i + 1]) this._codeRefs[i + 1].focus();
+  }
+  codeKey(i, e) {
+    if (e.key === 'Backspace' && !this.state.code[i] && this._codeRefs[i - 1]) {
+      const code = this.state.code.slice(); code[i - 1] = ''; this.setState({ code });
+      this._codeRefs[i - 1].focus();
+    } else if (e.key === 'ArrowLeft' && this._codeRefs[i - 1]) {
+      this._codeRefs[i - 1].focus();
+    } else if (e.key === 'ArrowRight' && this._codeRefs[i + 1]) {
+      this._codeRefs[i + 1].focus();
+    } else if (e.key === 'Enter') {
+      this.verifyCode();
+    }
+  }
+  codePaste(e) {
+    const text = ((e.clipboardData || window.clipboardData).getData('text') || '').replace(/\D/g, '').slice(0, 6);
+    if (!text) return;
+    e.preventDefault();
+    const code = ['', '', '', '', '', ''];
+    for (let i = 0; i < text.length; i++) code[i] = text[i];
+    this.setState({ code, codeError: '' });
+    const last = Math.min(text.length, 6) - 1;
+    if (this._codeRefs[last]) this._codeRefs[last].focus();
+  }
+  finishSetup() {
+    const pw = this.state.pw, pw2 = this.state.pw2, errs = {};
+    if (!pw || pw.length < 10) errs.pw = 'Use at least 10 characters.';
+    if (pw2 !== pw) errs.pw2 = 'Passwords do not match.';
+    if (Object.keys(errs).length) { this.setState({ pwErrors: errs }); return; }
+    if (this.state.flow === 'reset') {
+      this.setState({ authScreen: 'signin', flow: 'signup', signinNote: 'Your password was updated. Sign in with your new password.', pw: '', pw2: '', pwErrors: {} });
+    } else {
+      this.setState({ signedIn: true, accountTab: 'overview', subState: 'trial', pwErrors: {}, pw: '', pw2: '' });
+    }
+  }
+  verifyCode() {
+    const entered = this.state.code.join('');
+    if (entered.length < 6) { this.setState({ codeError: 'Enter all 6 digits.' }); return; }
+    if (entered !== '424242') { this.setState({ codeError: 'That code is incorrect or expired. Try again.' }); return; }
+    this.setState({ authScreen: 'setpw', codeError: '' });
+  }
+
+  renderConfirm() {
+    const h = React.createElement, ui = window.WardnetUi, self = this;
+    const s = this.state, err = !!s.codeError;
+    const cd = s.resendIn;
+    const mmss = '0:' + String(cd).padStart(2, '0');
+    const boxes = h('div', { style: { display: 'flex', gap: 8, justifyContent: 'space-between' } },
+      s.code.map((c, i) => h('input', {
+        key: i, ref: (el) => { self._codeRefs[i] = el; }, value: c, inputMode: 'numeric', maxLength: 1,
+        'aria-label': 'Digit ' + (i + 1),
+        autoFocus: i === 0,
+        onChange: (e) => self.setCode(i, e.target.value),
+        onKeyDown: (e) => self.codeKey(i, e),
+        onPaste: (e) => self.codePaste(e),
+        onFocus: (e) => e.target.select(),
+        style: {
+          width: 46, height: 54, textAlign: 'center', fontSize: 22, fontWeight: 600,
+          fontFamily: 'var(--font-mono)', color: 'var(--ink)', background: 'var(--bg-card)',
+          border: '1px solid ' + (err ? 'var(--danger)' : 'var(--line-strong)'),
+          borderRadius: 'var(--radius-sm)', outline: 'none', boxShadow: err ? '0 0 0 3px var(--danger-soft)' : 'none',
+          boxSizing: 'border-box', transition: 'border-color .15s, box-shadow .15s',
+        },
+      })));
+    const body = h('div', { style: { display: 'flex', flexDirection: 'column', gap: 18 } },
+      h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+        h(ui.Heading, { level: 2 }, s.flow === 'reset' ? 'Enter the reset code' : 'Confirm your email'),
+        h(ui.Text, { variant: 'caption' }, 'We sent a 6-digit code to ',
+          h('span', { style: { color: 'var(--ink)', fontWeight: 600 } }, s.pendingEmail), '.')),
+      boxes,
+      err ? h(ui.Text, { variant: 'caption', color: 'danger' }, s.codeError) : null,
+      h(ui.Button, { style: { width: '100%' }, onClick: () => self.verifyCode() }, 'Verify'),
+      h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
+        cd > 0
+          ? h(ui.Text, { variant: 'caption', color: 'ink-3' }, 'Resend in ' + mmss)
+          : this.link('Resend code', () => self.setState({ resendIn: 42, codeError: '' })),
+        this.link('Change email', () => self.setState({ authScreen: s.flow === 'reset' ? 'forgot' : 'register' }))));
+    const foot = h(ui.Text, { variant: 'caption', color: 'ink-3' }, 'Demo code: ',
+      h('span', { style: { fontFamily: 'var(--font-mono)', color: 'var(--ink-2)' } }, '424242'));
+    return this.authShell(body, foot);
+  }
+
+  renderSetPw() {
+    const h = React.createElement, ui = window.WardnetUi, self = this;
+    const reset = self.state.flow === 'reset';
+    const head = h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+      h(ui.Pill, { variant: 'ok' }, this.icons.check, reset ? ' Identity verified' : ' Email verified'),
+      h(ui.Heading, { level: 2, style: { marginTop: 4 } }, reset ? 'Set a new password' : 'Finish setting up'),
+      h(ui.Text, { variant: 'caption' }, reset
+        ? 'Choose a new password for ' + self.state.pendingEmail + '.'
+        : 'Choose a display name and password to secure your account.'));
+    const fields = [
+      reset ? null : h(ui.Field, { key: 'name', label: 'Display name', htmlFor: 'sp-name' },
+        h(ui.Input, { id: 'sp-name', placeholder: 'Pedro', defaultValue: 'Pedro' })),
+      h(ui.Field, { key: 'pw', label: reset ? 'New password' : 'Password', htmlFor: 'sp-pw', help: self.state.pwErrors.pw ? null : 'At least 10 characters.', error: self.state.pwErrors.pw || undefined },
+        h(ui.Input, { id: 'sp-pw', type: 'password', placeholder: '••••••••', value: self.state.pw,
+          onChange: (e) => self.setState({ pw: e.target.value, pwErrors: Object.assign({}, self.state.pwErrors, { pw: '' }) }) })),
+      h(ui.Field, { key: 'pw2', label: 'Confirm password', htmlFor: 'sp-pw2', error: self.state.pwErrors.pw2 || undefined },
+        h(ui.Input, { id: 'sp-pw2', type: 'password', placeholder: '••••••••', value: self.state.pw2,
+          onChange: (e) => self.setState({ pw2: e.target.value, pwErrors: Object.assign({}, self.state.pwErrors, { pw2: '' }) }),
+          onKeyDown: (e) => { if (e.key === 'Enter') self.finishSetup(); } })),
+      h(ui.Button, { key: 'btn', style: { width: '100%' }, onClick: () => self.finishSetup() }, reset ? 'Update password & sign in' : 'Create account & continue'),
+    ];
+    const body = h('div', { style: { display: 'flex', flexDirection: 'column', gap: 18 } },
+      head,
+      h('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } }, fields));
+    const foot = reset ? h(ui.Text, { variant: 'caption' }, 'Changed your mind?  ',
+      this.link('Back to sign in', () => self.setState({ authScreen: 'signin', pw: '', pw2: '', pwErrors: {} }))) : null;
+    return this.authShell(body, foot);
+  }
+
+  // ====================================================================
+  //  ACCOUNT SHELL
+  // ====================================================================
+  statusMeta() {
+    const d = this.data.dates;
+    switch (this.state.subState) {
+      case 'active': return { pill: 'ok', label: 'Active' };
+      case 'grace': return { pill: 'warn', label: 'Grace period' };
+      case 'cancelled': return { pill: 'down', label: 'Cancelled' };
+      default: return { pill: 'info', label: 'Trial' };
+    }
+  }
+
+  topbar() {
+    const h = React.createElement, ui = window.WardnetUi, self = this, I = this.icons;
+    const s = this.state, dark = s.theme === 'dark', d = this.data;
+    const navItem = (id, label) => {
+      const active = s.accountTab === id;
+      return h('button', { key: id, onClick: () => self.setState({ accountTab: id }),
+        style: {
+          appearance: 'none', border: 'none', background: 'transparent', cursor: 'pointer',
+          fontFamily: 'var(--font-sans)', fontSize: 13, fontWeight: active ? 600 : 500,
+          color: active ? 'var(--ink)' : 'var(--ink-3)', padding: '18px 2px', position: 'relative',
+        } },
+        label,
+        h('span', { style: { position: 'absolute', left: 0, right: 0, bottom: -1, height: 2, borderRadius: 2, background: active ? 'var(--accent)' : 'transparent' } }));
+    };
+    const stateItem = (val, label) => h(ui.DropdownMenuItem, { key: val, onSelect: () => self.setState({ subState: val }) },
+      h('span', { style: { width: 16, display: 'inline-flex', color: 'var(--accent)' } }, s.subState === val ? I.check : null), label);
+    const dataItem = (val, label) => h(ui.DropdownMenuItem, { key: val, onSelect: () => self.setState({ dataState: val }) },
+      h('span', { style: { width: 16, display: 'inline-flex', color: 'var(--accent)' } }, s.dataState === val ? I.check : null), label);
+
+    const bar = h('div', { style: { borderBottom: '1px solid var(--line)', background: 'var(--bg-card)', position: 'sticky', top: 0, zIndex: 20 } },
+      h('div', { style: { maxWidth: 940, margin: '0 auto', padding: '0 20px', display: 'flex', alignItems: 'center', gap: 18 } },
+        h('div', { style: { display: 'flex', alignItems: 'center', height: 56 } }, h(ui.Logo, { height: 20, variant: dark ? 'dark' : 'light' })),
+        h('nav', { style: { display: 'flex', gap: 22, marginLeft: 8 } }, navItem('overview', 'Overview'), navItem('subscription', 'Subscription'), navItem('security', 'Security')),
+        h('div', { style: { flex: 1 } }),
+        // reviewer demo control
+        h(ui.DropdownMenu, null,
+          h(ui.DropdownMenuTrigger, { asChild: true },
+            h(ui.Button, { variant: 'ghost', size: 'sm', style: { gap: 6 } }, I.flask, h('span', null, 'Demo'), I.chevron)),
+          h(ui.DropdownMenuContent, { align: 'end', style: { minWidth: 210 } },
+            h('div', { style: { padding: '6px 8px 4px' } }, h(ui.Text, { variant: 'micro', color: 'ink-3' }, 'SUBSCRIPTION STATE')),
+            stateItem('trial', 'Trial'), stateItem('active', 'Active'), stateItem('grace', 'Grace (expired)'), stateItem('cancelled', 'Cancelled'),
+            h(ui.DropdownMenuSeparator, null),
+            h('div', { style: { padding: '6px 8px 4px' } }, h(ui.Text, { variant: 'micro', color: 'ink-3' }, 'DATA STATE')),
+            dataItem('ready', 'Ready'), dataItem('loading', 'Loading'), dataItem('error', 'Error'), dataItem('empty', 'Empty'))),
+        h(ui.Button, { variant: 'ghost', size: 'icon-sm', 'aria-label': 'Toggle theme', onClick: () => self.setState({ theme: dark ? 'light' : 'dark' }) }, dark ? I.sun : I.moon),
+        // account menu
+        h(ui.DropdownMenu, null,
+          h(ui.DropdownMenuTrigger, { asChild: true },
+            h('button', { style: { display: 'flex', alignItems: 'center', gap: 8, border: '1px solid var(--line)', background: 'var(--bg-card)', borderRadius: 999, padding: '4px 8px 4px 4px', cursor: 'pointer' } },
+              h('span', { style: { width: 26, height: 26, borderRadius: 999, background: 'var(--accent)', color: 'var(--accent-ink)', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 13, fontFamily: 'var(--font-sans)' } }, d.user.initial),
+              h('span', { style: { fontSize: 13, fontWeight: 600, color: 'var(--ink)', fontFamily: 'var(--font-sans)' } }, d.user.name),
+              h('span', { style: { color: 'var(--ink-3)', display: 'inline-flex' } }, I.chevron))),
+          h(ui.DropdownMenuContent, { align: 'end', style: { minWidth: 220 } },
+            h('div', { style: { padding: '6px 8px 8px' } },
+              h(ui.Text, { variant: 'micro', color: 'ink-3' }, 'SIGNED IN AS'),
+              h(ui.Text, { variant: 'body', style: { fontWeight: 600 } }, d.user.email)),
+            h(ui.DropdownMenuSeparator, null),
+            h(ui.DropdownMenuItem, { onSelect: () => self.setState({ accountTab: 'overview' }) }, 'Overview'),
+            h(ui.DropdownMenuItem, { onSelect: () => self.setState({ accountTab: 'subscription' }) }, 'Subscription'),
+            h(ui.DropdownMenuItem, { onSelect: () => self.setState({ accountTab: 'security' }) }, 'Security'),
+            h(ui.DropdownMenuSeparator, null),
+            h(ui.DropdownMenuItem, { variant: 'destructive', onSelect: () => self.setState({ signedIn: false, authScreen: 'signin' }) }, I.logout, ' Sign out')))));
+    return bar;
+  }
+
+  pageHeader(title, sub) {
+    const h = React.createElement, ui = window.WardnetUi;
+    return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 20 } },
+      h(ui.Heading, { level: 1 }, title),
+      sub ? h(ui.Text, { variant: 'body', color: 'ink-2' }, sub) : null);
+  }
+
+  // ---- skeleton / error / empty -----------------------------------------
+  skel(w, hgt, r) {
+    return React.createElement('div', { style: {
+      width: w || '100%', height: hgt || 14, borderRadius: r || 6,
+      background: 'linear-gradient(90deg, var(--bg-sunken) 25%, var(--line) 37%, var(--bg-sunken) 63%)',
+      backgroundSize: '400px 100%', animation: 'wn-shimmer 1.3s ease infinite',
+    } });
+  }
+  renderLoading() {
+    const h = React.createElement, ui = window.WardnetUi;
+    const card = (children) => h(ui.Card, { style: { padding: 20 } }, children);
+    return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
+      card(h('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } }, this.skel('40%', 12), this.skel('60%', 24), this.skel('30%', 36, 8))),
+      h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 } },
+        card(h('div', { style: { display: 'flex', flexDirection: 'column', gap: 12 } }, this.skel('50%', 12), this.skel('40%', 28), this.skel('100%', 6, 999))),
+        card(h('div', { style: { display: 'flex', flexDirection: 'column', gap: 12 } }, this.skel('50%', 12), this.skel('40%', 28), this.skel('100%', 6, 999)))));
+  }
+  renderError() {
+    const h = React.createElement, ui = window.WardnetUi, self = this, I = this.icons;
+    return h(ui.Card, { style: { padding: 40, textAlign: 'center' } },
+      h('div', { style: { display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 14, maxWidth: 360, margin: '0 auto' } },
+        h('div', { style: { width: 44, height: 44, borderRadius: 999, background: 'var(--danger-soft)', color: 'var(--danger)', display: 'flex', alignItems: 'center', justifyContent: 'center' } }, I.alert),
+        h(ui.Heading, { level: 3 }, "Couldn't load your account"),
+        h(ui.Text, { variant: 'body', color: 'ink-2' }, 'We hit a problem reaching Wardnet Cloud. Check your connection and try again.'),
+        h('div', { style: { marginTop: 6 } }, h(ui.Button, { onClick: () => self.setState({ dataState: 'ready' }) }, 'Retry'))));
+  }
+
+  // ====================================================================
+  //  OVERVIEW
+  // ====================================================================
+  statusCard() {
+    const h = React.createElement, ui = window.WardnetUi, self = this, I = this.icons;
+    const s = this.state, d = this.data, meta = this.statusMeta();
+    let line, sub, cta, accent = false, tone = null;
+    if (s.subState === 'trial') {
+      line = 'Your Pro trial ends in ' + d.dates.trialDays + ' days'; sub = 'On ' + d.dates.trialEnd + ', add a payment method to keep dynamic DNS and remote tunneling.';
+      cta = h(ui.Button, { onClick: () => self.setState({ accountTab: 'subscription' }) }, 'Add payment method'); accent = true;
+    } else if (s.subState === 'active') {
+      line = 'Pro · renews on ' + d.dates.renews; sub = d.card.brand + ' •••• ' + d.card.last4 + ' will be charged ' + d.plan.price + '/' + d.plan.interval + '.';
+      cta = h(ui.Button, { variant: 'ghost', onClick: () => self.setState({ accountTab: 'subscription' }) }, 'Manage subscription', I.arrowRight);
+    } else if (s.subState === 'grace') {
+      line = 'Your subscription expired on ' + d.dates.expired; sub = 'You have ' + d.dates.graceDays + ' days to renew before it’s cancelled and premium features stop.';
+      cta = h(ui.Button, { onClick: () => self.setState({ accountTab: 'subscription' }) }, 'Renew now'); accent = true; tone = 'warn';
+    } else {
+      line = 'Cancelled on ' + d.dates.cancelled; sub = 'Reactivate to restore your networks and devices and turn premium features back on.';
+      cta = h(ui.Button, { onClick: () => self.setState({ accountTab: 'subscription' }) }, 'Reactivate'); accent = true;
+    }
+    const stripe = tone === 'warn' ? 'var(--warn)' : (s.subState === 'cancelled' ? 'var(--ink-4)' : 'var(--accent)');
+    return h(ui.Card, { style: { padding: 0, overflow: 'hidden' } },
+      h('div', { style: { display: 'flex' } },
+        h('div', { style: { width: 4, background: stripe, flex: 'none' } }),
+        h('div', { style: { padding: 22, display: 'flex', flexDirection: 'column', gap: 14, flex: 1 } },
+          h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 } },
+            h(ui.Text, { variant: 'label' }, 'WARDNET CLOUD'),
+            h(ui.Pill, { variant: meta.pill }, meta.label)),
+          h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+            h(ui.Heading, { level: 2 }, line),
+            h(ui.Text, { variant: 'body', color: 'ink-2', style: { maxWidth: 560 } }, sub)),
+          h('div', { style: { marginTop: 4 } }, cta))));
+  }
+
+  usageTiles() {
+    const h = React.createElement, ui = window.WardnetUi;
+    const d = this.data, e = d.ent;
+    const netPct = Math.round((e.netUsed / e.netMax) * 100);
+    const devPct = Math.round((e.devUsed / e.devMax) * 100);
+    const devWarn = e.devMax - e.devUsed <= 1;
+    return h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 } },
+      h(ui.StatTile, {
+        label: 'NETWORKS', value: e.netUsed, unit: '/ ' + e.netMax, bar: netPct,
+        sub: (e.netMax - e.netUsed) + ' network slot remaining',
+      }),
+      h(ui.StatTile, {
+        label: 'DEVICES', value: e.devUsed, unit: '/ ' + e.devMax, bar: devPct,
+        pill: devWarn ? h(ui.Pill, { variant: 'warn' }, 'Near limit') : null,
+        sub: devWarn ? 'Only ' + (e.devMax - e.devUsed) + ' device slot left' : (e.devMax - e.devUsed) + ' devices remaining',
+      }));
+  }
+
+  networksCard() {
+    const h = React.createElement, ui = window.WardnetUi, self = this, I = this.icons;
+    const empty = this.state.dataState === 'empty';
+    const nets = empty ? [] : this.data.networks;
+    const blocked = this.state.subState === 'grace' || this.state.subState === 'cancelled';
+    const rows = nets.map((n, i) => h('div', { key: n.name, style: { display: 'flex', alignItems: 'center', gap: 14, padding: '13px 0', borderTop: i ? '1px solid var(--line)' : 'none' } },
+      h('div', { style: { flex: 1, display: 'flex', flexDirection: 'column', gap: 2 } },
+        h(ui.Text, { variant: 'body', style: { fontFamily: 'var(--font-mono)', fontWeight: 600 } }, n.name),
+        h(ui.Text, { variant: 'caption' }, n.region)),
+      h(ui.Text, { variant: 'caption', color: 'ink-3' }, n.devices + ' devices'),
+      h(ui.Pill, { variant: n.status }, n.label)));
+
+    const emptyState = h('div', { style: { padding: '34px 8px', textAlign: 'center', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10 } },
+      h('div', { style: { width: 40, height: 40, borderRadius: 10, background: 'var(--bg-sunken)', color: 'var(--ink-3)', display: 'flex', alignItems: 'center', justifyContent: 'center' } }, I.shield),
+      h(ui.Text, { variant: 'body-strong' }, 'No networks yet'),
+      h(ui.Text, { variant: 'caption', style: { maxWidth: 300 } }, 'Networks are created automatically when you install and pair a Wardnet gateway on your Raspberry Pi.'));
+
+    return h(ui.Card, null,
+      h(ui.CardHeader, null,
+        h(ui.CardTitle, null, 'Your networks'),
+        h(ui.CardAction, null, blocked
+          ? h(ui.Pill, { variant: 'down' }, 'Premium paused')
+          : null),
+        h(ui.CardSubtitle, null, empty ? 'Networks are added automatically when you install a gateway.' : nets.length + ' of ' + this.data.ent.netMax + ' network slots in use.')),
+      h(ui.CardContent, null, empty ? emptyState : h('div', null, rows)));
+  }
+
+  renderOverview() {
+    const h = React.createElement;
+    const ds = this.state.dataState;
+    if (ds === 'loading') return this.renderLoading();
+    if (ds === 'error') return this.renderError();
+    return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
+      this.pageHeader('Overview', 'A snapshot of your Wardnet Cloud account.'),
+      this.statusCard(),
+      this.usageTiles(),
+      this.networksCard());
+  }
+
+  // ====================================================================
+  //  SUBSCRIPTION
+  // ====================================================================
+  planCard() {
+    const h = React.createElement, ui = window.WardnetUi;
+    const d = this.data, meta = this.statusMeta();
+    return h(ui.Card, null,
+      h(ui.CardHeader, null,
+        h(ui.CardTitle, null, 'Wardnet ' + d.plan.name),
+        h(ui.CardAction, null, h(ui.Pill, { variant: meta.pill }, meta.label)),
+        h(ui.CardSubtitle, null, 'Premium gateway features for self-hosted Wardnet.')),
+      h(ui.CardContent, null,
+        h('div', { style: { display: 'flex', alignItems: 'baseline', gap: 6 } },
+          h(ui.Text, { variant: 'metric' }, d.plan.price),
+          h(ui.Text, { variant: 'metric-unit' }, '/ ' + d.plan.interval),
+          h(ui.Text, { variant: 'caption', style: { marginLeft: 8 } }, 'billed monthly · cancel anytime'))));
+  }
+
+  entitlementRow(label, used, max, tone) {
+    const h = React.createElement, ui = window.WardnetUi;
+    return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, padding: '14px 0' } },
+      h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
+        h(ui.Text, { variant: 'body-strong' }, label),
+        h('div', { style: { display: 'flex', alignItems: 'baseline', gap: 6, whiteSpace: 'nowrap', flex: 'none' } },
+          h(ui.Text, { variant: 'body', style: { fontFamily: 'var(--font-mono)', fontWeight: 600, color: tone === 'warn' ? 'var(--warn)' : 'var(--ink)' } }, used),
+          h(ui.Text, { variant: 'caption' }, 'of ' + max))),
+      this.meter(used, max, tone));
+  }
+
+  entitlementsCard() {
+    const h = React.createElement, ui = window.WardnetUi;
+    const e = this.data.ent;
+    return h(ui.Card, null,
+      h(ui.CardHeader, null,
+        h(ui.CardTitle, null, 'Entitlements'),
+        h(ui.CardSubtitle, null, 'What your ' + this.data.plan.name + ' plan grants, and how much you’re using.')),
+      h(ui.CardContent, null,
+        this.entitlementRow('Networks', e.netUsed, e.netMax, null),
+        this.hairline(),
+        this.entitlementRow('Devices', e.devUsed, e.devMax, e.devMax - e.devUsed <= 1 ? 'warn' : null)));
+  }
+
+  lifecycleCard() {
+    const h = React.createElement, ui = window.WardnetUi, self = this, I = this.icons;
+    const s = this.state, d = this.data;
+
+    if (s.subState === 'trial') {
+      return h(ui.Card, null,
+        h(ui.CardHeader, null, h(ui.CardTitle, null, 'Trial'), h(ui.CardAction, null, h(ui.Pill, { variant: 'info' }, 'Trial'))),
+        h(ui.CardContent, { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
+          h('div', { style: { display: 'flex', gap: 12, alignItems: 'flex-start' } },
+            h('span', { style: { color: 'var(--accent)', marginTop: 2 } }, I.clock),
+            h('div', null,
+              h(ui.Text, { variant: 'body-strong' }, 'Your trial ends in ' + d.dates.trialDays + ' days (' + d.dates.trialEnd + ').'),
+              h(ui.Text, { variant: 'caption', style: { marginTop: 2 } }, 'Add a payment method to upgrade and keep Wardnet Cloud running without interruption.'))),
+          h('div', { style: { background: 'var(--bg-sunken)', border: '1px solid var(--line)', borderRadius: 'var(--radius)', padding: 14 } },
+            h(ui.Text, { variant: 'micro', color: 'ink-3' }, 'WHEN YOUR TRIAL ENDS'),
+            h(ui.Text, { variant: 'caption', style: { marginTop: 6 } }, 'Without a payment method, premium features (dynamic DNS, remote tunneling) pause and your account enters a 4-day grace period before cancelling. Your gateway keeps running locally.')),
+          h('div', { style: { display: 'flex', gap: 10, flexWrap: 'wrap' } },
+            h(ui.Button, { onClick: () => self.setState({ payModalOpen: true }) }, 'Add payment method'),
+            h(ui.Button, { variant: 'ghost' }, 'Upgrade to keep Wardnet Cloud'))));
+    }
+
+    if (s.subState === 'active') {
+      return h(ui.Card, null,
+        h(ui.CardHeader, null, h(ui.CardTitle, null, 'Billing'), h(ui.CardAction, null, h(ui.Pill, { variant: 'ok' }, 'Active'))),
+        h(ui.CardContent, { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
+          h('div', { style: { display: 'flex', gap: 12, alignItems: 'flex-start' } },
+            h('span', { style: { color: 'var(--accent)', marginTop: 2 } }, I.check),
+            h('div', null,
+              h(ui.Text, { variant: 'body-strong' }, 'Renews on ' + d.dates.renews + ' · ' + d.card.brand + ' •••• ' + d.card.last4),
+              h(ui.Text, { variant: 'caption', style: { marginTop: 2 } }, d.plan.price + '/' + d.plan.interval + ' will be charged automatically. You can change or cancel anytime.'))),
+          h('div', { style: { display: 'flex', gap: 10, flexWrap: 'wrap' } },
+            h(ui.Button, { variant: 'ghost' }, 'Change plan'),
+            h(ui.Button, { variant: 'ghost', onClick: () => self.setState({ payModalOpen: true }) }, 'Update payment method'),
+            this.cancelAlert())));
+    }
+
+    if (s.subState === 'grace') {
+      return h(ui.Card, null,
+        h(ui.CardContent, { style: { display: 'flex', flexDirection: 'column', gap: 16, paddingTop: 20 } },
+          h('div', { style: { display: 'flex', gap: 12, alignItems: 'flex-start' } },
+            h('span', { style: { color: 'var(--warn)', marginTop: 2 } }, I.alert),
+            h('div', null,
+              h(ui.Text, { variant: 'body-strong' }, 'Renew to restore premium features'),
+              h(ui.Text, { variant: 'caption', style: { marginTop: 2 } }, 'Your subscription expired on ' + d.dates.expired + '. You have ' + d.dates.graceDays + ' days left in the grace period. After that, dynamic DNS and remote tunneling switch off and your account is cancelled.'))),
+          h('div', { style: { display: 'flex', gap: 10, flexWrap: 'wrap' } },
+            h(ui.Button, { onClick: () => self.setState({ payModalOpen: true }) }, 'Renew now'),
+            h(ui.Button, { variant: 'ghost' }, 'Update payment method'))));
+    }
+
+    // cancelled
+    return h(ui.Card, null,
+      h(ui.CardContent, { style: { display: 'flex', flexDirection: 'column', gap: 16, paddingTop: 20 } },
+        h('div', { style: { display: 'flex', gap: 12, alignItems: 'flex-start' } },
+          h('span', { style: { color: 'var(--ink-4)', marginTop: 2 } }, I.info),
+          h('div', null,
+            h(ui.Text, { variant: 'body-strong' }, 'Subscription cancelled'),
+            h(ui.Text, { variant: 'caption', style: { marginTop: 2 } }, 'Cancelled on ' + d.dates.cancelled + '. Your networks and devices are retained for 30 days. Reactivate to restore them and turn premium features back on.'))),
+        h('div', null, h(ui.Button, { onClick: () => self.setState({ subState: 'active' }) }, 'Reactivate'))));
+  }
+
+  graceBanner() {
+    const h = React.createElement, ui = window.WardnetUi, self = this, I = this.icons;
+    const d = this.data;
+    if (this.state.subState !== 'grace') return null;
+    return h(ui.Banner, { tone: 'down', role: 'alert', icon: I.alert,
+      actions: h(ui.Button, { size: 'sm', onClick: () => self.setState({ payModalOpen: true }) }, 'Renew now') },
+      'Your subscription expired on ' + d.dates.expired + '. You have ' + d.dates.graceDays + ' days to renew before it’s cancelled and premium features stop.');
+  }
+
+  billingHistory() {
+    const h = React.createElement, ui = window.WardnetUi, I = this.icons;
+    const inv = this.data.invoices;
+    const cell = (c, style) => h('div', { style: Object.assign({ display: 'flex', alignItems: 'center' }, style || {}) }, c);
+    const cols = '1.4fr 1fr 1fr auto';
+    const head = h('div', { style: { display: 'grid', gridTemplateColumns: cols, gap: 12, padding: '0 0 10px' } },
+      cell(h(ui.Text, { variant: 'micro', color: 'ink-3' }, 'DATE')),
+      cell(h(ui.Text, { variant: 'micro', color: 'ink-3' }, 'AMOUNT')),
+      cell(h(ui.Text, { variant: 'micro', color: 'ink-3' }, 'STATUS')),
+      cell(h(ui.Text, { variant: 'micro', color: 'ink-3' }, 'INVOICE'), { justifyContent: 'flex-end' }));
+    const rows = inv.map((r, i) => h('div', { key: i, style: { display: 'grid', gridTemplateColumns: cols, gap: 12, padding: '12px 0', borderTop: '1px solid var(--line)', alignItems: 'center' } },
+      cell(h(ui.Text, { variant: 'body' }, r.date)),
+      cell(h(ui.Text, { variant: 'body', style: { fontFamily: 'var(--font-mono)' } }, r.amount)),
+      cell(h(ui.Pill, { variant: r.status }, r.label)),
+      cell(h(ui.Button, { variant: 'ghost', size: 'icon-sm', 'aria-label': 'Download invoice' }, I.download), { justifyContent: 'flex-end' })));
+    return h(ui.Card, null,
+      h(ui.CardHeader, null, h(ui.CardTitle, null, 'Billing history'), h(ui.CardSubtitle, null, 'Receipts for your Wardnet Cloud subscription.')),
+      h(ui.CardContent, null, head, h('div', null, rows)));
+  }
+
+  paymentMethodCard() {
+    const h = React.createElement, ui = window.WardnetUi, self = this, I = this.icons;
+    const d = this.data;
+    return h(ui.Card, null,
+      h(ui.CardHeader, null, h(ui.CardTitle, null, 'Payment method'), h(ui.CardSubtitle, null, 'Used for renewals and any upgrades.')),
+      h(ui.CardContent, null,
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: 14 } },
+          h('div', { style: { width: 44, height: 30, borderRadius: 6, background: 'var(--bg-sunken)', border: '1px solid var(--line)', color: 'var(--ink-2)', display: 'flex', alignItems: 'center', justifyContent: 'center' } }, I.card),
+          h('div', { style: { flex: 1 } },
+            h(ui.Text, { variant: 'body-strong' }, d.card.brand + ' •••• ' + d.card.last4),
+            h(ui.Text, { variant: 'caption' }, 'Expires ' + d.card.exp)),
+          h(ui.Button, { variant: 'ghost', size: 'sm', onClick: () => self.setState({ payModalOpen: true }) }, 'Update'))));
+  }
+
+  paymentModal() {
+    const h = React.createElement, ui = window.WardnetUi, self = this;
+    return h(ui.Modal, { open: this.state.payModalOpen, onOpenChange: (o) => self.setState({ payModalOpen: o }) },
+      h(ui.ModalContent, null,
+        h(ui.ModalHeader, null, h(ui.ModalTitle, null, 'Update payment method')),
+        h(ui.ModalBody, { style: { display: 'flex', flexDirection: 'column', gap: 14 } },
+          h(ui.ModalDescription, null, 'Your card is processed securely by Stripe. Wardnet never stores your card number.'),
+          h(ui.Field, { label: 'Card number', htmlFor: 'cc-num' },
+            h(ui.Input, { id: 'cc-num', placeholder: '1234 1234 1234 1234', inputMode: 'numeric', style: { fontFamily: 'var(--font-mono)' } })),
+          h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 } },
+            h(ui.Field, { label: 'Expiry', htmlFor: 'cc-exp' },
+              h(ui.Input, { id: 'cc-exp', placeholder: 'MM / YY', inputMode: 'numeric', style: { fontFamily: 'var(--font-mono)' } })),
+            h(ui.Field, { label: 'CVC', htmlFor: 'cc-cvc' },
+              h(ui.Input, { id: 'cc-cvc', placeholder: '123', inputMode: 'numeric', style: { fontFamily: 'var(--font-mono)' } }))),
+          h(ui.Field, { label: 'Name on card', htmlFor: 'cc-name' }, h(ui.Input, { id: 'cc-name', placeholder: 'Pedro' }))),
+        h(ui.ModalFooter, null,
+          h(ui.ModalClose, { asChild: true }, h(ui.Button, { variant: 'ghost' }, 'Cancel')),
+          h(ui.ModalClose, { asChild: true }, h(ui.Button, { onClick: () => self.setState({ subState: self.state.subState === 'trial' ? 'active' : self.state.subState }) }, 'Save card')))));
+  }
+
+  cancelAlert() {
+    const h = React.createElement, ui = window.WardnetUi, self = this;
+    return h(ui.AlertModal, null,
+      h(ui.AlertModalTrigger, { asChild: true }, h(ui.Button, { variant: 'ghost' }, 'Cancel subscription')),
+      h(ui.AlertModalContent, null,
+        h(ui.AlertModalHeader, null, h(ui.AlertModalTitle, null, 'Cancel your Pro subscription?')),
+        h(ui.AlertModalBody, null,
+          h(ui.AlertModalDescription, null,
+            'Your plan stays active until ' + this.data.dates.renews + ', then premium features switch off. ' +
+            'Networks beyond the free limit (1 network, 5 devices) and remote tunneling will be disabled until you resubscribe.')),
+        h(ui.AlertModalFooter, null,
+          h(ui.AlertModalCancel, { asChild: true }, h(ui.Button, { variant: 'ghost' }, 'Keep subscription')),
+          h(ui.AlertModalAction, { asChild: true }, h(ui.Button, { variant: 'destructive', onClick: () => self.setState({ subState: 'cancelled' }) }, 'Cancel at period end')))));
+  }
+
+  renderSubscription() {
+    const h = React.createElement;
+    const ds = this.state.dataState;
+    if (ds === 'loading') return this.renderLoading();
+    if (ds === 'error') return this.renderError();
+    return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
+      this.pageHeader('Subscription', 'Manage your plan, billing, and entitlements.'),
+      this.graceBanner(),
+      h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, alignItems: 'stretch' } },
+        this.planCard(), this.entitlementsCard()),
+      this.lifecycleCard(),
+      this.paymentMethodCard(),
+      this.billingHistory(),
+      this.paymentModal());
+  }
+
+  // ====================================================================
+  //  SECURITY
+  // ====================================================================
+  methodRow(icon, name, desc, connected, i) {
+    const h = React.createElement, ui = window.WardnetUi;
+    return h('div', { key: name, style: { display: 'flex', alignItems: 'center', gap: 14, padding: '15px 0', borderTop: i ? '1px solid var(--line)' : 'none' } },
+      h('span', { style: { width: 30, height: 30, borderRadius: 8, background: 'var(--bg-sunken)', border: '1px solid var(--line)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--ink-2)' } }, icon),
+      h('div', { style: { flex: 1 } },
+        h(ui.Text, { variant: 'body-strong' }, name),
+        h(ui.Text, { variant: 'caption' }, desc)),
+      connected
+        ? h('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
+            h(ui.Pill, { variant: 'ok' }, 'Connected'),
+            h(ui.Button, { variant: 'ghost', size: 'sm' }, 'Disconnect'))
+        : h(ui.Button, { variant: 'ghost', size: 'sm' }, 'Connect'));
+  }
+
+  renderSecurity() {
+    const h = React.createElement, ui = window.WardnetUi, self = this, I = this.icons;
+    const ds = this.state.dataState;
+    if (ds === 'loading') return this.renderLoading();
+    if (ds === 'error') return this.renderError();
+    const emailDot = h('span', { style: { fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: 13 } }, '@');
+    return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
+      this.pageHeader('Security', 'Sign-in methods and account protection.'),
+      h(ui.Card, null,
+        h(ui.CardHeader, null, h(ui.CardTitle, null, 'Connected sign-in methods'), h(ui.CardSubtitle, null, 'Link a provider for one-tap sign in. At least one method must stay connected.')),
+        h(ui.CardContent, null,
+          this.methodRow(I.google, 'Google', 'pedro@gmail.com', true, 0),
+          this.methodRow(I.github, 'GitHub', 'Not connected', false, 1),
+          this.methodRow(emailDot, 'Email & password', 'pedro@example.com', true, 2))),
+      h(ui.Card, null,
+        h(ui.CardHeader, null, h(ui.CardTitle, null, 'Change password'), h(ui.CardSubtitle, null, 'Update the password for your email sign-in.')),
+        h(ui.CardContent, { style: { display: 'flex', flexDirection: 'column', gap: 14, maxWidth: 420 } },
+          h(ui.Field, { label: 'Current password', htmlFor: 'cur-pw' }, h(ui.Input, { id: 'cur-pw', type: 'password', placeholder: '••••••••' })),
+          h(ui.Field, { label: 'New password', htmlFor: 'new-pw', help: 'At least 10 characters.' }, h(ui.Input, { id: 'new-pw', type: 'password', placeholder: '••••••••' })),
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: 12 } },
+            h(ui.Button, { onClick: () => self.setState({ pwSaved: true }) }, 'Update password'),
+            self.state.pwSaved ? h(ui.Text, { variant: 'caption', color: 'accent-soft-ink' }, '✓ Password updated') : null))),
+      h(ui.Card, null,
+        h(ui.CardHeader, null, h(ui.CardTitle, null, 'Sessions')),
+        h(ui.CardContent, { style: { display: 'flex', flexDirection: 'column', gap: 14 } },
+          h(ui.Text, { variant: 'body', color: 'ink-2' }, 'Signed in on this browser · Amsterdam, NL · just now'),
+          h('div', { style: { display: 'flex', gap: 10, flexWrap: 'wrap' } },
+            h(ui.Button, { variant: 'ghost', onClick: () => self.setState({ signedIn: false, authScreen: 'signin' }) }, I.logout, ' Sign out'),
+            h(ui.Button, { variant: 'destructive', onClick: () => self.setState({ signedIn: false, authScreen: 'signin' }) }, 'Sign out of all sessions')))));
+  }
+
+  renderAccount() {
+    const h = React.createElement;
+    const s = this.state;
+    let content;
+    if (s.accountTab === 'subscription') content = this.renderSubscription();
+    else if (s.accountTab === 'security') content = this.renderSecurity();
+    else content = this.renderOverview();
+    return h('div', { 'data-theme': this.state.theme, style: { minHeight: '100vh', background: 'var(--bg)', fontFamily: 'var(--font-sans)' } },
+      this.topbar(),
+      h('main', { key: s.accountTab + s.dataState, style: { maxWidth: 940, margin: '0 auto', padding: '28px 20px 64px' } }, content));
+  }
+
+  // ====================================================================
+  renderVals() {
+    if (this.state.booting || !window.WardnetUi || !window.WardnetUi.Button) {
+      const h = React.createElement;
+      return { app: h('div', { style: { minHeight: '100vh', background: 'var(--bg, #f4f3ee)', display: 'flex', alignItems: 'center', justifyContent: 'center' } },
+        h('div', { style: { width: 26, height: 26, border: '2.5px solid var(--line, #e6e4dc)', borderTopColor: 'var(--accent, #12b981)', borderRadius: 999, animation: 'wn-shimmer .8s linear infinite' } })) };
+    }
+    const app = this.state.signedIn ? this.renderAccount() : this.renderAuth();
+    return { app };
+  }
+}
+</script>
+</body>
+</html>

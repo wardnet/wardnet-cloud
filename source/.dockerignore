@@ -3,3 +3,10 @@ target/
 end2end-tests/mesh/certs/
 **/*.pem
 .git/
+# The frontend (account-dashboard-app) is not part of any Rust service image. Its
+# node_modules holds `link:` symlinks that escape the build context (sibling DS
+# repo), which the builder rejects ("invalid symlink"). None of it is needed.
+**/node_modules/
+account-dashboard-app/dist/
+# Local dev-stack secrets (certs are already covered by **/*.pem above).
+dev-stack/.env

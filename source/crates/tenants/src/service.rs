@@ -705,10 +705,21 @@ fn normalize_email(email: &str) -> Result<String, TenantsError> {
     crate::util::normalize_email(email).map_err(|m| TenantsError::BadRequest(m.to_string()))
 }
 
-/// Generate a random one-time code, returning `(raw_code_hex, sha256_hex)`. Only
-/// the hash is persisted; the raw code is shown once.
+/// Length of a human-typed one-time code (matches the SPA's segmented input).
+const CODE_LEN: usize = 6;
+/// Code alphabet: uppercase letters + digits, with the ambiguous glyphs
+/// (`I`, `O`, `0`, `1`) removed so a hand-keyed code is unambiguous. 32 symbols
+/// over 6 places ≈ 2^30 combinations — paired with the short TTL + per-IP
+/// issuance limit, far more than a 6-digit numeric code.
+const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+/// Generate a random one-time code, returning `(raw_code, sha256_hex)`. Only the
+/// hash is persisted; the raw code is emailed/shown once. The code is a 6-char
+/// uppercase alphanumeric string the user types into the segmented code input.
 fn generate_code() -> (String, String) {
-    let code = crate::util::random_token();
+    let code: String = (0..CODE_LEN)
+        .map(|_| CODE_ALPHABET[rand::random_range(0..CODE_ALPHABET.len())] as char)
+        .collect();
     let hash = hash_code(&code);
     (code, hash)
 }

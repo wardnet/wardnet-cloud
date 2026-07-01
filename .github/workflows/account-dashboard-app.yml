@@ -1,0 +1,59 @@
+name: Account dashboard app
+
+# Reusable leaf that validates the My Account SPA (source/account-dashboard-app):
+# install (from GitHub Packages), type-check, test, build. Invoked by the CI/PR
+# orchestrators, gated by detect-changes.
+#
+# @wardnet/ui (+ styles) install from GitHub Packages with the built-in
+# GITHUB_TOKEN — no PAT. `packages: read` is the only extra permission needed.
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # yarn reads the @wardnet registry token from NODE_AUTH_TOKEN (see .npmrc /
+  # .yarnrc.yml). The built-in token has packages:read for this org.
+  NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  build:
+    name: Type-check · test · build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    defaults:
+      run:
+        working-directory: source/account-dashboard-app
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Node + Corepack (Yarn 4)
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+        with:
+          node-version: 22
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Type-check
+        run: yarn type-check
+
+      - name: Test
+        run: yarn test
+
+      - name: Build
+        run: yarn build

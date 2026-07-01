@@ -13,8 +13,13 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
-use wardnet_billing::gateway::{StripeEvent, StripeEventKind, SubscriptionData};
-use wardnet_common::contract::{InvoiceStatus, InvoiceView, PaymentMethodView, SubscriptionStatus};
+use wardnet_billing::gateway::{
+    StripeEvent, StripeEventKind, SubscriptionData, SubscriptionDetails,
+};
+use wardnet_billing::repository::{BillingRepository, CatalogPlan};
+use wardnet_common::contract::{
+    Entitlement, InvoiceStatus, InvoiceView, PaymentMethodView, SubscriptionStatus,
+};
 use wardnet_common::token::{ClaimsSpec, PrincipalType, canonical_request_payload};
 use wardnet_tenants::api;
 use wardnet_tenants::repository::tenant::Tenant;
@@ -726,4 +731,444 @@ async fn stripe_webhook_without_signature_is_bad_request() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── HTTP contract tests for the plan-change / card-update / subscription-read /
+//    public-plans endpoints added in this PR (previously only service-tested). ──
+
+/// Seed `tenant` as an active Home subscriber with a Stripe billing ref, plus the
+/// Home/Pro catalog, so the plan-change, card-update and subscription-read endpoints
+/// have the data their handlers read.
+async fn seed_paid_http(h: &common::Harness, tenant: &str) {
+    let now = chrono::Utc::now();
+    let plan =
+        |price: &str, prod: &str, name: &str, level: u32, nets: u32, daemons: u32| CatalogPlan {
+            price_id: price.to_string(),
+            product_id: prod.to_string(),
+            name: name.to_string(),
+            level,
+            entitlement: Entitlement {
+                max_networks: nets,
+                max_daemons: daemons,
+            },
+            amount_cents: 100,
+            currency: "usd".to_string(),
+            interval: "month".to_string(),
+        };
+    h.store
+        .replace_catalog(
+            &[
+                plan("price_home", "prod_home", "Home", 1, 1, 1),
+                plan("price_pro", "prod_pro", "Pro", 3, 3, 6),
+            ],
+            &[],
+            now,
+        )
+        .await
+        .unwrap();
+    h.store
+        .upsert_subscription(tenant, "cus_x", "sub_x", Some("price_home"))
+        .await
+        .unwrap();
+    h.stripe.set_subscription(SubscriptionDetails {
+        item_id: "si_x".to_string(),
+        price_id: "price_home".to_string(),
+        current_period_end: now + chrono::Duration::days(30),
+        schedule_id: None,
+        trialing: false,
+    });
+}
+
+fn post_json(path: &str, token: Option<&str>, body: &Value) -> Request<Body> {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json");
+    if let Some(t) = token {
+        b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+    }
+    b.body(Body::from(serde_json::to_vec(body).unwrap()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn change_plan_upgrade_returns_202_and_the_new_price() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    seed_paid_http(&h, "tb").await;
+
+    let resp = app
+        .oneshot(post_json(
+            "/v1/tenants/tb/billing/change-plan",
+            Some(&user_token("tb")),
+            &json!({"price_id": "price_pro", "accept_full_price": false}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let b = json_body(resp).await;
+    assert_eq!(b["effect"], json!("upgraded"));
+    assert_eq!(b["current_price_id"], json!("price_pro"));
+}
+
+#[tokio::test]
+async fn change_plan_without_a_paid_subscription_is_400() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    // "tt" has no billing ref → the service rejects → 400 (never a 5xx).
+    let resp = app
+        .oneshot(post_json(
+            "/v1/tenants/tt/billing/change-plan",
+            Some(&user_token("tt")),
+            &json!({"price_id": "price_pro", "accept_full_price": false}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn change_plan_rejects_another_tenants_token() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    seed_paid_http(&h, "tb").await;
+    let resp = app
+        .oneshot(post_json(
+            "/v1/tenants/tb/billing/change-plan",
+            Some(&user_token("other")),
+            &json!({"price_id": "price_pro", "accept_full_price": false}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn get_billing_subscription_returns_the_current_plan() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    seed_paid_http(&h, "tb").await;
+    let resp = billing_get(
+        &app,
+        "/v1/tenants/tb/billing/subscription",
+        &user_token("tb"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let b = json_body(resp).await;
+    assert_eq!(b["current_price_id"], json!("price_home"));
+    assert_eq!(b["trialing"], json!(false));
+    assert_eq!(b["pending_change"], Value::Null);
+}
+
+#[tokio::test]
+async fn get_billing_subscription_is_empty_without_a_ref() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    let resp = billing_get(
+        &app,
+        "/v1/tenants/tt/billing/subscription",
+        &user_token("tt"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await["current_price_id"], Value::Null);
+}
+
+#[tokio::test]
+async fn get_billing_subscription_rejects_another_tenants_token() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    seed_paid_http(&h, "tb").await;
+    let resp = billing_get(
+        &app,
+        "/v1/tenants/tb/billing/subscription",
+        &user_token("other"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn card_update_returns_a_setup_session_url() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    seed_paid_http(&h, "tb").await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tenants/tb/billing/card-update")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", user_token("tb")),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(json_body(resp).await["url"].is_string());
+}
+
+#[tokio::test]
+async fn plans_endpoint_is_public_and_lists_the_catalog() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    seed_paid_http(&h, "tb").await;
+    // Public bootstrap route — no Authorization header.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/plans")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = json_body(resp).await;
+    let arr = arr.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert!(arr.iter().any(|p| p["price_id"] == json!("price_pro")));
+}
+
+// ── HTTP contract tests for the remaining account-plane handlers (me / add-daemon
+//    code / daemon lists / cancel / delete-network) — previously only ~46% covered. ──
+
+/// Enroll a tenant and register one network (with its first daemon) via the real HTTP
+/// flow; returns `(tenant_id, network_id, slug)` for the daemon-list / delete tests.
+async fn enroll_with_network(h: &common::Harness) -> (String, String, String) {
+    let app = api::router(h.state.clone());
+    let (key, cnf) = daemon_keypair(11);
+
+    let mut signup = Request::builder()
+        .method("POST")
+        .uri("/v1/verification-codes")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({"email": "net@b.com", "purpose": "enrollment"})).unwrap(),
+        ))
+        .unwrap();
+    signup
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));
+    let code = json_body(app.clone().oneshot(signup).await.unwrap()).await["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/enroll")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"code": code, "public_key": cnf})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let tenant_id = json_body(resp).await["tenant_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    h.pump().await;
+
+    let body = serde_json::to_vec(&json!({"public_key": cnf})).unwrap();
+    let token = json_body(
+        app.clone()
+            .oneshot(daemon_request("POST", "/v1/token", &body, &key, None))
+            .await
+            .unwrap(),
+    )
+    .await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let body = serde_json::to_vec(&json!({"slug": "happy-cat", "region": "use1"})).unwrap();
+    app.clone()
+        .oneshot(daemon_request(
+            "POST",
+            "/v1/networks",
+            &body,
+            &key,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+
+    // Recover the network id from the tenant's network list (NetworkView.id).
+    let nets = billing_get(
+        &app,
+        &format!("/v1/tenants/{tenant_id}/networks"),
+        &user_token(&tenant_id),
+    )
+    .await;
+    let network_id = json_body(nets).await[0]["id"].as_str().unwrap().to_string();
+    (tenant_id, network_id, "happy-cat".to_string())
+}
+
+#[tokio::test]
+async fn me_returns_the_account_profile() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    h.store.seed_tenant(Tenant {
+        id: "tm".to_string(),
+        email: "me@b.com".to_string(),
+        created_at: chrono::Utc::now(),
+        deregistered_at: None,
+    });
+    h.subscriptions.create_trial("tm").await.unwrap();
+
+    let resp = billing_get(&app, "/v1/me", &user_token("tm")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let b = json_body(resp).await;
+    assert_eq!(b["tenant_id"], json!("tm"));
+    assert_eq!(b["email"], json!("me@b.com"));
+    assert_eq!(b["subscription"]["status"], json!("trialing"));
+}
+
+#[tokio::test]
+async fn me_is_404_for_a_missing_tenant() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    // A validly-signed token for a tenant that was never created.
+    let resp = billing_get(&app, "/v1/me", &user_token("ghost")).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn issue_tenant_code_returns_a_code_for_the_owner() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    h.store.seed_tenant(Tenant {
+        id: "tc".to_string(),
+        email: "c@b.com".to_string(),
+        created_at: chrono::Utc::now(),
+        deregistered_at: None,
+    });
+
+    let resp = app
+        .oneshot(post_json(
+            "/v1/tenants/tc/codes",
+            Some(&user_token("tc")),
+            &json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Dev email sender doesn't deliver, so the code is returned in-band.
+    assert!(json_body(resp).await["code"].is_string());
+}
+
+#[tokio::test]
+async fn issue_tenant_code_rejects_another_tenant() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    let resp = app
+        .oneshot(post_json(
+            "/v1/tenants/tc/codes",
+            Some(&user_token("other")),
+            &json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn update_tenant_cancels_the_subscription() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    h.store.seed_tenant(Tenant {
+        id: "tu".to_string(),
+        email: "u@b.com".to_string(),
+        created_at: chrono::Utc::now(),
+        deregistered_at: None,
+    });
+    h.subscriptions.create_trial("tu").await.unwrap();
+
+    let req = Request::builder()
+        .method("PATCH")
+        .uri("/v1/tenants/tu")
+        .header("content-type", "application/json")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", user_token("tu")),
+        )
+        .body(Body::from(
+            serde_json::to_vec(&json!({"subscription_status": "canceled"})).unwrap(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    // The subscription is no longer live.
+    assert!(h.subscriptions.current("tu").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn update_tenant_rejects_an_unsupported_field() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    h.store.seed_tenant(Tenant {
+        id: "tu".to_string(),
+        email: "u@b.com".to_string(),
+        created_at: chrono::Utc::now(),
+        deregistered_at: None,
+    });
+    let req = Request::builder()
+        .method("PATCH")
+        .uri("/v1/tenants/tu")
+        .header("content-type", "application/json")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", user_token("tu")),
+        )
+        .body(Body::from(
+            serde_json::to_vec(&json!({"subscription_status": "active"})).unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(req).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn tenant_and_network_daemon_lists_and_delete_network() {
+    let h = build_harness(SEED);
+    let app = api::router(h.state.clone());
+    let (tenant_id, network_id, slug) = enroll_with_network(&h).await;
+    let token = user_token(&tenant_id);
+
+    // The tenant has exactly its one enrolled daemon.
+    let td = billing_get(&app, &format!("/v1/tenants/{tenant_id}/daemons"), &token).await;
+    assert_eq!(td.status(), StatusCode::OK);
+    assert_eq!(json_body(td).await.as_array().unwrap().len(), 1);
+
+    // …reachable via the network too.
+    let nd = billing_get(&app, &format!("/v1/networks/{network_id}/daemons"), &token).await;
+    assert_eq!(nd.status(), StatusCode::OK);
+    assert_eq!(json_body(nd).await.as_array().unwrap().len(), 1);
+
+    // Deleting the network is accepted (marks it deprovisioning).
+    let del = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/tenants/{tenant_id}/networks/{slug}"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(del.status(), StatusCode::ACCEPTED);
 }

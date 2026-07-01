@@ -1,0 +1,128 @@
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--line);
+}
+.topbarInner {
+  max-width: 940px;
+  margin: 0 auto;
+  height: 56px;
+  padding: 0 20px;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+}
+.brand {
+  display: inline-flex;
+  align-items: center;
+}
+.nav {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.navLink {
+  position: relative;
+  appearance: none;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  color: var(--ink-3);
+  padding: 18px 8px;
+  text-decoration: none;
+}
+.navLink:hover {
+  color: var(--ink-2);
+}
+.navLinkActive {
+  color: var(--ink);
+  font-weight: 600;
+}
+.navLinkActive::after {
+  content: "";
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: -1px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+.spacer {
+  flex: 1;
+}
+.right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.avatar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  background: var(--bg-card);
+  border-radius: 999px;
+  padding: 4px 8px 4px 4px;
+  cursor: pointer;
+}
+.avatarBadge {
+  width: 26px;
+  height: 26px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: var(--text-sm);
+}
+.avatarName {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--ink);
+}
+.menuMeta {
+  padding: 4px 8px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+/* Mobile: the inline tab bar would overflow the row, so collapse it — the account
+   menu already lists every tab — and drop the avatar name to keep the bar on one
+   line without horizontal scroll. */
+@media (max-width: 640px) {
+  .topbarInner {
+    gap: 10px;
+    padding: 0 14px;
+  }
+  .nav {
+    display: none;
+  }
+  .avatarName {
+    display: none;
+  }
+}
+
+.page {
+  max-width: 940px;
+  margin: 0 auto;
+  padding: 28px 20px 64px;
+}
+.pageHead {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 20px;
+}
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}

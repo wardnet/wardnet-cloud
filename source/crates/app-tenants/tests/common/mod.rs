@@ -25,11 +25,14 @@ use wardnet_common::contract::{
     CodePurpose, Entitlement, InvoiceView, PaymentMethodView, SubscriptionStatus,
 };
 use wardnet_common::event::{DomainEvent, EventBus, EventStream, InProcessEventBus};
-use wardnet_common::ports::{BillingPort, SubscriptionCommands, SubscriptionReader};
+use wardnet_common::ports::{BillingPort, PlanCatalog, SubscriptionCommands, SubscriptionReader};
 use wardnet_common::token::{Signer, Verifier};
 
 use wardnet_billing::BillingService;
-use wardnet_billing::gateway::{CheckoutSession, StripeEvent, StripeGateway};
+use wardnet_billing::gateway::{
+    CheckoutSession, PlanData, PromotionData, ScheduledChange, StripeEvent, StripeGateway,
+    SubscriptionDetails,
+};
 use wardnet_billing::repository::BillingRepository;
 use wardnet_subscriptions::{
     Subscription, SubscriptionRepository, SubscriptionService, TrialPolicy,
@@ -121,6 +124,10 @@ struct Data {
     billing_customers: HashMap<String, BillingCustomer>,
     /// Billing webhook idempotency ledger.
     processed_stripe_events: HashSet<String>,
+    /// The catalog projection (plans + promotions) + last-sync stamp.
+    catalog_plans: Vec<wardnet_billing::repository::CatalogPlan>,
+    catalog_promos: Vec<wardnet_billing::repository::CatalogPromo>,
+    catalog_synced_at: Option<DateTime<Utc>>,
     /// Login methods keyed on `(provider, subject)` (mirrors the PK).
     identities: HashMap<(String, String), TenantIdentity>,
     /// Sessions keyed on `token_hash`.
@@ -146,6 +153,20 @@ impl MockStore {
             .unwrap()
             .tenants
             .insert(tenant.id.clone(), tenant);
+    }
+
+    /// Test seam: override the live subscription's trial expiry (the mock `create_trial`
+    /// is fixed at the policy's trial length, so this lets tests exercise the near/expired
+    /// trial-preserve threshold).
+    pub fn set_trial_expiry(&self, tenant_id: &str, expiry: DateTime<Utc>) {
+        let mut d = self.0.lock().unwrap();
+        if let Some(s) = d
+            .subscriptions
+            .values_mut()
+            .find(|s| s.tenant_id == tenant_id && s.status != SubscriptionStatus::Canceled)
+        {
+            s.trial_expires_at = Some(expiry);
+        }
     }
 
     /// Seed a login method directly (e.g. a federated `google` identity already linked
@@ -1022,6 +1043,45 @@ impl BillingRepository for MockStore {
             .and_then(|r| r.customer.clone()))
     }
 
+    async fn billing_ref(
+        &self,
+        tenant_id: &str,
+    ) -> anyhow::Result<Option<wardnet_billing::repository::BillingRef>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .billing_customers
+            .get(tenant_id)
+            .map(|r| wardnet_billing::repository::BillingRef {
+                customer_id: r.customer.clone(),
+                stripe_subscription_id: r.subscription.clone(),
+                price_id: r.price.clone(),
+            }))
+    }
+
+    async fn replace_catalog(
+        &self,
+        plans: &[wardnet_billing::repository::CatalogPlan],
+        promos: &[wardnet_billing::repository::CatalogPromo],
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let mut d = self.0.lock().unwrap();
+        d.catalog_plans = plans.to_vec();
+        d.catalog_promos = promos.to_vec();
+        d.catalog_synced_at = Some(now);
+        Ok(())
+    }
+
+    async fn read_catalog(&self) -> anyhow::Result<wardnet_billing::repository::CatalogSnapshot> {
+        let d = self.0.lock().unwrap();
+        Ok(wardnet_billing::repository::CatalogSnapshot {
+            plans: d.catalog_plans.clone(),
+            promos: d.catalog_promos.clone(),
+            last_synced_at: d.catalog_synced_at,
+        })
+    }
+
     async fn tenant_for_subscription(
         &self,
         stripe_subscription_id: &str,
@@ -1034,6 +1094,20 @@ impl BillingRepository for MockStore {
             .iter()
             .find(|(_, r)| r.subscription.as_deref() == Some(stripe_subscription_id))
             .map(|(tenant_id, _)| tenant_id.clone()))
+    }
+
+    async fn subscription_for_customer(
+        &self,
+        stripe_customer_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .billing_customers
+            .values()
+            .find(|r| r.customer.as_deref() == Some(stripe_customer_id))
+            .and_then(|r| r.subscription.clone()))
     }
 
     async fn is_event_processed(&self, event_id: &str) -> anyhow::Result<bool> {
@@ -1112,6 +1186,8 @@ impl EventBus for RecordingEventBus {
 
 /// A recorded `create_checkout_session` call: `(customer_id, email, price_id, tenant_id)`.
 pub type CheckoutCall = (Option<String>, String, String, String);
+/// A recorded change-plan side-effect: (`subscription_id`, `new_price_id`, kind, coupon).
+pub type ChangeCall = (String, String, &'static str, Option<String>);
 
 /// A recording [`StripeGateway`] fake: checkout/portal return canned URLs and record
 /// their calls; `construct_event` returns a pre-set [`StripeEvent`] (set by the
@@ -1119,7 +1195,7 @@ pub type CheckoutCall = (Option<String>, String, String, String);
 /// in `wardnet_billing::gateway::tests`, not re-tested here.
 pub struct MockStripeGateway {
     checkout_url: String,
-    portal_url: String,
+    setup_url: String,
     checkout_customer_id: Option<String>,
     event: Mutex<Option<StripeEvent>>,
     /// Recorded `create_checkout_session` calls.
@@ -1128,6 +1204,29 @@ pub struct MockStripeGateway {
     payment_method: Mutex<Option<PaymentMethodView>>,
     /// Canned `list_invoices` result (defaults to empty).
     invoices: Mutex<Vec<InvoiceView>>,
+    /// Canned catalog reads (default empty).
+    plans: Mutex<Vec<PlanData>>,
+    promotions: Mutex<Vec<PromotionData>>,
+    /// Canned `get_subscription` result (default `None` → an error when called).
+    subscription: Mutex<Option<SubscriptionDetails>>,
+    /// Canned `pending_scheduled_change` result.
+    pending: Mutex<Option<ScheduledChange>>,
+    /// Recorded change-plan side-effects (see [`ChangeCall`]).
+    pub changes: Mutex<Vec<ChangeCall>>,
+    /// Recorded `release_schedule` calls (schedule ids).
+    pub released: Mutex<Vec<String>>,
+    /// Recorded coupon forwarded on each `create_checkout_session` call.
+    pub checkout_coupons: Mutex<Vec<Option<String>>>,
+    /// Recorded `trial_end` forwarded on each `create_checkout_session` call (ADR-0012).
+    pub checkout_trial_ends: Mutex<Vec<Option<i64>>>,
+    /// Recorded `end_trial` flag forwarded on each `upgrade_subscription` call (ADR-0012).
+    pub upgrade_end_trials: Mutex<Vec<bool>>,
+    /// Recorded `currency` forwarded on each `create_setup_checkout_session` call.
+    pub setup_currencies: Mutex<Vec<String>>,
+    /// When set, the next `upgrade_subscription` fails once (to exercise restore-on-failure).
+    pub fail_upgrade: Mutex<bool>,
+    /// Recorded `set_default_payment_method_from_setup` calls (customer, subscription, setup intent).
+    pub default_pm_setups: Mutex<Vec<(String, Option<String>, String)>>,
 }
 
 impl MockStripeGateway {
@@ -1135,12 +1234,24 @@ impl MockStripeGateway {
     pub fn new() -> Self {
         Self {
             checkout_url: "https://checkout.stripe.test/session".to_string(),
-            portal_url: "https://billing.stripe.test/portal".to_string(),
+            setup_url: "https://checkout.stripe.test/setup".to_string(),
             checkout_customer_id: None,
             event: Mutex::new(None),
             checkouts: Mutex::new(Vec::new()),
             payment_method: Mutex::new(None),
             invoices: Mutex::new(Vec::new()),
+            plans: Mutex::new(Vec::new()),
+            promotions: Mutex::new(Vec::new()),
+            subscription: Mutex::new(None),
+            pending: Mutex::new(None),
+            changes: Mutex::new(Vec::new()),
+            released: Mutex::new(Vec::new()),
+            checkout_coupons: Mutex::new(Vec::new()),
+            checkout_trial_ends: Mutex::new(Vec::new()),
+            upgrade_end_trials: Mutex::new(Vec::new()),
+            setup_currencies: Mutex::new(Vec::new()),
+            fail_upgrade: Mutex::new(false),
+            default_pm_setups: Mutex::new(Vec::new()),
         }
     }
 
@@ -1158,6 +1269,27 @@ impl MockStripeGateway {
     pub fn set_invoices(&self, invoices: Vec<InvoiceView>) {
         *self.invoices.lock().unwrap() = invoices;
     }
+
+    /// Set the catalog `list_plans` / `list_promotions` will return.
+    pub fn set_catalog(&self, plans: Vec<PlanData>, promotions: Vec<PromotionData>) {
+        *self.plans.lock().unwrap() = plans;
+        *self.promotions.lock().unwrap() = promotions;
+    }
+
+    /// Set the `get_subscription` result (drives change-plan).
+    pub fn set_subscription(&self, details: SubscriptionDetails) {
+        *self.subscription.lock().unwrap() = Some(details);
+    }
+
+    /// Make the next `upgrade_subscription` fail once (exercise restore-on-failure).
+    pub fn fail_next_upgrade(&self) {
+        *self.fail_upgrade.lock().unwrap() = true;
+    }
+
+    /// Set the `pending_scheduled_change` result.
+    pub fn set_pending_change(&self, change: ScheduledChange) {
+        *self.pending.lock().unwrap() = Some(change);
+    }
 }
 
 impl Default for MockStripeGateway {
@@ -1174,6 +1306,8 @@ impl StripeGateway for MockStripeGateway {
         email: &str,
         price_id: &str,
         tenant_id: &str,
+        coupon: Option<&str>,
+        trial_end: Option<i64>,
     ) -> anyhow::Result<CheckoutSession> {
         self.checkouts.lock().unwrap().push((
             customer_id.map(str::to_string),
@@ -1181,14 +1315,114 @@ impl StripeGateway for MockStripeGateway {
             price_id.to_string(),
             tenant_id.to_string(),
         ));
+        self.checkout_coupons
+            .lock()
+            .unwrap()
+            .push(coupon.map(str::to_string));
+        self.checkout_trial_ends.lock().unwrap().push(trial_end);
         Ok(CheckoutSession {
             url: self.checkout_url.clone(),
             customer_id: self.checkout_customer_id.clone(),
         })
     }
 
-    async fn create_billing_portal_session(&self, _customer_id: &str) -> anyhow::Result<String> {
-        Ok(self.portal_url.clone())
+    async fn create_setup_checkout_session(
+        &self,
+        _customer_id: &str,
+        currency: &str,
+    ) -> anyhow::Result<String> {
+        self.setup_currencies
+            .lock()
+            .unwrap()
+            .push(currency.to_string());
+        Ok(self.setup_url.clone())
+    }
+
+    async fn list_plans(&self) -> anyhow::Result<Vec<PlanData>> {
+        Ok(self.plans.lock().unwrap().clone())
+    }
+
+    async fn list_promotions(&self) -> anyhow::Result<Vec<PromotionData>> {
+        Ok(self.promotions.lock().unwrap().clone())
+    }
+
+    async fn get_subscription(
+        &self,
+        _subscription_id: &str,
+    ) -> anyhow::Result<SubscriptionDetails> {
+        self.subscription
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no canned subscription set on MockStripeGateway"))
+    }
+
+    async fn pending_scheduled_change(
+        &self,
+        _schedule_id: &str,
+        _current_period_end: DateTime<Utc>,
+    ) -> anyhow::Result<Option<ScheduledChange>> {
+        Ok(self.pending.lock().unwrap().clone())
+    }
+
+    async fn upgrade_subscription(
+        &self,
+        subscription_id: &str,
+        _item_id: &str,
+        new_price_id: &str,
+        coupon: Option<&str>,
+        end_trial: bool,
+    ) -> anyhow::Result<()> {
+        {
+            let mut fail = self.fail_upgrade.lock().unwrap();
+            if *fail {
+                *fail = false;
+                anyhow::bail!("simulated Stripe upgrade failure");
+            }
+        }
+        self.changes.lock().unwrap().push((
+            subscription_id.to_string(),
+            new_price_id.to_string(),
+            "upgrade",
+            coupon.map(str::to_string),
+        ));
+        self.upgrade_end_trials.lock().unwrap().push(end_trial);
+        Ok(())
+    }
+
+    async fn schedule_downgrade(
+        &self,
+        subscription_id: &str,
+        _current_price_id: &str,
+        new_price_id: &str,
+        current_period_end: DateTime<Utc>,
+    ) -> anyhow::Result<DateTime<Utc>> {
+        self.changes.lock().unwrap().push((
+            subscription_id.to_string(),
+            new_price_id.to_string(),
+            "downgrade",
+            None,
+        ));
+        Ok(current_period_end)
+    }
+
+    async fn release_schedule(&self, schedule_id: &str) -> anyhow::Result<()> {
+        self.released.lock().unwrap().push(schedule_id.to_string());
+        Ok(())
+    }
+
+    async fn set_default_payment_method_from_setup(
+        &self,
+        customer_id: &str,
+        subscription_id: Option<&str>,
+        setup_intent_id: &str,
+    ) -> anyhow::Result<()> {
+        self.default_pm_setups.lock().unwrap().push((
+            customer_id.to_string(),
+            subscription_id.map(str::to_string),
+            setup_intent_id.to_string(),
+        ));
+        Ok(())
     }
 
     fn construct_event(&self, _payload: &[u8], _sig_header: &str) -> anyhow::Result<StripeEvent> {
@@ -1275,11 +1509,14 @@ pub fn test_config() -> Config {
         trial_grace_days: 15,
         payment_grace_days: 15,
         sub_reaper_interval_secs: 3600,
+        catalog_sync_interval_secs: 18000,
+        catalog_stale_secs: 432_000,
         stripe_secret_key: "sk_test_dummy".to_string(),
         stripe_webhook_secret: "whsec_dummy".to_string(),
         account_base_url: "https://account.wardnet.test".to_string(),
         resend_api_key: None,
         email_from: "wardnet <noreply@wardnet.test>".to_string(),
+        email_logo_url: String::new(),
         cookie_key: "test-cookie-key-at-least-sixty-four-bytes-of-entropy-for-the-jar!!"
             .to_string(),
         user_jwt_ttl_secs: 300,
@@ -1309,6 +1546,8 @@ pub struct Harness {
     pub subscriptions: Arc<SubscriptionService>,
     pub tenants: Arc<TenantsService>,
     pub identities: Arc<IdentitiesService>,
+    /// The concrete billing service (for the worker-only `sync_catalog` not on `BillingPort`).
+    pub billing: Arc<BillingService>,
 }
 
 impl Harness {
@@ -1385,13 +1624,18 @@ pub fn build_harness_with_providers(
     let subscription_reader: Arc<dyn SubscriptionReader> = subscriptions.clone();
     let subscription_commands: Arc<dyn SubscriptionCommands> = subscriptions.clone();
 
-    // The payment aggregate, driving the license aggregate only through the ports.
-    let billing: Arc<dyn BillingPort> = Arc::new(BillingService::new(
+    // The payment aggregate, driving the license aggregate only through the ports. One
+    // concrete service, shared as both its command port + its catalog read port.
+    let billing_service = Arc::new(BillingService::new(
         Arc::clone(&stripe) as Arc<dyn StripeGateway>,
         Arc::new(store.clone()) as Arc<dyn BillingRepository>,
         Arc::clone(&subscription_reader),
         Arc::clone(&subscription_commands),
+        Arc::new(tokio::sync::Notify::new()),
+        432_000,
     ));
+    let billing: Arc<dyn BillingPort> = billing_service.clone();
+    let plans: Arc<dyn PlanCatalog> = billing_service.clone();
 
     let tenants = Arc::new(TenantsService::new(
         Arc::new(store.clone()) as Arc<dyn TenantRepository>,
@@ -1418,6 +1662,7 @@ pub fn build_harness_with_providers(
         Arc::clone(&subscription_reader),
         Arc::clone(&subscription_commands),
         Arc::clone(&billing),
+        Arc::clone(&plans),
         identities.clone(),
         verifier,
     );
@@ -1430,6 +1675,7 @@ pub fn build_harness_with_providers(
         subscriptions,
         tenants,
         identities,
+        billing: billing_service,
     }
 }
 

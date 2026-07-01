@@ -35,8 +35,10 @@ details. (See `docs/adr/` for the decisions behind these.)
   nothing about payment providers (that is [Billing](#billing)); owned by
   `SubscriptionService` in the `subscriptions` crate. See `docs/adr/0010`.
 - **Billing** — *how* a subscription is paid for: the payment provider (Stripe today),
-  hosted [Checkout](#checkout-session)/[Portal](#billing-portal), the webhook, the
-  idempotency ledger, and the provider-reference ids (the `billing_customers` table).
+  hosted [Checkout](#checkout-session) (incl. `setup`-mode [card update](#payment-method-update)),
+  the [plan-change](#plan-change) flow, the [plan catalog](#plan), [promotions](#promotion),
+  the webhook, the idempotency ledger, and the provider-reference ids (the
+  `billing_customers` table).
   Swappable; owned by `BillingService` in the `billing` crate. Drives the license only
   through the [SubscriptionCommands](#subscriptionreader--subscriptioncommands) port —
   Subscription never calls Billing back.
@@ -44,7 +46,20 @@ details. (See `docs/adr/` for the decisions behind these.)
   today). Billing talks to the provider only through it, so the wire format never leaks
   into the lifecycle logic.
 - **Plan** — a purchasable tier, defined as a Stripe Price whose metadata carries the
-  `max_networks` / `max_daemons` it grants. Adding a plan is a Stripe change, no deploy.
+  `max_networks` / `max_daemons` it grants **and** a unique integer **`level`** that
+  totally orders the catalog (used to decide upgrade vs downgrade). A price missing any
+  of those keys — or with a duplicate `level` — is excluded from the catalog
+  (safe-closed). Adding a plan is a Stripe change, no deploy.
+- **Plan level** — the unique integer rank (`level` metadata) that orders [plans](#plan).
+  A [plan change](#plan-change) to a higher level is an **upgrade**; to a lower level a
+  **downgrade**; same level is rejected.
+- **Plan catalog** — the set of purchasable [plans](#plan) + live [promotions](#promotion),
+  owned by Stripe but served from a **projection**: a [Billing](#billing)-owned table a
+  background worker keeps in sync with Stripe (webhook-triggered, with a periodic backstop).
+  `GET /v1/plans` and server-side promo derivation read the projection, never Stripe on the
+  hot path; the worker is its only writer (Stripe stays sole authority). Promo live-ness is
+  computed against the clock at request time; a catalog past a hard staleness bound is
+  refused (503). See `docs/adr/0011`.
 - **Network** — one wardnet network owned by a tenant. Holds a globally-unique
   **vanity slug** and a [provisioning state](#provisioning-state). The DNS record
   belongs to the network, not to any single device. A tenant may own several.
@@ -63,9 +78,44 @@ details. (See `docs/adr/` for the decisions behind these.)
   (trial grace, payment grace), both 15 days by default.
 - **Checkout session** — the Stripe-hosted page a user is redirected to (from the
   account plane) to subscribe to a plan; on completion the webhook converts the trial
-  to a paid subscription.
-- **Billing portal** — the Stripe-hosted page where a user manages their payment
-  method / subscription; reached via a portal session from the account plane.
+  to a paid subscription. Also used in **`setup` mode** to collect/replace a
+  [payment method](#payment-method-update) without a purchase.
+- **Trial-preserving subscribe** — subscribing *from the [trial](#trial)* to a plan
+  whose [entitlement](#entitlement) is **no greater** than the trial's (i.e. Home,
+  `1/1`): the [Checkout session](#checkout-session) collects a card but defers the
+  first charge to the tenant's original `trial_expires_at` (Stripe `trial_end`), so the
+  user keeps their remaining free days and locks in the plan + any
+  [promotion](#promotion). Entitlement is unchanged (still `1/1`). The subscription is
+  a Stripe-side trial (`Active` locally — it entitles — with no managed-trial reaping).
+- **Trial-ending change** — moving *while a trial is in effect* to a plan whose
+  entitlement **exceeds** the trial's: the user is getting more capacity now, so the trial
+  is forfeited and billing starts immediately (proration-free first charge). Covers two
+  routes: (a) **subscribing** from the managed trial to Home HA / Pro; and (b)
+  **[upgrading](#plan-change)** during a *trial-preserving* subscription (a Stripe-side
+  trial) — because that subscription always sits on Home (`1/1`), any upgrade exceeds the
+  trial entitlement and ends the trial (Stripe `trial_end` set to now). Both routes go
+  through an account-plane **warning + confirmation** that names the trial days being
+  forfeited. This is the only way a trial ends early.
+- **Plan change** — an in-app move between [plans](#plan) on an *already-paid*
+  subscription (`POST .../billing/change-plan`). An **upgrade** (to a higher
+  [level](#plan-level)) applies immediately with proration on the next invoice; a
+  **downgrade** (to a lower level) is scheduled via a Stripe Subscription Schedule to
+  take effect at the current period end (the tenant keeps the paid-for entitlement
+  until then). Re-entry reconciles against any pending schedule (release-then-act). An
+  upgrade on a subscription still in its Stripe [trial](#trial) (a *trial-preserving*
+  Home sub) is a [trial-ending change](#trial-ending-change): it ends the trial now and
+  charges. A tenant on the *managed* (card-less) trial or `canceled` has **no Stripe
+  subscription** to change — it subscribes via [Checkout](#checkout-session) instead.
+- **Payment-method update** — replacing the card without leaving Stripe's trust
+  boundary: a [Checkout session](#checkout-session) in `setup` mode. Recovery from
+  `past_due` links the open invoice's Stripe-hosted pay page (`hosted_invoice_url`).
+  There is **no Stripe Customer Portal** — all billing actions are in-app, with card
+  entry always on a Stripe-served surface.
+- **Promotion** — a global, seasonal discount auto-applied at [Checkout](#checkout-session)
+  / [upgrade](#plan-change): a Stripe **coupon** flagged `wardnet_auto_apply` whose active
+  window (`wardnet_promo_start` → Stripe `redeem_by`) contains now and whose
+  `applies_to.products` covers the plan. Applied **server-side only** (never client-passed);
+  surfaced on the catalog for display. Affects *cost* only — never [entitlement](#entitlement).
 - **Deregister** — the account-closing act: the tenant is **tombstoned**, all its
   networks are cascaded to [deprovisioning](#provisioning-state), and its
   subscription is canceled. Idempotent. Distinct from a subscription cancel (which

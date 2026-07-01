@@ -15,11 +15,16 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use wardnet_common::contract::CodePurpose;
+use chrono::{Duration, Utc};
+
+use wardnet_common::contract::{CodePurpose, Entitlement, SubscriptionStatus};
 use wardnet_common::db::DbPools;
 use wardnet_common::event::EventBus;
-use wardnet_common::ports::SubscriptionReader;
+use wardnet_common::ports::{SubscriptionCommands, SubscriptionReader};
 
+use wardnet_billing::repository::{
+    BillingRepository, CatalogPlan, CatalogPromo, PgBillingRepository,
+};
 use wardnet_subscriptions::{
     PgSubscriptionRepository, SubscriptionRepository, SubscriptionService, TrialPolicy,
 };
@@ -267,4 +272,186 @@ async fn deregister_tombstone_sweep_and_email_reuse_on_postgres() {
     assert!(svc.find_tenant(&first_id).await.unwrap().is_none());
     // The live re-signup tenant is untouched.
     assert!(svc.find_tenant(&second_id).await.unwrap().is_some());
+}
+
+/// Two Stripe events from the same checkout (e.g. `customer.subscription.created`
+/// and `.updated`) can reach `billing::apply_upsert` together: both read the tenant
+/// as still `trialing` and both drive the trial→paid conversion. The conversion must
+/// be concurrency-safe — exactly one live row, no `uq_subscriptions_live` violation.
+/// Regression guard for the webhook 500 observed in the real-Stripe e2e (the losing
+/// event's second live-row INSERT collided on the partial unique index).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL"]
+async fn concurrent_trial_conversion_keeps_one_live_row() {
+    let pools = test_pool().await;
+    let h = harness(pools.clone());
+
+    // Signup → enroll → the subscription reactor opens the trial.
+    let (_key, cnf) = daemon_keypair(11);
+    let code = h
+        .tenants()
+        .issue_signup_code("race@example.com", "1.2.3.4", CodePurpose::Enrollment)
+        .await
+        .unwrap();
+    let tenant_id = h.tenants().enroll(&code, &cnf).await.unwrap().tenant_id;
+    h.pump().await;
+
+    // Deterministically stage the exact race two racing checkout webhooks produce:
+    // event A has begun converting and holds the trial row lock, but has not yet
+    // committed its paid row. Open A's transaction by hand and cancel the trial (taking
+    // the row lock) without committing.
+    let mut tx_a = pools.write.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE subscriptions SET status = 'canceled', updated_at = now() \
+         WHERE tenant_id = $1 AND status <> 'canceled'",
+    )
+    .bind(&tenant_id)
+    .execute(&mut *tx_a)
+    .await
+    .unwrap();
+
+    // Event B is the real method under test. Its cancel-UPDATE blocks on A's row lock,
+    // pinning B's snapshot *before* A's paid row exists — the window that produced the
+    // e2e 500. Spawn it, then wait until it is genuinely blocked on the lock.
+    let b = Arc::clone(&h.subscriptions);
+    let tb = tenant_id.clone();
+    let handle = tokio::spawn(async move {
+        b.convert_trial_to_paid(
+            &tb,
+            SubscriptionStatus::Active,
+            Entitlement {
+                max_networks: 1,
+                max_daemons: 2,
+            },
+            Some(Utc::now() + Duration::days(30)),
+        )
+        .await
+    });
+    // Poll (on a separate connection) until B's UPDATE is waiting on the row lock.
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE wait_event_type = 'Lock' AND query ILIKE '%subscriptions%'",
+        )
+        .fetch_one(&pools.read)
+        .await
+        .unwrap();
+        if waiting >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // A finishes: insert its paid row and commit, releasing the lock. B now unblocks
+    // with a stale snapshot and, on the buggy blind INSERT, collides on
+    // `uq_subscriptions_live`.
+    sqlx::query(
+        "INSERT INTO subscriptions \
+         (id, tenant_id, status, entitlement, trial_expires_at, current_period_end, created_at, updated_at) \
+         VALUES ($1, $2, 'active', '{\"max_networks\":1,\"max_daemons\":1}'::jsonb, NULL, now(), now(), now())",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&tenant_id)
+    .execute(&mut *tx_a)
+    .await
+    .unwrap();
+    tx_a.commit().await.unwrap();
+
+    let rb = handle.await.unwrap();
+    assert!(
+        rb.is_ok(),
+        "the racing conversion must not violate uq_subscriptions_live: {rb:?}"
+    );
+
+    // Exactly one live row remains, and it is a paid (Active) subscription.
+    let live = h
+        .subscriptions
+        .current(&tenant_id)
+        .await
+        .unwrap()
+        .expect("a live subscription must remain");
+    assert_eq!(live.status, SubscriptionStatus::Active);
+}
+
+/// Round-trip the `PgBillingRepository` — the idempotency ledger, the catalog projection
+/// replace/read, and the customer/subscription reference reads — against real Postgres.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn billing_repository_round_trips_on_postgres() {
+    let pools = test_pool().await;
+    let h = harness(pools.clone());
+    // A real tenant for the billing_customers foreign key.
+    let (_key, cnf) = daemon_keypair(11);
+    let code = h
+        .tenants()
+        .issue_signup_code("bill@example.com", "1.2.3.4", CodePurpose::Enrollment)
+        .await
+        .unwrap();
+    let tenant_id = h.tenants().enroll(&code, &cnf).await.unwrap().tenant_id;
+
+    let repo = PgBillingRepository::new_pools(pools);
+
+    // Idempotency ledger.
+    assert!(!repo.is_event_processed("evt_1").await.unwrap());
+    repo.record_event("evt_1", Utc::now()).await.unwrap();
+    assert!(repo.is_event_processed("evt_1").await.unwrap());
+
+    // Catalog projection: replace then read back.
+    let plan = CatalogPlan {
+        price_id: "price_1".to_string(),
+        product_id: "prod_1".to_string(),
+        name: "Home".to_string(),
+        level: 1,
+        entitlement: Entitlement {
+            max_networks: 1,
+            max_daemons: 1,
+        },
+        amount_cents: 370,
+        currency: "usd".to_string(),
+        interval: "month".to_string(),
+    };
+    let promo = CatalogPromo {
+        coupon_id: "co_1".to_string(),
+        name: "Founders".to_string(),
+        percent_off: Some(25.0),
+        amount_off: None,
+        currency: Some("usd".to_string()),
+        applies_to_products: vec!["prod_1".to_string()],
+        start: Some(Utc::now() - Duration::days(1)),
+        redeem_by: Some(Utc::now() + Duration::days(1)),
+    };
+    repo.replace_catalog(&[plan], &[promo], Utc::now())
+        .await
+        .unwrap();
+    let snap = repo.read_catalog().await.unwrap();
+    assert_eq!(snap.plans.len(), 1);
+    assert_eq!(snap.plans[0].price_id, "price_1");
+    assert_eq!(snap.promos.len(), 1);
+
+    // Customer + subscription references.
+    repo.upsert_customer(&tenant_id, "cus_1").await.unwrap();
+    assert_eq!(
+        repo.customer_id(&tenant_id).await.unwrap().as_deref(),
+        Some("cus_1")
+    );
+    repo.upsert_subscription(&tenant_id, "cus_1", "sub_1", Some("price_1"))
+        .await
+        .unwrap();
+    let bref = repo.billing_ref(&tenant_id).await.unwrap().unwrap();
+    assert_eq!(bref.stripe_subscription_id.as_deref(), Some("sub_1"));
+    assert_eq!(bref.price_id.as_deref(), Some("price_1"));
+    assert_eq!(
+        repo.tenant_for_subscription("sub_1")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(tenant_id.as_str())
+    );
+    assert_eq!(
+        repo.subscription_for_customer("cus_1")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("sub_1")
+    );
 }
