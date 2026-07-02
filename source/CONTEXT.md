@@ -66,6 +66,15 @@ details. (See `docs/adr/` for the decisions behind these.)
 - **Daemon** — a device bound to a network, holding its own Ed25519 keypair. A
   network may have many daemons (active/active); each authenticates and is issued
   tokens independently.
+- **Daemon self-removal** — a daemon deleting **only its own** row from its network on
+  teardown (uninstall / factory-reset / re-enrollment), via
+  `DELETE /v1/networks/{id}/daemons/self` (network-scoped daemon JWT + PoP). The
+  row-level effect is idempotent — removing an already-absent daemon still returns
+  `204` — though each retry must be freshly re-signed (a byte-identical PoP replay is
+  rejected). Unlike [Deregister](#deregister) it never tombstones the tenant,
+  cancels the subscription, or tears down the network's DNS — those belong to the
+  network and survive one device leaving. Distinct from the whole-network delete
+  (`DELETE /v1/tenants/{id}/networks/{slug}`, which cascades **all** daemons + DNS).
 - **Vanity / slug** — the network's public name (`<slug>.<zone>`); globally unique.
 - **Entitlement** — the limits a [subscription](#subscription)'s plan grants: at
   minimum `max_networks` and `max_daemons`. Default for the free trial: 1 / 1.

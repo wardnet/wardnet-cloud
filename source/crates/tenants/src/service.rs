@@ -340,6 +340,29 @@ impl TenantsService {
         Ok(())
     }
 
+    /// Daemon self-removal: delete only the calling daemon's row (`public_key`) from
+    /// `network_id` on teardown. Unlike [`delete_network`](Self::delete_network) this
+    /// never deprovisions the network, cancels a subscription, or tears down DNS —
+    /// those are network-scoped and survive one daemon leaving. Idempotent: a missing
+    /// row (retried teardown, already reaped) is a success.
+    ///
+    /// Note: removing the row does not proactively revoke the daemon's already-issued
+    /// network-scoped JWT or abort a live tunnel — ddns/tunneller authorize on the
+    /// token's `net` claim, and `mint_jwt` is the only path that re-checks the row. The
+    /// daemon's data-plane reach therefore lapses only when its short-TTL token expires
+    /// (in the real teardown flow the process exits and its tunnel closes immediately).
+    ///
+    /// # Errors
+    /// [`TenantsError`] if the underlying delete fails.
+    pub async fn remove_daemon(
+        &self,
+        public_key: &str,
+        network_id: &str,
+    ) -> Result<(), TenantsError> {
+        self.daemons.remove(public_key, network_id).await?;
+        Ok(())
+    }
+
     // ── Enrollment plane (codes + enroll + JWT) ──────────────────────────────────
 
     /// Issue a new-signup one-time code for `email` (public, rate-limited) and email

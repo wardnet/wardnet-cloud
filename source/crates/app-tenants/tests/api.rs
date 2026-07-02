@@ -7,10 +7,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::connect_info::ConnectInfo;
 use axum::http::{Request, StatusCode, header};
-use base64::Engine as _;
-use ed25519_dalek::{Signer as _, SigningKey};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 use wardnet_billing::gateway::{
@@ -20,49 +17,17 @@ use wardnet_billing::repository::{BillingRepository, CatalogPlan};
 use wardnet_common::contract::{
     Entitlement, InvoiceStatus, InvoiceView, PaymentMethodView, SubscriptionStatus,
 };
-use wardnet_common::token::{ClaimsSpec, PrincipalType, canonical_request_payload};
+use wardnet_common::token::{ClaimsSpec, PrincipalType};
 use wardnet_tenants::api;
 use wardnet_tenants::repository::tenant::Tenant;
 mod common;
-use common::{build_harness, build_state, daemon_keypair, test_signer};
+use common::{build_harness, build_state, daemon_keypair, daemon_request, now_ts, test_signer};
 
 const SEED: u8 = 5;
-
-fn now() -> i64 {
-    chrono::Utc::now().timestamp()
-}
 
 fn app() -> Router {
     let (state, _store) = build_state(SEED);
     api::router(state)
-}
-
-fn sign(key: &SigningKey, method: &str, path_and_query: &str, ts: i64, body: &[u8]) -> String {
-    let hash = hex::encode(Sha256::digest(body));
-    let payload = canonical_request_payload(method, path_and_query, ts, &hash);
-    base64::engine::general_purpose::STANDARD.encode(key.sign(payload.as_bytes()).to_bytes())
-}
-
-/// A daemon-signed request with optional bearer JWT.
-fn daemon_request(
-    method: &str,
-    path: &str,
-    body: &[u8],
-    key: &SigningKey,
-    bearer: Option<&str>,
-) -> Request<Body> {
-    let ts = now();
-    let sig = sign(key, method, path, ts, body);
-    let mut builder = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("content-type", "application/json")
-        .header("X-Wardnet-Timestamp", ts.to_string())
-        .header("X-Wardnet-Signature", sig);
-    if let Some(token) = bearer {
-        builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
-    }
-    builder.body(Body::from(body.to_vec())).unwrap()
 }
 
 fn user_token(tenant_id: &str) -> String {
@@ -76,7 +41,7 @@ fn user_token(tenant_id: &str) -> String {
                 cnf_ed25519_b64: None,
                 audience: vec!["tenants"],
             },
-            now(),
+            now_ts(),
             300,
         )
         .unwrap()

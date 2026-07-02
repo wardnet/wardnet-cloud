@@ -10,6 +10,7 @@ mod auth;
 mod availability;
 mod billing;
 mod cookies;
+pub mod daemons;
 mod enroll;
 mod me;
 pub mod network;
@@ -67,11 +68,12 @@ pub fn router(state: AppState) -> Router {
         }),
     );
 
-    // Register-network is daemon-only.
-    let daemon = networks::register(OpenApiRouter::new()).route_layer(from_fn_with_state(
-        state.clone(),
-        |st: State<AppState>, r, n| authenticate(CallerType::DAEMON, st, r, n),
-    ));
+    // Register-network and daemon self-removal are daemon-only.
+    let daemon = daemons::register(networks::register(OpenApiRouter::new())).route_layer(
+        from_fn_with_state(state.clone(), |st: State<AppState>, r, n| {
+            authenticate(CallerType::DAEMON, st, r, n)
+        }),
+    );
 
     // The account plane is user-only (incl. the `/v1/me/*` security endpoints).
     let user = me::register(tenants::register(OpenApiRouter::new())).route_layer(
