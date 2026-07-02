@@ -56,6 +56,13 @@ pub struct Config {
     /// Interval (seconds) between subscription-reaper + reconcile passes. Default 3600.
     pub sub_reaper_interval_secs: u64,
 
+    /// Interval (seconds) between plan-catalog projection syncs from Stripe (the periodic
+    /// backstop; a catalog webhook resyncs sooner). Default 18000 (5h).
+    pub catalog_sync_interval_secs: u64,
+    /// How old (seconds) the catalog projection may be before `GET /v1/plans` refuses to
+    /// serve it (503). Default 432000 (5 days).
+    pub catalog_stale_secs: i64,
+
     /// Stripe secret API key (inforge-injected, like the DSN). Redacted in `Debug`.
     pub stripe_secret_key: String,
     /// Stripe webhook signing secret — the credential the webhook endpoint verifies.
@@ -70,6 +77,9 @@ pub struct Config {
     pub resend_api_key: Option<String>,
     /// The verified `from` address for enrollment-code emails.
     pub email_from: String,
+    /// Absolute URL of the brand logo to render in HTML emails. Empty falls back to
+    /// a CSS wordmark (so emails work before a logo is hosted).
+    pub email_logo_url: String,
 
     // ── Human/web auth (WS-F, ADR-0009) ──────────────────────────────────────────
     /// Symmetric key for the encrypted/signed cookie jar (`axum-extra` private jar);
@@ -109,6 +119,11 @@ impl std::fmt::Debug for Config {
             .field("trial_grace_days", &self.trial_grace_days)
             .field("payment_grace_days", &self.payment_grace_days)
             .field("sub_reaper_interval_secs", &self.sub_reaper_interval_secs)
+            .field(
+                "catalog_sync_interval_secs",
+                &self.catalog_sync_interval_secs,
+            )
+            .field("catalog_stale_secs", &self.catalog_stale_secs)
             .field("stripe_secret_key", &"<redacted>")
             .field("stripe_webhook_secret", &"<redacted>")
             .field("account_base_url", &self.account_base_url)
@@ -117,6 +132,7 @@ impl std::fmt::Debug for Config {
                 &self.resend_api_key.as_ref().map(|_| "<redacted>"),
             )
             .field("email_from", &self.email_from)
+            .field("email_logo_url", &self.email_logo_url)
             .field("cookie_key", &"<redacted>")
             .field("user_jwt_ttl_secs", &self.user_jwt_ttl_secs)
             .field("oauth_redirect_base", &self.oauth_redirect_base)
@@ -187,6 +203,14 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3600),
+            catalog_sync_interval_secs: std::env::var("CATALOG_SYNC_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(18000),
+            catalog_stale_secs: std::env::var("CATALOG_STALE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(432_000),
             stripe_secret_key: required("STRIPE_SECRET_KEY")?,
             stripe_webhook_secret: required("STRIPE_WEBHOOK_SECRET")?,
             resend_api_key: std::env::var("RESEND_API_KEY")
@@ -194,6 +218,7 @@ impl Config {
                 .filter(|s| !s.is_empty()),
             email_from: std::env::var("EMAIL_FROM")
                 .unwrap_or_else(|_| "wardnet <noreply@wardnet.io>".to_string()),
+            email_logo_url: opt("EMAIL_LOGO_URL").unwrap_or_default(),
             cookie_key,
             user_jwt_ttl_secs: std::env::var("USER_JWT_TTL_SECS")
                 .ok()
@@ -209,3 +234,6 @@ impl Config {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -29,14 +29,19 @@
 //! - **metrics** — RED metrics from [`http_metrics`] plus per-service domain
 //!   instruments built off [`opentelemetry::global::meter`].
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use axum::Json;
 use axum::Router;
 use axum::extract::{MatchedPath, Request};
+use axum::http::StatusCode;
 use axum::middleware::{Next, from_fn};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
+
+use crate::error::ErrorBody;
 use base64::Engine as _;
 use opentelemetry::metrics::Histogram;
 use opentelemetry::trace::TracerProvider as _;
@@ -48,6 +53,7 @@ use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -306,16 +312,45 @@ where
 {
     // `.layer()` applies outside-in, so the last layer is outermost on the request
     // path: TraceLayer opens the span, `extract_trace_context` adopts any
-    // propagated parent, then `http_metrics` records RED metrics. All three pass
-    // the `Request` through untouched, preserving the `OnUpgrade` extension the
-    // tunnel WebSocket handshake depends on (invariant #10).
+    // propagated parent, then `http_metrics` records RED metrics, and innermost a
+    // `CatchPanic` guard wraps the handlers. A handler panic is therefore turned
+    // into a 500 (never unwinding to kill the connection/listener) *inside* the
+    // span and *before* metrics, so the panic is logged with trace context and the
+    // 500 is counted. All layers pass the `Request` through untouched, preserving
+    // the `OnUpgrade` extension the tunnel WebSocket handshake depends on (#10).
     router
+        .layer(CatchPanicLayer::custom(handle_panic))
         .layer(from_fn(http_metrics))
         .layer(from_fn(extract_trace_context))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO)),
         )
+}
+
+/// Convert a caught handler panic into a logged `500` response. A panic must never
+/// escape a handler: unguarded it unwinds the hyper connection task and can leave
+/// shared state poisoned, taking the whole listener down. Here it is logged at
+/// ERROR (the only signal a panic would otherwise produce — `ApiError` 5xx are
+/// logged in `error.rs`, but a panic bypasses that path entirely) and answered
+/// with the standard `ErrorBody`.
+// The by-value `Box` is dictated by tower-http's `ResponseForPanic`; a reference
+// would not satisfy the trait.
+#[allow(clippy::needless_pass_by_value)]
+fn handle_panic(err: Box<dyn Any + Send + 'static>) -> Response {
+    let detail = err
+        .downcast_ref::<&'static str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| err.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_owned());
+    tracing::error!(panic = %detail, "handler panicked; returning 500");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorBody {
+            error: "internal server error".to_owned(),
+        }),
+    )
+        .into_response()
 }
 
 /// The RED request-duration histogram, built once on first use. Boundaries are

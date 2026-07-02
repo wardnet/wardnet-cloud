@@ -8,15 +8,17 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use wardnet_common::auth::{AuthCaller, Caller};
 use wardnet_common::contract::{
-    BillingPortalResponse, CheckoutSessionResponse, CodeResponse, CreateCheckoutSessionRequest,
-    DaemonView, InvoiceView, MeView, NetworkView, PaymentMethodView, SubscriptionView, TenantView,
-    UpdateTenantRequest,
+    BillingSubscriptionView, ChangePlanRequest, ChangePlanResponse, CheckoutSessionResponse,
+    CodeResponse, CreateCheckoutSessionRequest, DaemonView, InvoiceView, MeView, NetworkView,
+    PaymentMethodView, PromoUnavailableBody, SubscriptionView, TenantView, UpdateTenantRequest,
 };
+use wardnet_common::ports::BillingError;
 
 use crate::error::ApiError;
 use crate::repository::{Daemon, Tenant};
@@ -33,9 +35,32 @@ pub fn register(router: OpenApiRouter<AppState>) -> OpenApiRouter<AppState> {
         .routes(routes!(update_tenant, delete_tenant))
         .routes(routes!(delete_network))
         .routes(routes!(create_checkout_session))
-        .routes(routes!(billing_portal))
+        .routes(routes!(change_plan))
+        .routes(routes!(start_card_update))
+        .routes(routes!(get_billing_subscription))
         .routes(routes!(get_payment_method))
         .routes(routes!(list_invoices))
+}
+
+/// Map a `BillingError` to a response, rendering a `PromoUnavailable` as a structured
+/// `409` (with the real price for the SPA to re-confirm) and everything else through the
+/// standard `ApiError` mapping.
+fn billing_err_response(e: BillingError) -> Response {
+    match e {
+        BillingError::PromoUnavailable {
+            actual_amount_cents,
+            currency,
+        } => (
+            StatusCode::CONFLICT,
+            Json(PromoUnavailableBody {
+                error: "promo_unavailable".to_string(),
+                actual_amount_cents,
+                currency,
+            }),
+        )
+            .into_response(),
+        other => ApiError::from(other).into_response(),
+    }
 }
 
 // ── Domain → contract conversions (orphan rule OK: the domain type is local) ───
@@ -260,10 +285,13 @@ async fn delete_tenant(
 
 #[utoipa::path(
     post, path = "/v1/tenants/{id}/billing/checkout-session", tag = "tenants",
-    description = "Start a Stripe Checkout for a plan; returns the URL to redirect to.",
+    description = "Start a Stripe Checkout for a plan; returns the URL to redirect to. \
+                   Auto-applies the live promo unless accept_full_price re-confirms.",
     request_body = CreateCheckoutSessionRequest,
     responses(
         (status = 200, description = "Checkout session created", body = CheckoutSessionResponse),
+        (status = 409, description = "A displayed promo lapsed; re-confirm at full price",
+            body = PromoUnavailableBody),
         (status = 401, description = "Unauthenticated"),
         (status = 403, description = "Not your tenant"),
         (status = 404, description = "No such tenant"),
@@ -274,7 +302,7 @@ async fn create_checkout_session(
     AuthCaller(caller): AuthCaller,
     Path(id): Path<String>,
     Json(body): Json<CreateCheckoutSessionRequest>,
-) -> Result<Json<CheckoutSessionResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     require_owner(&caller, &id)?;
     // Cross-aggregate orchestration: read the tenant email here, then drive Billing
     // through its port (Billing never depends on the tenant aggregate).
@@ -283,31 +311,85 @@ async fn create_checkout_session(
         .find_tenant(&id)
         .await?
         .ok_or_else(|| ApiError::NotFound("no such tenant".to_string()))?;
-    let url = state
+    match state
         .billing()
-        .start_checkout(&id, &tenant.email, &body.price_id)
-        .await?;
-    Ok(Json(CheckoutSessionResponse { url }))
+        .start_checkout(&id, &tenant.email, &body.price_id, body.accept_full_price)
+        .await
+    {
+        Ok(url) => Ok(Json(CheckoutSessionResponse { url }).into_response()),
+        Err(e) => Ok(billing_err_response(e)),
+    }
 }
 
 #[utoipa::path(
-    post, path = "/v1/tenants/{id}/billing/portal", tag = "tenants",
-    description = "Create a Stripe Billing Portal session; returns the URL to redirect to.",
+    post, path = "/v1/tenants/{id}/billing/change-plan", tag = "tenants",
+    description = "Change an already-paid subscription's plan. Upgrade is immediate; \
+                   downgrade is scheduled for the period end. Entitlement lands via webhook.",
+    request_body = ChangePlanRequest,
     responses(
-        (status = 200, description = "Portal session created", body = BillingPortalResponse),
+        (status = 202, description = "Change applied/scheduled", body = ChangePlanResponse),
+        (status = 400, description = "No paid subscription, unknown plan, or no-op change"),
+        (status = 409, description = "A displayed promo lapsed; re-confirm at full price",
+            body = PromoUnavailableBody),
+        (status = 401, description = "Unauthenticated"),
+        (status = 403, description = "Not your tenant"),
+    ),
+)]
+async fn change_plan(
+    State(state): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+    Path(id): Path<String>,
+    Json(body): Json<ChangePlanRequest>,
+) -> Result<Response, ApiError> {
+    require_owner(&caller, &id)?;
+    match state
+        .billing()
+        .change_plan(&id, &body.price_id, body.accept_full_price)
+        .await
+    {
+        Ok(resp) => Ok((StatusCode::ACCEPTED, Json(resp)).into_response()),
+        Err(e) => Ok(billing_err_response(e)),
+    }
+}
+
+#[utoipa::path(
+    post, path = "/v1/tenants/{id}/billing/card-update", tag = "tenants",
+    description = "Start a Stripe setup-mode Checkout to add/replace the card (no purchase); \
+                   returns the URL to redirect to.",
+    responses(
+        (status = 200, description = "Setup session created", body = CheckoutSessionResponse),
         (status = 400, description = "Tenant has no billing account yet"),
         (status = 401, description = "Unauthenticated"),
         (status = 403, description = "Not your tenant"),
     ),
 )]
-async fn billing_portal(
+async fn start_card_update(
     State(state): State<AppState>,
     AuthCaller(caller): AuthCaller,
     Path(id): Path<String>,
-) -> Result<Json<BillingPortalResponse>, ApiError> {
+) -> Result<Json<CheckoutSessionResponse>, ApiError> {
     require_owner(&caller, &id)?;
-    let url = state.billing().billing_portal(&id).await?;
-    Ok(Json(BillingPortalResponse { url }))
+    let url = state.billing().start_card_update(&id).await?;
+    Ok(Json(CheckoutSessionResponse { url }))
+}
+
+#[utoipa::path(
+    get, path = "/v1/tenants/{id}/billing/subscription", tag = "tenants",
+    description = "Provider (Billing) view of the subscription: current Stripe price + any \
+                   pending scheduled downgrade. Composed by the SPA with /v1/me.",
+    responses(
+        (status = 200, description = "Billing subscription view", body = BillingSubscriptionView),
+        (status = 401, description = "Unauthenticated"),
+        (status = 403, description = "Not your tenant"),
+    ),
+)]
+async fn get_billing_subscription(
+    State(state): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+    Path(id): Path<String>,
+) -> Result<Json<BillingSubscriptionView>, ApiError> {
+    require_owner(&caller, &id)?;
+    Ok(Json(state.billing().billing_subscription(&id).await?))
 }
 
 #[utoipa::path(

@@ -1,0 +1,39 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  background: var(--bg);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: inherit;
+}
+
+/* The DS typography classes set size/weight/leading but not margins, and there is
+   no Tailwind preflight in this consumer — so headings and paragraphs would keep
+   their large UA block margins. Spacing here is owned by layout (flex/grid gaps),
+   so drop the default margins to avoid dead space (e.g. between a page title and
+   its subtitle). */
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+p {
+  margin: 0;
+}

@@ -11,9 +11,9 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use wardnet_common::auth::{AuthCaller, Caller, UserCaller};
-use wardnet_common::contract::ConnectedIdentityView;
+use wardnet_common::contract::{ConnectedIdentityView, SetPasswordRequest};
 
-use super::cookies::{SESSION_COOKIE, cleared};
+use super::cookies::{SESSION_COOKIE, cleared, session_cookie};
 use crate::error::ApiError;
 use crate::repository::identity::TenantIdentity;
 use crate::state::AppState;
@@ -24,6 +24,7 @@ pub fn register(router: OpenApiRouter<AppState>) -> OpenApiRouter<AppState> {
         .routes(routes!(list_identities))
         .routes(routes!(unlink_identity))
         .routes(routes!(signout_all))
+        .routes(routes!(set_password))
 }
 
 /// Require a `USER` caller (the `/v1/me/*` plane is human-only). The route layer already
@@ -107,4 +108,31 @@ async fn signout_all(
     let user = require_user(&caller)?;
     state.identities().logout_all(&user.tenant_id).await?;
     Ok((jar.remove(cleared(SESSION_COOKIE)), StatusCode::NO_CONTENT))
+}
+
+#[utoipa::path(
+    post, path = "/v1/me/password", tag = "tenants",
+    description = "Set or change the caller's password, proven by a fresh one-time email \
+        code for the caller's own account email. Revokes every existing session (evicting \
+        other devices) and issues a new session cookie for this browser, so the caller \
+        stays signed in.",
+    request_body = SetPasswordRequest,
+    responses(
+        (status = 204, description = "Password set; a fresh session cookie is issued"),
+        (status = 400, description = "Weak password"),
+        (status = 401, description = "Unauthenticated, or a bad/expired/mismatched code"),
+    ),
+)]
+async fn set_password(
+    State(state): State<AppState>,
+    AuthCaller(caller): AuthCaller,
+    jar: PrivateCookieJar,
+    Json(body): Json<SetPasswordRequest>,
+) -> Result<(PrivateCookieJar, StatusCode), ApiError> {
+    let user = require_user(&caller)?;
+    let token = state
+        .identities()
+        .set_password_authenticated(&user.tenant_id, &body.code, &body.password)
+        .await?;
+    Ok((jar.add(session_cookie(token)), StatusCode::NO_CONTENT))
 }

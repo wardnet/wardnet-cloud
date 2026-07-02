@@ -35,6 +35,9 @@ pub enum ApiError {
     #[error("too many requests: {0}")]
     TooManyRequests(String),
 
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
+
     #[error("internal server error")]
     Internal(#[from] anyhow::Error),
 }
@@ -53,11 +56,19 @@ impl IntoResponse for ApiError {
             ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m.as_str()),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.as_str()),
             ApiError::TooManyRequests(m) => (StatusCode::TOO_MANY_REQUESTS, m.as_str()),
+            ApiError::ServiceUnavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m.as_str()),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal server error"),
         };
 
-        if let ApiError::Internal(err) = &self {
-            tracing::error!(error = %err, "unhandled internal error");
+        // Every error is logged: server faults (5xx) at ERROR so they are never
+        // silent; client errors (4xx) at DEBUG so they are traceable without noise.
+        match &self {
+            ApiError::Internal(err) => {
+                tracing::error!(status = status.as_u16(), error = %err, "request failed (internal error)");
+            }
+            client_err => {
+                tracing::debug!(status = status.as_u16(), error = %client_err, "request rejected");
+            }
         }
 
         (

@@ -20,6 +20,7 @@ async fn resend_posts_the_code_with_auth() {
     let sender = ResendEmailSender::with_base_url(
         "re_test_key",
         "wardnet <noreply@wardnet.io>",
+        "",
         &server.uri(),
     )
     .unwrap();
@@ -38,10 +39,12 @@ async fn resend_posts_the_code_with_auth() {
     assert_eq!(received.len(), 1);
     let body: serde_json::Value = received[0].body_json().unwrap();
     assert_eq!(body["to"][0], "user@example.com");
+    // Both the plain-text fallback and the branded HTML carry the code.
     assert!(body["text"].as_str().unwrap().contains("abcdef123456"));
+    assert!(body["html"].as_str().unwrap().contains("abcdef123456"));
     // The subject/body match the purpose (a reset code is not labelled "enrollment").
-    assert_eq!(body["subject"], "Your wardnet password-reset code");
-    assert!(body["text"].as_str().unwrap().contains("password-reset"));
+    assert_eq!(body["subject"], "Your Wardnet password-reset code");
+    assert!(body["text"].as_str().unwrap().contains("new password"));
 }
 
 #[tokio::test]
@@ -55,11 +58,49 @@ async fn resend_surfaces_provider_errors() {
         .mount(&server)
         .await;
 
-    let sender = ResendEmailSender::with_base_url("re_x", "from@x.io", &server.uri()).unwrap();
+    let sender = ResendEmailSender::with_base_url("re_x", "from@x.io", "", &server.uri()).unwrap();
     assert!(
         sender
             .send_code("u@e.com", "code", CodePurpose::Enrollment)
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn resend_labels_signup_and_password_change_distinctly() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/emails"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "e"})))
+        .mount(&server)
+        .await;
+
+    // A non-empty logo URL exercises the branded-header HTML branch.
+    let sender = ResendEmailSender::with_base_url(
+        "re_x",
+        "from@x.io",
+        "https://logo.test/wardnet.png",
+        &server.uri(),
+    )
+    .unwrap();
+    for purpose in [CodePurpose::Signup, CodePurpose::PasswordChange] {
+        sender
+            .send_code("u@e.com", "code123", purpose)
+            .await
+            .unwrap();
+    }
+
+    let received = server.received_requests().await.unwrap();
+    let subjects: Vec<String> = received
+        .iter()
+        .map(|r| {
+            r.body_json::<serde_json::Value>().unwrap()["subject"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert!(subjects.iter().any(|s| s.contains("sign-up")));
+    assert!(subjects.iter().any(|s| s.contains("password change")));
 }

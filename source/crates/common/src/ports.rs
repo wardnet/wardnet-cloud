@@ -24,7 +24,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use crate::contract::{
-    Entitlement, InvoiceView, PaymentMethodView, SubscriptionStatus, SubscriptionView,
+    BillingSubscriptionView, ChangePlanResponse, Entitlement, InvoiceView, PaymentMethodView,
+    PlanView, SubscriptionStatus, SubscriptionView,
 };
 use crate::error::ApiError;
 
@@ -102,15 +103,45 @@ pub trait SubscriptionCommands: Send + Sync {
     async fn cancel(&self, tenant_id: &str) -> anyhow::Result<()>;
 }
 
-/// Error surfaced by the [`BillingPort`]. HTTP-agnostic but distinguishes a
-/// client-fixable request (bad webhook signature, no billing account yet) from an
-/// internal failure, so the HTTP shell maps it to the right status.
+/// Read port over the **plan catalog** — the set of purchasable plans + live
+/// promotions. Sourced from Stripe, served from the Billing projection (never a live
+/// Stripe call on the hot path). Implemented by `BillingService`; consumed by the public
+/// `GET /v1/plans` handler.
+#[async_trait]
+pub trait PlanCatalog: Send + Sync {
+    /// The purchasable plans, ascending by [`level`](crate::contract::PlanView::level),
+    /// each carrying any live promotion's discounted price (computed against the current
+    /// clock at call time).
+    ///
+    /// # Errors
+    /// [`BillingError::Internal`] on a repository failure, or [`BillingError::Stale`]
+    /// when the projection is older than the hard staleness bound (→ `503`).
+    async fn plans(&self) -> Result<Vec<PlanView>, BillingError>;
+}
+
+/// Error surfaced by the [`BillingPort`] / [`PlanCatalog`]. HTTP-agnostic but
+/// distinguishes the client-fixable / display cases from an internal failure, so the
+/// HTTP shell maps each to the right status.
 #[derive(Debug, thiserror::Error)]
 pub enum BillingError {
-    /// The request itself is bad — an unverifiable webhook signature, or a portal
-    /// request for a tenant with no billing account. Maps to `400`.
+    /// The request itself is bad — an unverifiable webhook signature, a change-plan on a
+    /// tenant with no paid subscription, or an unknown target plan. Maps to `400`.
     #[error("{0}")]
     InvalidRequest(String),
+    /// A displayed auto-promo had lapsed by the time it was applied (the provider
+    /// rejected the coupon). Carries the real price so the caller can re-confirm at full
+    /// price. Maps to `409` ([`PromoUnavailableBody`](crate::contract::PromoUnavailableBody)).
+    #[error("promotion no longer available")]
+    PromoUnavailable {
+        /// The plan's full price in the currency's minor units.
+        actual_amount_cents: i64,
+        /// ISO-4217 currency code, lowercase.
+        currency: String,
+    },
+    /// The catalog projection is too stale to trust (the sync worker has not refreshed it
+    /// within the hard bound). Maps to `503` — we never serve ancient pricing.
+    #[error("plan catalog temporarily unavailable")]
+    Stale,
     /// A provider/repository failure. Maps to `500`.
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
@@ -120,6 +151,15 @@ impl From<BillingError> for ApiError {
     fn from(e: BillingError) -> Self {
         match e {
             BillingError::InvalidRequest(m) => ApiError::BadRequest(m),
+            // PromoUnavailable carries structured data the SPA needs; the change-plan /
+            // checkout handlers render it as a 409 directly. Reaching the generic mapping
+            // (it shouldn't) degrades to a 409 with a plain message.
+            BillingError::PromoUnavailable { .. } => {
+                ApiError::Conflict("promotion no longer available".to_string())
+            }
+            BillingError::Stale => {
+                ApiError::ServiceUnavailable("plan catalog temporarily unavailable".to_string())
+            }
             BillingError::Internal(e) => ApiError::Internal(e),
         }
     }
@@ -133,23 +173,56 @@ impl From<BillingError> for ApiError {
 #[async_trait]
 pub trait BillingPort: Send + Sync {
     /// Start a hosted Checkout for `price_id` (reusing the tenant's provider customer
-    /// when known) and return the redirect URL.
+    /// when known) and return the redirect URL. Auto-applies the plan's live promotion
+    /// server-side unless `accept_full_price` is set (the re-confirm after a
+    /// [`PromoUnavailable`](BillingError::PromoUnavailable) prompt).
     ///
     /// # Errors
-    /// [`BillingError::Internal`] on a provider/repository failure.
+    /// [`BillingError::PromoUnavailable`] if a displayed promo lapsed before it could be
+    /// applied; [`BillingError::Internal`] on a provider/repository failure.
     async fn start_checkout(
         &self,
         tenant_id: &str,
         email: &str,
         price_id: &str,
+        accept_full_price: bool,
     ) -> Result<String, BillingError>;
 
-    /// Create a hosted Billing Portal session for the tenant and return its URL.
+    /// Change an **already-paid** tenant's plan to `price_id`. An upgrade (higher
+    /// [`level`](crate::contract::PlanView::level)) applies immediately; a downgrade is
+    /// scheduled for the current period end; re-selecting the current plan cancels any
+    /// pending downgrade. Auto-applies the live promo on an upgrade unless
+    /// `accept_full_price`.
+    ///
+    /// # Errors
+    /// [`BillingError::InvalidRequest`] if the tenant has no paid subscription, or
+    /// `price_id` is unknown / equals the current plan with nothing pending;
+    /// [`BillingError::PromoUnavailable`] if a displayed promo lapsed;
+    /// [`BillingError::Internal`] on a provider/repository failure.
+    async fn change_plan(
+        &self,
+        tenant_id: &str,
+        price_id: &str,
+        accept_full_price: bool,
+    ) -> Result<ChangePlanResponse, BillingError>;
+
+    /// Start a hosted `setup`-mode Checkout to add/replace the tenant's card (no
+    /// purchase) and return its URL. Replaces the removed Customer Portal card-update.
     ///
     /// # Errors
     /// [`BillingError::InvalidRequest`] if the tenant has no billing account yet;
     /// [`BillingError::Internal`] on a provider failure.
-    async fn billing_portal(&self, tenant_id: &str) -> Result<String, BillingError>;
+    async fn start_card_update(&self, tenant_id: &str) -> Result<String, BillingError>;
+
+    /// The provider (Billing) view of the tenant's subscription — its current Stripe
+    /// price and any pending scheduled downgrade — for the account page.
+    ///
+    /// # Errors
+    /// [`BillingError::Internal`] on a provider/repository failure.
+    async fn billing_subscription(
+        &self,
+        tenant_id: &str,
+    ) -> Result<BillingSubscriptionView, BillingError>;
 
     /// Verify a raw provider webhook (the signature is the credential) and apply it
     /// idempotently.

@@ -66,8 +66,13 @@ impl ProvisioningState {
 pub enum CodePurpose {
     /// Web password signup (`POST /v1/auth/password/signup`).
     Signup,
-    /// Web password reset (`POST /v1/auth/password/reset`).
+    /// Web password reset — **unauthenticated** recovery (`POST /v1/auth/password/reset`).
     PasswordReset,
+    /// Web password set/change by an **authenticated** user (`POST /v1/me/password`).
+    /// Separate purpose from [`Self::PasswordReset`] so a recovery code can never be
+    /// consumed by the authenticated change flow (and vice-versa), and so its email
+    /// copy / limits can evolve independently.
+    PasswordChange,
     /// Daemon enrollment (`POST /v1/enroll`).
     Enrollment,
 }
@@ -79,6 +84,7 @@ impl CodePurpose {
         match self {
             CodePurpose::Signup => "signup",
             CodePurpose::PasswordReset => "password_reset",
+            CodePurpose::PasswordChange => "password_change",
             CodePurpose::Enrollment => "enrollment",
         }
     }
@@ -370,6 +376,19 @@ pub struct PasswordResetRequest {
     pub password: String,
 }
 
+/// Request body for `POST /v1/me/password` — an **authenticated** USER sets or changes
+/// their own password. The `code` is a fresh one-time email proof (issued via
+/// `POST /v1/verification-codes {purpose: "password_change"}`) and must be for the
+/// caller's own account email. On success every existing session is revoked and a new
+/// session cookie is issued for the current browser, so the user stays signed in.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SetPasswordRequest {
+    /// One-time email-proof code for the caller's account email.
+    pub code: String,
+    /// Plaintext new password (hashed server-side; never stored or logged).
+    pub password: String,
+}
+
 /// Account profile for the SPA (`GET /v1/me`, auth = `USER`). The full current-user
 /// view: the tenant identity + its current subscription.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -388,20 +407,142 @@ pub struct MeView {
 pub struct CreateCheckoutSessionRequest {
     /// The Stripe Price id of the plan being purchased.
     pub price_id: String,
+    /// Set by the SPA only on the **re-confirm** after a [`PromoUnavailableBody`] 409:
+    /// the customer has acknowledged the (now full) price, so the server skips applying
+    /// any auto-promo and proceeds at the catalog price. Defaults to `false`.
+    #[serde(default)]
+    pub accept_full_price: bool,
 }
 
-/// Response body for the create-checkout-session endpoint.
+/// Response body for the create-checkout-session endpoint. Also returned by the
+/// card-update (setup-mode Checkout) endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CheckoutSessionResponse {
     /// The Stripe-hosted Checkout URL to redirect the user to.
     pub url: String,
 }
 
-/// Response body for the billing-portal endpoint.
+/// One purchasable [plan](`crate::contract`) row for `GET /v1/plans` (newest catalog,
+/// ascending by [`level`](Self::level)). The whole catalog is sourced from Stripe and
+/// served from the Billing projection; this is its public, tenant-agnostic display shape.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct BillingPortalResponse {
-    /// The Stripe-hosted Billing Portal URL to redirect the user to.
-    pub url: String,
+pub struct PlanView {
+    /// The Stripe Price id Checkout / change-plan is created against.
+    pub price_id: String,
+    /// Human-facing plan name (the Stripe product name).
+    pub name: String,
+    /// The unique integer rank that totally orders the catalog (Stripe price metadata
+    /// `level`). Higher = more. Drives the upgrade/downgrade decision.
+    pub level: u32,
+    /// The limits this plan grants (from the price's `max_networks`/`max_daemons` metadata).
+    pub entitlement: Entitlement,
+    /// The plan's list price in the currency's minor units (e.g. cents) — before any promo.
+    pub amount_cents: i64,
+    /// ISO-4217 currency code, lowercase (e.g. `"usd"`).
+    pub currency: String,
+    /// Billing interval as Stripe reports it (`"month"` / `"year"`). Never assumed.
+    pub interval: String,
+    /// A live global promotion for this plan, or `None`. **Display-only** — the discount
+    /// is re-derived and applied server-side at Checkout/upgrade, never trusted from here.
+    pub promo: Option<PromoView>,
+}
+
+/// The display half of a live [promotion](`PlanView::promo`) on a [`PlanView`]. The
+/// discounted amount is computed server-side from the Stripe coupon; the SPA only renders it.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PromoView {
+    /// The post-discount price in the currency's minor units (what the customer pays now).
+    pub amount_cents_after: i64,
+    /// Human-facing label for the promotion (the Stripe coupon name).
+    pub label: String,
+    /// When the promotion's window closes (the Stripe coupon `redeem_by`).
+    pub ends_at: DateTime<Utc>,
+}
+
+/// Request body for `POST /v1/tenants/{id}/billing/change-plan`.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ChangePlanRequest {
+    /// The Stripe Price id of the **target** plan.
+    pub price_id: String,
+    /// Re-confirm flag after a [`PromoUnavailableBody`] 409 (see
+    /// [`CreateCheckoutSessionRequest::accept_full_price`]). Defaults to `false`.
+    #[serde(default)]
+    pub accept_full_price: bool,
+}
+
+/// What a [change-plan](ChangePlanRequest) did. The actual entitlement change lands
+/// asynchronously via the Stripe webhook — this only reports the effect + when it takes hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanChangeEffect {
+    /// Target level > current: applied immediately (proration on the next invoice).
+    Upgraded,
+    /// Target level < current: scheduled to take effect at the current period end.
+    DowngradeScheduled,
+    /// Re-selected the current plan while a downgrade was pending: the pending downgrade
+    /// was released, so the tenant stays on the current plan.
+    DowngradeCanceled,
+}
+
+/// Response body for the change-plan endpoint (`202 Accepted`).
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ChangePlanResponse {
+    /// What happened.
+    pub effect: PlanChangeEffect,
+    /// When the change takes effect — the period end for a scheduled downgrade; `None`
+    /// for an immediate upgrade or a canceled downgrade.
+    pub effective_at: Option<DateTime<Utc>>,
+    /// The Stripe Price the tenant is on *after* this change — the target for an
+    /// immediate upgrade, the unchanged current price for a scheduled/canceled downgrade.
+    /// Lets the SPA reflect the new current plan at once instead of waiting on the async
+    /// webhook that back-fills `billing_customers` (kills the post-upgrade UI lag).
+    pub current_price_id: Option<String>,
+}
+
+/// The provider (Billing) view of a tenant's subscription for the account page —
+/// the bits that live in Billing (Stripe refs), composed by the SPA alongside the
+/// provider-agnostic [`SubscriptionView`]. Response for
+/// `GET /v1/tenants/{id}/billing/subscription`.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BillingSubscriptionView {
+    /// The Stripe Price id the tenant is currently subscribed at, or `None` (no paid
+    /// subscription — trial/canceled). Lets the SPA highlight the current plan in the picker.
+    pub current_price_id: Option<String>,
+    /// A pending scheduled downgrade (read from the Stripe subscription schedule), or
+    /// `None`. Survives reloads so the "downgrades on DATE" banner can re-render.
+    pub pending_change: Option<PendingChangeView>,
+    /// Whether the subscription is still in its Stripe trial (a *trial-preserving* Home
+    /// sub, ADR-0012). The SPA uses this to confirm before an in-app upgrade that would
+    /// end the trial — the account state alone can't tell (a honored trial reads `Active`).
+    pub trialing: bool,
+}
+
+/// A pending scheduled plan change (today only a downgrade), surfaced by
+/// [`BillingSubscriptionView`].
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PendingChangeView {
+    /// The Stripe Price id the subscription will move to at [`effective_at`](Self::effective_at).
+    pub price_id: String,
+    /// The target plan's name (resolved through the catalog projection).
+    pub name: String,
+    /// The target plan's level.
+    pub level: u32,
+    /// When the scheduled change takes effect (the current period end).
+    pub effective_at: DateTime<Utc>,
+}
+
+/// `409` body returned by checkout / change-plan when an auto-promo that was displayed
+/// has lapsed by the time it is applied (Stripe rejects the coupon). The SPA shows the
+/// real price and re-confirms with `accept_full_price = true`. Carries the structured
+/// price so the SPA need not re-fetch the catalog to render the prompt.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PromoUnavailableBody {
+    /// Machine tag for the SPA to branch on (`"promo_unavailable"`).
+    pub error: String,
+    /// The plan's full price in the currency's minor units (no discount).
+    pub actual_amount_cents: i64,
+    /// ISO-4217 currency code, lowercase.
+    pub currency: String,
 }
 
 /// The tenant's default payment-method summary, read back from the provider for

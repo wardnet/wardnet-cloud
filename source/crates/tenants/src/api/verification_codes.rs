@@ -58,7 +58,7 @@ async fn create_verification_code(
                 .request_password_reset(&body.email, &remote_ip)
                 .await?
         }
-        purpose @ (CodePurpose::Signup | CodePurpose::Enrollment) => {
+        purpose @ (CodePurpose::Signup | CodePurpose::Enrollment | CodePurpose::PasswordChange) => {
             state
                 .tenants()
                 .issue_signup_code(&body.email, &remote_ip, purpose)

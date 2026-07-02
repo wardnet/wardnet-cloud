@@ -44,6 +44,7 @@ jobs:
       tenants: ${{ steps.detect.outputs.tenants }}
       ddns: ${{ steps.detect.outputs.ddns }}
       tunneller: ${{ steps.detect.outputs.tunneller }}
+      account-dashboard-app: ${{ steps.detect.outputs.account-dashboard-app }}
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -91,6 +92,16 @@ jobs:
     uses: ./.github/workflows/build-service.yml
     with:
       service: tunneller
+    secrets: inherit
+
+  account-dashboard-app:
+    name: Account dashboard app
+    needs: preflight
+    if: needs.preflight.outputs.account-dashboard-app == 'true' || needs.preflight.outputs.all == 'true'
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/account-dashboard-app.yml
     secrets: inherit
 
   # The mesh e2e harness runs nightly (schedule) + on demand, NOT on every push to

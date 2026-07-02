@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use wardnet_common::config as common_config;
 use wardnet_common::event::{EventBus, InProcessEventBus};
-use wardnet_common::ports::{BillingPort, SubscriptionCommands, SubscriptionReader};
+use wardnet_common::ports::{BillingPort, PlanCatalog, SubscriptionCommands, SubscriptionReader};
 use wardnet_common::{mtls, serve, token};
 
 use wardnet_billing::{BillingRepository, BillingService, PgBillingRepository, StripeClient};
@@ -111,22 +111,35 @@ async fn main() -> anyhow::Result<()> {
     let subscription_reader: Arc<dyn SubscriptionReader> = subscriptions.clone();
     let subscription_commands: Arc<dyn SubscriptionCommands> = subscriptions.clone();
 
-    // The payment aggregate. Drives the license aggregate only through the ports above.
+    // The payment aggregate. Drives the license aggregate only through the ports above,
+    // and is shared as both its command port (`BillingPort`) and its read port
+    // (`PlanCatalog`) — one concrete service, two trait objects. The catalog-sync worker
+    // holds the concrete `Arc` (to call `sync_catalog`) + the resync `Notify` a Stripe
+    // catalog webhook pings.
     let stripe = Arc::new(StripeClient::new(
         &config.stripe_secret_key,
         &config.stripe_webhook_secret,
         &config.account_base_url,
     ));
-    let billing: Arc<dyn BillingPort> = Arc::new(BillingService::new(
+    let catalog_resync = Arc::new(tokio::sync::Notify::new());
+    let billing_service = Arc::new(BillingService::new(
         stripe,
         billing_repo as Arc<dyn BillingRepository>,
         Arc::clone(&subscription_reader),
         Arc::clone(&subscription_commands),
+        Arc::clone(&catalog_resync),
+        config.catalog_stale_secs,
     ));
+    let billing: Arc<dyn BillingPort> = billing_service.clone();
+    let plans: Arc<dyn PlanCatalog> = billing_service.clone();
 
     // Transactional email: Resend when configured, else the dev no-op (logs the code).
     let email: Arc<dyn EmailSender> = if let Some(key) = &config.resend_api_key {
-        Arc::new(ResendEmailSender::new(key, &config.email_from)?)
+        Arc::new(ResendEmailSender::new(
+            key,
+            &config.email_from,
+            &config.email_logo_url,
+        )?)
     } else {
         tracing::warn!("RESEND_API_KEY unset; using the no-op email sender (codes are logged)");
         Arc::new(NoopEmailSender)
@@ -178,6 +191,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&subscription_reader),
         Arc::clone(&subscription_commands),
         Arc::clone(&billing),
+        Arc::clone(&plans),
         Arc::clone(&identities),
         verifier,
     );
@@ -225,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
 
     let sweep_interval = std::time::Duration::from_secs(config.sweep_interval_secs);
     let sub_reaper_interval = std::time::Duration::from_secs(config.sub_reaper_interval_secs);
+    let catalog_sync_interval = std::time::Duration::from_secs(config.catalog_sync_interval_secs);
 
     tokio::select! {
         // Public, nginx-fronted control-plane API (daemon + user JWT, bootstrap).
@@ -246,9 +261,44 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&service),
             sub_reaper_interval,
         ) => {},
+
+        // Catalog projection sync: periodic refresh + a webhook-pinged resync (ADR-0011).
+        () = catalog_sync_loop(
+            Arc::clone(&billing_service),
+            catalog_resync,
+            catalog_sync_interval,
+        ) => {},
     }
 
     Ok(())
+}
+
+/// Keep the plan-catalog projection in sync with Stripe: resync on each interval tick
+/// **and** whenever a Stripe catalog webhook pings `resync` (the webhook handler signals
+/// it; this loop is the only place that calls Stripe for the catalog). One sync runs at
+/// boot so a fresh replica has a catalog immediately. Errors are logged and the loop
+/// continues — the next tick / ping retries (the staleness guard refuses a too-old
+/// catalog independently).
+async fn catalog_sync_loop(
+    billing: Arc<BillingService>,
+    resync: Arc<tokio::sync::Notify>,
+    interval: std::time::Duration,
+) {
+    let mut tick = tokio::time::interval(interval);
+    // `interval`'s first tick fires immediately; consume it so the boot sync below isn't
+    // immediately followed by a second one.
+    tick.tick().await;
+    loop {
+        if let Err(e) = billing.sync_catalog().await {
+            tracing::error!(error = %e, "catalog sync failed");
+        }
+        tokio::select! {
+            _ = tick.tick() => {},
+            () = resync.notified() => {
+                tracing::info!("catalog resync triggered by Stripe webhook");
+            },
+        }
+    }
 }
 
 /// Build the configured federated login providers (WS-F). Each provider is enabled

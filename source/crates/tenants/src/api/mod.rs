@@ -14,6 +14,7 @@ mod enroll;
 mod me;
 pub mod network;
 pub mod networks;
+mod plans;
 pub mod reconcile;
 pub mod tenant;
 pub mod tenants;
@@ -53,8 +54,10 @@ pub fn router(state: AppState) -> Router {
     // Bootstrap: health + credential-minting endpoints + the Stripe webhook + the
     // web-auth surface. No auth middleware — each verifies its own one-time code / key
     // PoP / Stripe signature / session cookie / OAuth state.
-    let bootstrap = auth::register(billing::register(verification_codes::register(
-        token::register(enroll::register(health::register(OpenApiRouter::new()))),
+    let bootstrap = plans::register(auth::register(billing::register(
+        verification_codes::register(token::register(enroll::register(health::register(
+            OpenApiRouter::new(),
+        )))),
     )));
 
     // Availability accepts a daemon (wizard) or a user (account plane).

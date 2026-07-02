@@ -10,7 +10,7 @@ use axum::extract::FromRef;
 use axum_extra::extract::cookie::Key;
 
 use wardnet_common::auth::AuthContext;
-use wardnet_common::ports::{BillingPort, SubscriptionCommands, SubscriptionReader};
+use wardnet_common::ports::{BillingPort, PlanCatalog, SubscriptionCommands, SubscriptionReader};
 use wardnet_common::replay_cache::ReplayCache;
 use wardnet_common::token::Verifier;
 
@@ -34,8 +34,10 @@ struct Inner {
     subscriptions: Arc<dyn SubscriptionReader>,
     /// Account-plane subscription cancel (the one command the USER plane drives).
     subscription_commands: Arc<dyn SubscriptionCommands>,
-    /// Hosted Checkout/Portal + the provider webhook.
+    /// Hosted Checkout + change-plan + card-update + the provider webhook.
     billing: Arc<dyn BillingPort>,
+    /// The plan-catalog read port (`GET /v1/plans`).
+    plans: Arc<dyn PlanCatalog>,
     identities: Arc<IdentitiesService>,
     verifier: Verifier,
     replay_cache: Arc<ReplayCache>,
@@ -55,6 +57,7 @@ impl AppState {
         subscriptions: Arc<dyn SubscriptionReader>,
         subscription_commands: Arc<dyn SubscriptionCommands>,
         billing: Arc<dyn BillingPort>,
+        plans: Arc<dyn PlanCatalog>,
         identities: Arc<IdentitiesService>,
         verifier: Verifier,
     ) -> Self {
@@ -65,6 +68,7 @@ impl AppState {
             subscriptions,
             subscription_commands,
             billing,
+            plans,
             identities,
             verifier,
             replay_cache: Arc::new(ReplayCache::new()),
@@ -101,10 +105,16 @@ impl AppState {
         self.0.subscription_commands.as_ref()
     }
 
-    /// The payment aggregate's port (Checkout/Portal + webhook).
+    /// The payment aggregate's command port (Checkout / change-plan / card-update / webhook).
     #[must_use]
     pub fn billing(&self) -> &dyn BillingPort {
         self.0.billing.as_ref()
+    }
+
+    /// The plan-catalog read port (`GET /v1/plans`).
+    #[must_use]
+    pub fn plans(&self) -> &dyn PlanCatalog {
+        self.0.plans.as_ref()
     }
 
     /// The replay cache (used by the bootstrap token endpoint's `PoP` check).

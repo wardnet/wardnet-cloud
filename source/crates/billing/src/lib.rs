@@ -1,7 +1,8 @@
 //! Wardnet **Billing** — the payment aggregate: *how* a subscription is paid for.
 //!
 //! Owns the payment provider (Stripe today, behind the [`StripeGateway`] port),
-//! hosted Checkout/Portal, the webhook + signature verification, the
+//! hosted Checkout (subscribe / change-plan / setup-mode card update), the plan-catalog
+//! projection, promotions, the webhook + signature verification, the
 //! `processed_stripe_events` idempotency ledger, and the `billing_customers`
 //! provider-reference table. It is **swappable** and provider-specific.
 //!

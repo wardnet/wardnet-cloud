@@ -1,0 +1,89 @@
+import * as React from "react";
+import { Link, useNavigate } from "react-router-dom";
+import {
+  Button,
+  Field,
+  Form,
+  Heading,
+  Input,
+  Text,
+  TextLink,
+  Validator,
+} from "@wardnet/ui";
+import { requestVerificationCode } from "../../api/auth";
+import { emailFormatError } from "../../lib/validation";
+import { AuthShell } from "./AuthShell";
+import { useAuthFlow } from "./AuthFlowContext";
+import { OAuthOptions } from "./OAuthOptions";
+import s from "./auth.module.css";
+
+export function Register() {
+  const navigate = useNavigate();
+  const { set } = useAuthFlow();
+  const [email, setEmail] = React.useState("");
+  const [error, setError] = React.useState<string | null>(null);
+  const [submitting, setSubmitting] = React.useState(false);
+
+  async function onSubmit() {
+    setError(null);
+    setSubmitting(true);
+    try {
+      const resp = await requestVerificationCode({ email, purpose: "signup" });
+      set({ email, flow: "signup", sentCode: resp.code ?? null });
+      navigate("/confirm");
+    } catch {
+      setError("Couldn't send the code. Try again.");
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <AuthShell
+      footer={
+        <Text variant="caption" color="ink-2">
+          Already have an account?{" "}
+          <TextLink asChild>
+            <Link to="/signin">Sign in</Link>
+          </TextLink>
+        </Text>
+      }
+    >
+      <div className={s.head}>
+        <Heading level={2}>Create an account</Heading>
+        <Text variant="caption" color="ink-3">
+          Unlock dynamic DNS and secure remote tunneling.
+        </Text>
+      </div>
+
+      <OAuthOptions />
+
+      <Form values={{ email }} onSubmit={onSubmit} className={s.form}>
+        <Field
+          label="Email"
+          htmlFor="rg-email"
+          name="email"
+          help="We'll send a 6-character confirmation code."
+        >
+          <Input
+            id="rg-email"
+            type="email"
+            autoComplete="email"
+            placeholder="you@example.com"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+          />
+        </Field>
+        <Validator name="email" rule="required" message="Email is required." />
+        <Validator name="email" validate={emailFormatError} />
+        {error && (
+          <Text variant="body" color="danger" className={s.danger} role="alert">
+            {error}
+          </Text>
+        )}
+        <Button type="submit" className={s.full} disabled={submitting}>
+          Send confirmation code
+        </Button>
+      </Form>
+    </AuthShell>
+  );
+}

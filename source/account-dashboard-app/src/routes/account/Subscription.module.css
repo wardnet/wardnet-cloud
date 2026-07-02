@@ -1,0 +1,139 @@
+.topGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  align-items: stretch;
+}
+.topGrid > * {
+  height: 100%;
+}
+.priceRow {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.meterRow {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 0;
+}
+.meterRow + .meterRow {
+  border-top: 1px solid var(--line);
+}
+.meterHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.lifecycleActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+  justify-content: flex-end;
+}
+.subSection {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+.pmRow {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.pmIcon {
+  width: 44px;
+  height: 30px;
+  border-radius: 6px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  color: var(--ink-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+.pmMeta {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.table {
+  display: flex;
+  flex-direction: column;
+}
+.tableHead,
+.tableRow {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr 1fr auto;
+  gap: 12px;
+  align-items: center;
+}
+.tableHead {
+  padding: 0 0 10px;
+}
+.tableRow {
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
+.amount {
+  font-family: var(--font-mono);
+}
+.iconBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink-3);
+}
+.cardContent {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+@media (max-width: 720px) {
+  .topGrid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.planList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.planRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.planRowCurrent {
+  border-color: var(--accent);
+  background: var(--bg-2);
+}
+
+.planMeta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+}
+
+.planPrice {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.strike {
+  text-decoration: line-through;
+  color: var(--ink-4);
+}
