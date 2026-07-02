@@ -10,6 +10,9 @@
 
 COMPOSE      ?= docker-compose
 COMPOSE_FILE ?= end2end-tests/mesh/compose.yaml
+# The `-f` set passed to every e2e compose call. CI layers the GHA-cache override
+# on top, e.g. COMPOSE_FILES="-f end2end-tests/mesh/compose.yaml -f end2end-tests/mesh/compose.ci.yaml".
+COMPOSE_FILES ?= -f $(COMPOSE_FILE)
 CERTS_DIR    ?= end2end-tests/mesh/certs
 
 DEV_COMPOSE_FILE ?= dev-stack/compose.yaml
@@ -21,11 +24,11 @@ DEV_CERTS_DIR    ?= dev-stack/certs
 # so it only runs for the dev-* targets, not every make invocation.
 DEV_DOCKER_HOST = $(shell docker info >/dev/null 2>&1 || podman machine inspect --format 'DOCKER_HOST=unix://{{.ConnectionInfo.PodmanSocket.Path}}' 2>/dev/null | head -1)
 
-OPENAPI_DIR ?= docs/openapi
-
 .PHONY: check fmt clippy test openapi check-openapi \
-        e2e-certs e2e-build e2e-up e2e-test e2e-down e2e-all \
+        e2e-certs e2e-build e2e-up e2e-test e2e-logs e2e-down e2e-all \
         dev-certs dev-up dev-down dev-logs dev-app dev
+
+OPENAPI_DIR ?= docs/openapi
 
 # ── Standard gates ──────────────────────────────────────────────────────────
 check: fmt clippy test
@@ -73,25 +76,34 @@ e2e-certs:
 	cargo run -p xtask -- gen-certs $(CERTS_DIR)
 
 e2e-build:
-	$(COMPOSE) -f $(COMPOSE_FILE) build
+	$(COMPOSE) $(COMPOSE_FILES) build
 
-# Bring the stack up (building images as needed). Generates certs first.
+# Bring the stack up and BLOCK until every service is healthy (`--wait`). The
+# tenants/ddns `/v1/health` healthchecks are the readiness gate, so the test
+# never starts against a still-migrating service. Generates certs first.
 e2e-up: e2e-certs
-	$(COMPOSE) -f $(COMPOSE_FILE) up -d --build
+	$(COMPOSE) $(COMPOSE_FILES) up -d --build --wait
 
 # Run the (ignored) e2e tests against a running stack — the tombstone flow over
 # real mesh mTLS, and the OTLP observability assertions against the collector.
 e2e-test:
 	cargo test -p wardnet-e2e-mesh -- --ignored --nocapture
 
-e2e-down:
-	$(COMPOSE) -f $(COMPOSE_FILE) down -v
+# Dump all container logs (diagnostics on failure, before teardown drops volumes).
+e2e-logs:
+	$(COMPOSE) $(COMPOSE_FILES) logs --no-color --timestamps
 
-# One-shot: certs → up → test → guaranteed teardown (even on failure).
+e2e-down:
+	$(COMPOSE) $(COMPOSE_FILES) down -v
+
+# One-shot: certs → up (wait for healthy) → test → guaranteed teardown. On a
+# non-zero exit, dump container logs BEFORE `down -v` wipes them (local parity
+# with the CI log-artifact step).
 e2e-all: e2e-certs
 	set -e; \
-	trap '$(COMPOSE) -f $(COMPOSE_FILE) down -v' EXIT; \
-	$(COMPOSE) -f $(COMPOSE_FILE) up -d --build; \
+	trap 'rc=$$?; [ $$rc -ne 0 ] && $(COMPOSE) $(COMPOSE_FILES) logs --no-color; \
+	      $(COMPOSE) $(COMPOSE_FILES) down -v' EXIT; \
+	$(COMPOSE) $(COMPOSE_FILES) up -d --build --wait; \
 	$(MAKE) e2e-test
 
 # ── Local dev stack for the My Account SPA ────────────────────────────────────

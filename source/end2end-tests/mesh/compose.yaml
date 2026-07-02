@@ -98,6 +98,17 @@ services:
       - ./certs:/certs:ro
     ports:
       - "18080:80"
+    # `/v1/health` returns 200 only after the API listener binds (post-migrations),
+    # so `healthy` means "migrations applied, serving". The API listener is
+    # PROXY-v1-required and fail-closed (invariant #13) — a header-less request is
+    # dropped — so the probe MUST prepend a PROXY v1 header: `curl --haproxy-protocol`
+    # emits `PROXY TCP4 127.0.0.1 127.0.0.1 <sport> 80\r\n` ahead of the GET.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--haproxy-protocol", "http://localhost:80/v1/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 45 # ~90s ceiling for a cold, loaded-runner boot
+      start_period: 5s
 
   ddns:
     build:
@@ -107,7 +118,9 @@ services:
       pg-regional:
         condition: service_healthy
       tenants:
-        condition: service_started
+        # Wait for the tenants app to actually serve (not just the container to
+        # start) — closes the ddns-provisioner-races-tenants-boot gap.
+        condition: service_healthy
       cloudflare:
         condition: service_started
       otel-lgtm:
@@ -142,3 +155,12 @@ services:
       INFORGE_DEPLOYMENT_ENV: e2e
     volumes:
       - ./certs:/certs:ro
+    # `/v1/health` returns 200 only after the API listener binds (post-migrations).
+    # `--haproxy-protocol` prepends the PROXY v1 header the fail-closed API listener
+    # requires (invariant #13); a plain curl would be dropped.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--haproxy-protocol", "http://localhost:80/v1/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 45 # ~90s ceiling for a cold, loaded-runner boot
+      start_period: 5s

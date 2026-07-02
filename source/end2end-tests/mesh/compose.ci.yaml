@@ -1,0 +1,25 @@
+# CI-only compose override: persist the cargo-chef dependency layer across
+# ephemeral GitHub runners via the GitHub Actions cache backend (`type=gha`).
+#
+# Kept OUT of compose.yaml so local `docker compose build` (which has no GHA
+# token and, by default, the `docker` buildx driver that can't export cache)
+# never sees `type=gha`. Layer it only in CI:
+#
+#   docker compose -f compose.yaml -f compose.ci.yaml build
+#
+# `type=gha` cache export requires the `docker-container` buildx driver — the
+# e2e workflow sets one up as the default builder via docker/setup-buildx-action.
+services:
+  tenants:
+    build:
+      cache_from:
+        - "type=gha,scope=e2e-tenants"
+      cache_to:
+        - "type=gha,mode=max,scope=e2e-tenants"
+
+  ddns:
+    build:
+      cache_from:
+        - "type=gha,scope=e2e-ddns"
+      cache_to:
+        - "type=gha,mode=max,scope=e2e-ddns"
