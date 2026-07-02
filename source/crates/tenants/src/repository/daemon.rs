@@ -29,6 +29,10 @@ pub trait DaemonRepository: Send + Sync {
     async fn list_by_tenant(&self, tenant_id: &str) -> anyhow::Result<Vec<Daemon>>;
     /// All daemons of a network.
     async fn list_by_network(&self, network_id: &str) -> anyhow::Result<Vec<Daemon>>;
+    /// Remove the daemon identified by `public_key` from `network_id` (daemon
+    /// self-removal on teardown). Returns the number of rows deleted (0 if already
+    /// gone) so the caller can stay idempotent. Never touches the network or its DNS.
+    async fn remove(&self, public_key: &str, network_id: &str) -> anyhow::Result<u64>;
 }
 
 /// `PostgreSQL`-backed [`DaemonRepository`].
@@ -82,5 +86,14 @@ impl DaemonRepository for PgDaemonRepository {
         .fetch_all(&self.pools.read)
         .await?;
         Ok(rows)
+    }
+
+    async fn remove(&self, public_key: &str, network_id: &str) -> anyhow::Result<u64> {
+        let result = sqlx::query("DELETE FROM daemons WHERE public_key = $1 AND network_id = $2")
+            .bind(public_key)
+            .bind(network_id)
+            .execute(&self.pools.write)
+            .await?;
+        Ok(result.rows_affected())
     }
 }

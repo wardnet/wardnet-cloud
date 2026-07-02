@@ -85,6 +85,63 @@ pub fn daemon_keypair(seed: u8) -> (SigningKey, String) {
     (key, cnf)
 }
 
+/// Current unix timestamp (seconds) — the `PoP` request timestamp.
+pub fn now_ts() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// Ed25519 proof-of-possession signature over the canonical request payload
+/// (`METHOD\npath_and_query\ntimestamp\nhex-sha256(body)`, invariant #7), base64-encoded.
+pub fn sign_pop(
+    key: &SigningKey,
+    method: &str,
+    path_and_query: &str,
+    ts: i64,
+    body: &[u8],
+) -> String {
+    use ed25519_dalek::Signer as _;
+    use sha2::{Digest, Sha256};
+    let hash = hex::encode(Sha256::digest(body));
+    let payload =
+        wardnet_common::token::canonical_request_payload(method, path_and_query, ts, &hash);
+    base64::engine::general_purpose::STANDARD.encode(key.sign(payload.as_bytes()).to_bytes())
+}
+
+/// A daemon-signed HTTP request (`PoP` headers + optional bearer JWT) at an explicit
+/// timestamp. Pass `ts` explicitly to issue two *distinct* signed requests: the replay
+/// cache keys on `pubkey:ts:body_hash`, so identical bytes collide.
+pub fn daemon_request_at(
+    method: &str,
+    path: &str,
+    body: &[u8],
+    key: &SigningKey,
+    bearer: Option<&str>,
+    ts: i64,
+) -> axum::http::Request<axum::body::Body> {
+    let sig = sign_pop(key, method, path, ts, body);
+    let mut builder = axum::http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json")
+        .header("X-Wardnet-Timestamp", ts.to_string())
+        .header("X-Wardnet-Signature", sig);
+    if let Some(token) = bearer {
+        builder = builder.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    builder.body(axum::body::Body::from(body.to_vec())).unwrap()
+}
+
+/// [`daemon_request_at`] with a fresh timestamp — the common case.
+pub fn daemon_request(
+    method: &str,
+    path: &str,
+    body: &[u8],
+    key: &SigningKey,
+    bearer: Option<&str>,
+) -> axum::http::Request<axum::body::Body> {
+    daemon_request_at(method, path, body, key, bearer, now_ts())
+}
+
 // ── Shared in-memory store ────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -153,6 +210,16 @@ impl MockStore {
             .unwrap()
             .tenants
             .insert(tenant.id.clone(), tenant);
+    }
+
+    /// Seed a daemon row directly (e.g. a second daemon on an existing network, for
+    /// the "self-removal touches only the caller" test).
+    pub fn seed_daemon(&self, daemon: Daemon) {
+        self.0
+            .lock()
+            .unwrap()
+            .daemons
+            .insert(daemon.id.clone(), daemon);
     }
 
     /// Test seam: override the live subscription's trial expiry (the mock `create_trial`
@@ -569,6 +636,14 @@ impl DaemonRepository for MockStore {
             .filter(|x| x.network_id == network_id)
             .cloned()
             .collect())
+    }
+
+    async fn remove(&self, public_key: &str, network_id: &str) -> anyhow::Result<u64> {
+        let mut d = self.0.lock().unwrap();
+        let before = d.daemons.len();
+        d.daemons
+            .retain(|_, x| !(x.public_key == public_key && x.network_id == network_id));
+        Ok((before - d.daemons.len()) as u64)
     }
 }
 
