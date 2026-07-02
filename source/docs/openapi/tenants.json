@@ -1,0 +1,2025 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Wardnet Tenants API",
+    "description": "Wardnet Tenants service — global identity/naming authority + mesh work-queue",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/v1/auth/logout": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "description": "Delete the current session (server-side) and clear the cookie. Idempotent.",
+        "operationId": "logout",
+        "responses": {
+          "204": {
+            "description": "Logged out"
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/v1/auth/oidc/{provider}/callback": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "description": "Federated callback: validate state, exchange the code, then either log in (set the session cookie) or — for a mode=link flow — link the verified identity to the current account. 302s back to the account SPA.",
+        "operationId": "oidc_callback",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "google | github",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Logged in / linked; redirect to the SPA"
+          },
+          "401": {
+            "description": "State mismatch / unverified email / exchange failure"
+          },
+          "409": {
+            "description": "Provider identity already linked to another account"
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/v1/auth/oidc/{provider}/start": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "description": "Begin federated login: stash CSRF/PKCE in a signed cookie and 302 to the provider. With ?mode=link (called while signed in via the session cookie) the callback links the verified identity to the current account.",
+        "operationId": "oidc_start",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "google | github",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "mode",
+            "in": "query",
+            "description": "\"link\" to link to the signed-in account",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirect to the provider"
+          },
+          "400": {
+            "description": "Unknown/unconfigured provider"
+          },
+          "401": {
+            "description": "mode=link without an active session"
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/v1/auth/password/login": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "description": "Log in with email + password. Sets the session cookie on success.",
+        "operationId": "password_login",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasswordLoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Logged in; session cookie set"
+          },
+          "401": {
+            "description": "Invalid email or password"
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/v1/auth/password/reset": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "description": "Reset (or set) the account password from a one-time code; force-logs-out every existing session.",
+        "operationId": "password_reset",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasswordResetRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Password reset"
+          },
+          "400": {
+            "description": "Weak password"
+          },
+          "401": {
+            "description": "Bad or expired code"
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/v1/auth/password/signup": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "description": "Sign up with email + password (the one-time code proves the email). Sets the session cookie on success.",
+        "operationId": "password_signup",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasswordSignupRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Signed up; session cookie set"
+          },
+          "400": {
+            "description": "Weak password"
+          },
+          "401": {
+            "description": "Bad or expired code"
+          },
+          "409": {
+            "description": "Email already has a password"
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/v1/auth/token": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "description": "Silent exchange: read the session cookie and mint a short-TTL USER JWT (aud:[tenants]). The SPA holds the JWT only in memory.",
+        "operationId": "token",
+        "responses": {
+          "200": {
+            "description": "USER JWT minted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No active session"
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/v1/availability": {
+      "get": {
+        "tags": [
+          "networks"
+        ],
+        "description": "Check whether a vanity slug is available. An invalid or reserved slug reads as unavailable rather than an error.",
+        "operationId": "availability",
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "query",
+            "description": "The vanity slug to check.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Availability",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AvailabilityResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthenticated"
+          }
+        }
+      }
+    },
+    "/v1/billing/stripe/webhook": {
+      "post": {
+        "tags": [
+          "billing"
+        ],
+        "description": "Stripe subscription-lifecycle webhook. Unauthenticated: the Stripe-Signature header is verified as the credential. Idempotent.",
+        "operationId": "stripe_webhook",
+        "requestBody": {
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Event accepted (or a harmless redelivery)"
+          },
+          "400": {
+            "description": "Missing/invalid signature or payload"
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/v1/enroll": {
+      "post": {
+        "tags": [
+          "enrollment"
+        ],
+        "description": "Bootstrap a daemon: consume a one-time code and bind its public key to a tenant via a short-lived pending record. No JWT is returned — call POST /v1/token next.",
+        "operationId": "enroll",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnrollRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Daemon enrolled (pending)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnrollResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid public key"
+          },
+          "401": {
+            "description": "Invalid/expired/used code"
+          },
+          "409": {
+            "description": "Tenant daemon limit reached"
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/v1/health": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "description": "Liveness probe. Returns 200 OK when the bridge process is running. No authentication required. Used by load balancers and uptime monitors.",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "Bridge is alive"
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/v1/me": {
+      "get": {
+        "tags": [
+          "tenants"
+        ],
+        "description": "The current user's account profile (the SPA's identity bootstrap).",
+        "operationId": "me",
+        "responses": {
+          "200": {
+            "description": "Account profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthenticated"
+          },
+          "404": {
+            "description": "Account no longer exists"
+          }
+        }
+      }
+    },
+    "/v1/me/identities": {
+      "get": {
+        "tags": [
+          "tenants"
+        ],
+        "description": "List the caller's connected login methods. Never leaks secret hashes.",
+        "operationId": "list_identities",
+        "responses": {
+          "200": {
+            "description": "Connected login methods",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ConnectedIdentityView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthenticated"
+          }
+        }
+      }
+    },
+    "/v1/me/identities/{provider}": {
+      "delete": {
+        "tags": [
+          "tenants"
+        ],
+        "description": "Unlink a login method. At least one login method must always remain.",
+        "operationId": "unlink_identity",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "password | google | github",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Unlinked (idempotent)"
+          },
+          "401": {
+            "description": "Unauthenticated"
+          },
+          "409": {
+            "description": "Would remove the last login method"
+          }
+        }
+      }
+    },
+    "/v1/me/password": {
+      "post": {
+        "tags": [
+          "tenants"
+        ],
+        "description": "Set or change the caller's password, proven by a fresh one-time email code for the caller's own account email. Revokes every existing session (evicting other devices) and issues a new session cookie for this browser, so the caller stays signed in.",
+        "operationId": "set_password",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetPasswordRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Password set; a fresh session cookie is issued"
+          },
+          "400": {
+            "description": "Weak password"
+          },
+          "401": {
+            "description": "Unauthenticated, or a bad/expired/mismatched code"
+          }
+        }
+      }
+    },
+    "/v1/me/sessions": {
+      "delete": {
+        "tags": [
+          "tenants"
+        ],
+        "description": "Sign out of all sessions (including the current one) and clear the cookie.",
+        "operationId": "signout_all",
+        "responses": {
+          "204": {
+            "description": "All sessions revoked"
+          },
+          "401": {
+            "description": "Unauthenticated"
+          }
+        }
+      }
+    },
+    "/v1/networks": {
+      "post": {
+        "tags": [
+          "networks"
+        ],
+        "description": "Register a network for the calling daemon's tenant and bind the daemon to it. The new network starts in `provisioning`.",
+        "operationId": "register_network",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterNetworkRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Network registered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NetworkView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid slug/region"
+          },
+          "401": {
+            "description": "Unauthenticated"
+          },
+          "403": {
+            "description": "Not a daemon caller"
+          },
+          "409": {
+            "description": "Slug taken / limit reached / daemon already registered"
+          }
+        }
+      }
+    },
+    "/v1/networks/{id}/daemons": {
+      "get": {
+        "tags": [
+          "networks"
+        ],
+        "description": "List a network's daemons (scoped to the caller's tenant).",
+        "operationId": "list_network_daemons",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DaemonView"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such network"
+          }
+        }
+      }
+    },
+    "/v1/networks/{id}/daemons/self": {
+      "delete": {
+        "tags": [
+          "networks"
+        ],
+        "description": "Remove the calling daemon from its network (self-removal on teardown). The row-level effect is idempotent — removing an already-absent daemon still returns 204, though a retry must be freshly re-signed (a byte-identical replay is rejected). Does not deprovision the network or delete its DNS.",
+        "operationId": "remove_self",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The daemon's own network id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Daemon removed (or already absent)"
+          },
+          "401": {
+            "description": "Unauthenticated"
+          },
+          "403": {
+            "description": "Token is not scoped to this network"
+          }
+        }
+      }
+    },
+    "/v1/plans": {
+      "get": {
+        "tags": [
+          "billing"
+        ],
+        "description": "The purchasable plan catalog (ascending by level), each with its live promotion's discounted price. Public; sourced from Stripe via the projection.",
+        "operationId": "list_plans",
+        "responses": {
+          "200": {
+            "description": "The plan catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PlanView"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Catalog temporarily unavailable (too stale)"
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/v1/tenants/{id}": {
+      "delete": {
+        "tags": [
+          "tenants"
+        ],
+        "description": "Deregister (tombstone) the account: all its networks are marked for deprovisioning, its subscription is canceled, and once the networks are fully reaped the account row is swept. Idempotent.",
+        "operationId": "delete_tenant",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Accepted; account is deregistering"
+          },
+          "401": {
+            "description": "Unauthenticated"
+          },
+          "403": {
+            "description": "Not your tenant"
+          },
+          "404": {
+            "description": "No such tenant"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "tenants"
+        ],
+        "description": "Update a tenant. Currently only subscription_status=canceled, which cascades the tenant's networks to deprovisioning.",
+        "operationId": "update_tenant",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTenantRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Updated"
+          },
+          "400": {
+            "description": "Unsupported update"
+          },
+          "403": {
+            "description": "Not your tenant"
+          },
+          "404": {
+            "description": "No such tenant"
+          }
+        }
+      }
+    },
+    "/v1/tenants/{id}/billing/card-update": {
+      "post": {
+        "tags": [
+          "tenants"
+        ],
+        "description": "Start a Stripe setup-mode Checkout to add/replace the card (no purchase); returns the URL to redirect to.",
+        "operationId": "start_card_update",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Setup session created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CheckoutSessionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Tenant has no billing account yet"
+          },
+          "401": {
+            "description": "Unauthenticated"
+          },
+          "403": {
+            "description": "Not your tenant"
+          }
+        }
+      }
+    },
+    "/v1/tenants/{id}/billing/change-plan": {
+      "post": {
+        "tags": [
+          "tenants"
+        ],
+        "description": "Change an already-paid subscription's plan. Upgrade is immediate; downgrade is scheduled for the period end. Entitlement lands via webhook.",
+        "operationId": "change_plan",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangePlanRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Change applied/scheduled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangePlanResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No paid subscription, unknown plan, or no-op change"
+          },
+          "401": {
+            "description": "Unauthenticated"
+          },
+          "403": {
+            "description": "Not your tenant"
+          },
+          "409": {
+            "description": "A displayed promo lapsed; re-confirm at full price",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PromoUnavailableBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tenants/{id}/billing/checkout-session": {
+      "post": {
+        "tags": [
+          "tenants"
+        ],
+        "description": "Start a Stripe Checkout for a plan; returns the URL to redirect to. Auto-applies the live promo unless accept_full_price re-confirms.",
+        "operationId": "create_checkout_session",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCheckoutSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Checkout session created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CheckoutSessionResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthenticated"
+          },
+          "403": {
+            "description": "Not your tenant"
+          },
+          "404": {
+            "description": "No such tenant"
+          },
+          "409": {
+            "description": "A displayed promo lapsed; re-confirm at full price",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PromoUnavailableBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tenants/{id}/billing/invoices": {
+      "get": {
+        "tags": [
+          "tenants"
+        ],
+        "description": "Recent invoices, newest first; empty when the tenant has no provider customer. Read-only and provider-proxied.",
+        "operationId": "list_invoices",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Invoice history",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/InvoiceView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthenticated"
+          },
+          "403": {
+            "description": "Not your tenant"
+          }
+        }
+      }
+    },
+    "/v1/tenants/{id}/billing/payment-method": {
+      "get": {
+        "tags": [
+          "tenants"
+        ],
+        "description": "The tenant's default payment-method summary, or null. Read-only and provider-proxied; never PAN/CVC (SAQ-A).",
+        "operationId": "get_payment_method",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Payment method summary, or null",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/components/schemas/PaymentMethodView"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthenticated"
+          },
+          "403": {
+            "description": "Not your tenant"
+          }
+        }
+      }
+    },
+    "/v1/tenants/{id}/billing/subscription": {
+      "get": {
+        "tags": [
+          "tenants"
+        ],
+        "description": "Provider (Billing) view of the subscription: current Stripe price + any pending scheduled downgrade. Composed by the SPA with /v1/me.",
+        "operationId": "get_billing_subscription",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Billing subscription view",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BillingSubscriptionView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthenticated"
+          },
+          "403": {
+            "description": "Not your tenant"
+          }
+        }
+      }
+    },
+    "/v1/tenants/{id}/codes": {
+      "post": {
+        "tags": [
+          "tenants"
+        ],
+        "description": "Issue an add-daemon one-time code for an existing tenant.",
+        "operationId": "issue_tenant_code",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Code issued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodeResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not your tenant"
+          },
+          "404": {
+            "description": "No such tenant"
+          }
+        }
+      }
+    },
+    "/v1/tenants/{id}/daemons": {
+      "get": {
+        "tags": [
+          "tenants"
+        ],
+        "description": "List a tenant's daemons.",
+        "operationId": "list_tenant_daemons",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DaemonView"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not your tenant"
+          }
+        }
+      }
+    },
+    "/v1/tenants/{id}/networks": {
+      "get": {
+        "tags": [
+          "tenants"
+        ],
+        "description": "List a tenant's networks.",
+        "operationId": "list_networks",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/NetworkView"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not your tenant"
+          }
+        }
+      }
+    },
+    "/v1/tenants/{id}/networks/{slug}": {
+      "delete": {
+        "tags": [
+          "tenants"
+        ],
+        "description": "Mark a network for deprovisioning (the reaper tears down DNS, then deletes the row).",
+        "operationId": "delete_network",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Accepted; network is deprovisioning"
+          },
+          "403": {
+            "description": "Not your tenant"
+          },
+          "404": {
+            "description": "No such network"
+          }
+        }
+      }
+    },
+    "/v1/token": {
+      "post": {
+        "tags": [
+          "enrollment"
+        ],
+        "description": "Mint an identity JWT for a daemon, authenticated by an Ed25519 proof-of-possession signature over the request (headers X-Wardnet-Timestamp / X-Wardnet-Signature). Tenant-scoped before the daemon registers a network, network-scoped after.",
+        "operationId": "issue_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Identity JWT minted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid public key"
+          },
+          "401": {
+            "description": "Bad signature / unknown or expired key"
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/v1/verification-codes": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "description": "Issue a one-time, email-proof code bound to a purpose (signup / password_reset / enrollment). Public, per-IP rate-limited. Emailed in production; returned here in dev.",
+        "operationId": "create_verification_code",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerificationCodeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Code issued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerificationCodeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid email"
+          },
+          "429": {
+            "description": "Per-IP rate limit exceeded"
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AvailabilityResponse": {
+        "type": "object",
+        "description": "Response body for `GET /v1/availability`.",
+        "required": [
+          "available"
+        ],
+        "properties": {
+          "available": {
+            "type": "boolean",
+            "description": "`true` if the slug is well-formed, not reserved, and unused."
+          }
+        }
+      },
+      "BillingSubscriptionView": {
+        "type": "object",
+        "description": "The provider (Billing) view of a tenant's subscription for the account page —\nthe bits that live in Billing (Stripe refs), composed by the SPA alongside the\nprovider-agnostic [`SubscriptionView`]. Response for\n`GET /v1/tenants/{id}/billing/subscription`.",
+        "required": [
+          "trialing"
+        ],
+        "properties": {
+          "current_price_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Stripe Price id the tenant is currently subscribed at, or `None` (no paid\nsubscription — trial/canceled). Lets the SPA highlight the current plan in the picker."
+          },
+          "pending_change": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PendingChangeView",
+                "description": "A pending scheduled downgrade (read from the Stripe subscription schedule), or\n`None`. Survives reloads so the \"downgrades on DATE\" banner can re-render."
+              }
+            ]
+          },
+          "trialing": {
+            "type": "boolean",
+            "description": "Whether the subscription is still in its Stripe trial (a *trial-preserving* Home\nsub, ADR-0012). The SPA uses this to confirm before an in-app upgrade that would\nend the trial — the account state alone can't tell (a honored trial reads `Active`)."
+          }
+        }
+      },
+      "ChangePlanRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/tenants/{id}/billing/change-plan`.",
+        "required": [
+          "price_id"
+        ],
+        "properties": {
+          "accept_full_price": {
+            "type": "boolean",
+            "description": "Re-confirm flag after a [`PromoUnavailableBody`] 409 (see\n[`CreateCheckoutSessionRequest::accept_full_price`]). Defaults to `false`."
+          },
+          "price_id": {
+            "type": "string",
+            "description": "The Stripe Price id of the **target** plan."
+          }
+        }
+      },
+      "ChangePlanResponse": {
+        "type": "object",
+        "description": "Response body for the change-plan endpoint (`202 Accepted`).",
+        "required": [
+          "effect"
+        ],
+        "properties": {
+          "current_price_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Stripe Price the tenant is on *after* this change — the target for an\nimmediate upgrade, the unchanged current price for a scheduled/canceled downgrade.\nLets the SPA reflect the new current plan at once instead of waiting on the async\nwebhook that back-fills `billing_customers` (kills the post-upgrade UI lag)."
+          },
+          "effect": {
+            "$ref": "#/components/schemas/PlanChangeEffect",
+            "description": "What happened."
+          },
+          "effective_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the change takes effect — the period end for a scheduled downgrade; `None`\nfor an immediate upgrade or a canceled downgrade."
+          }
+        }
+      },
+      "CheckoutSessionResponse": {
+        "type": "object",
+        "description": "Response body for the create-checkout-session endpoint. Also returned by the\ncard-update (setup-mode Checkout) endpoint.",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "The Stripe-hosted Checkout URL to redirect the user to."
+          }
+        }
+      },
+      "CodePurpose": {
+        "type": "string",
+        "description": "The flow a one-time [verification code](VerificationCodeRequest) is bound to\n(PR3). A code issued for one purpose can never be consumed by another, closing\ncross-purpose replay. Doubles as the `enrollment_codes.purpose` DB value (the\n[`ProvisioningState`] pattern). `enrollment` covers both daemon paths (new-signup\nand add-daemon), which the orthogonal `tenant_id` column already distinguishes.",
+        "enum": [
+          "signup",
+          "password_reset",
+          "password_change",
+          "enrollment"
+        ]
+      },
+      "CodeResponse": {
+        "type": "object",
+        "description": "Response body for the add-daemon code endpoint.",
+        "properties": {
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The one-time code — `None` once emailed (production), `Some` in the dev/no-op\nemail path."
+          }
+        }
+      },
+      "ConnectedIdentityView": {
+        "type": "object",
+        "description": "One connected login method for `GET /v1/me/identities`. Deliberately omits the\nstored secret (invariant #1): never carries a password hash or provider subject.",
+        "required": [
+          "provider",
+          "label",
+          "connected_at"
+        ],
+        "properties": {
+          "connected_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When this method was linked to the account."
+          },
+          "label": {
+            "type": "string",
+            "description": "A human-facing label — the provider-verified email."
+          },
+          "provider": {
+            "type": "string",
+            "description": "The login-method provider (`password` / `google` / `github`)."
+          }
+        }
+      },
+      "CreateCheckoutSessionRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/tenants/{id}/billing/checkout-session`.",
+        "required": [
+          "price_id"
+        ],
+        "properties": {
+          "accept_full_price": {
+            "type": "boolean",
+            "description": "Set by the SPA only on the **re-confirm** after a [`PromoUnavailableBody`] 409:\nthe customer has acknowledged the (now full) price, so the server skips applying\nany auto-promo and proceeds at the catalog price. Defaults to `false`."
+          },
+          "price_id": {
+            "type": "string",
+            "description": "The Stripe Price id of the plan being purchased."
+          }
+        }
+      },
+      "DaemonView": {
+        "type": "object",
+        "description": "The full **Daemon** resource. Producer: Tenants (account-plane listings).",
+        "required": [
+          "id",
+          "network_id",
+          "public_key",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string"
+          },
+          "network_id": {
+            "type": "string"
+          },
+          "public_key": {
+            "type": "string"
+          }
+        }
+      },
+      "EnrollRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/enroll`.",
+        "required": [
+          "code",
+          "public_key"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "The one-time code (raw value, as emailed to the tenant)."
+          },
+          "public_key": {
+            "type": "string",
+            "description": "Base64-encoded raw Ed25519 public key (32 bytes) the daemon will sign with."
+          }
+        }
+      },
+      "EnrollResponse": {
+        "type": "object",
+        "description": "Response body for `POST /v1/enroll`.",
+        "required": [
+          "tenant_id"
+        ],
+        "properties": {
+          "tenant_id": {
+            "type": "string",
+            "description": "The tenant this daemon is now (pending-)bound to."
+          }
+        }
+      },
+      "Entitlement": {
+        "type": "object",
+        "description": "Per-tenant limits. JSONB-stored so new dimensions need no migration; `serde`\ndefaults keep old rows readable as dimensions are added.",
+        "properties": {
+          "max_daemons": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Maximum daemons across all the tenant's networks.",
+            "minimum": 0
+          },
+          "max_networks": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Maximum networks the tenant may hold.",
+            "minimum": 0
+          }
+        }
+      },
+      "ErrorBody": {
+        "type": "object",
+        "description": "JSON body returned for every error response.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "InvoiceStatus": {
+        "type": "string",
+        "description": "Provider-agnostic invoice lifecycle status (mapped from the provider's own set).",
+        "enum": [
+          "paid",
+          "open",
+          "void",
+          "uncollectible"
+        ]
+      },
+      "InvoiceView": {
+        "type": "object",
+        "description": "One invoice row for `GET /v1/tenants/{id}/billing/invoices` (newest first in the list).",
+        "required": [
+          "date",
+          "amount_cents",
+          "currency",
+          "status"
+        ],
+        "properties": {
+          "amount_cents": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Amount in the currency's minor units (e.g. cents); the SPA formats for display."
+          },
+          "currency": {
+            "type": "string",
+            "description": "ISO-4217 currency code, lowercase (e.g. `\"usd\"`), as the provider reports it."
+          },
+          "date": {
+            "type": "string",
+            "description": "Invoice creation date as `YYYY-MM-DD`."
+          },
+          "hosted_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The provider-hosted invoice/receipt URL (the download action); `None` if absent."
+          },
+          "status": {
+            "$ref": "#/components/schemas/InvoiceStatus",
+            "description": "Provider-agnostic status."
+          }
+        }
+      },
+      "MeView": {
+        "type": "object",
+        "description": "Account profile for the SPA (`GET /v1/me`, auth = `USER`). The full current-user\nview: the tenant identity + its current subscription.",
+        "required": [
+          "tenant_id",
+          "email"
+        ],
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "subscription": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SubscriptionView",
+                "description": "The tenant's current (non-`Canceled`) subscription, or `None` if not entitled."
+              }
+            ]
+          },
+          "tenant_id": {
+            "type": "string",
+            "description": "The user's tenant id (`sub`)."
+          }
+        }
+      },
+      "NetworkView": {
+        "type": "object",
+        "description": "The full **Network** resource. Producer: Tenants (`POST /v1/networks`, the mesh\n`GET /v1/networks` work-queue + `GET /v1/networks/{id}` resource read).\nConsumers: the DDNS reconciler and the Tunneller routing policy.",
+        "required": [
+          "id",
+          "tenant_id",
+          "slug",
+          "display_name",
+          "region",
+          "provisioning_state",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "provisioning_state": {
+            "$ref": "#/components/schemas/ProvisioningState"
+          },
+          "region": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "PasswordLoginRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/auth/password/login`. On success a session cookie is set.",
+        "required": [
+          "email",
+          "password"
+        ],
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string"
+          }
+        }
+      },
+      "PasswordResetRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/auth/password/reset`. The `code` is the one-time email\nproof; the new password replaces (or sets) the account's password and force-logs-out\nevery session.",
+        "required": [
+          "code",
+          "password"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string"
+          }
+        }
+      },
+      "PasswordSignupRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/auth/password/signup`. The `code` is the one-time email\nproof (gate 1); on success a session cookie is set.",
+        "required": [
+          "email",
+          "code",
+          "password"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "The one-time signup code issued to `email` (via\n`POST /v1/verification-codes {purpose: \"signup\"}`)."
+          },
+          "email": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string",
+            "description": "Plaintext password (hashed server-side; never stored or logged)."
+          }
+        }
+      },
+      "PaymentMethodView": {
+        "type": "object",
+        "description": "The tenant's default payment-method summary, read back from the provider for\n`GET /v1/tenants/{id}/billing/payment-method`.\n\nThese fields are **not** PAN/CVC — `last4`/`brand`/`exp_*` are safe to read and render\n(SAQ-A preserved; card *entry* still happens only through hosted Checkout/Portal). The\nendpoint returns `null` when the tenant has no provider customer / default card yet.",
+        "required": [
+          "brand",
+          "last4",
+          "exp_month",
+          "exp_year"
+        ],
+        "properties": {
+          "brand": {
+            "type": "string",
+            "description": "Card brand, e.g. `\"visa\"`."
+          },
+          "exp_month": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Expiry month, `1`–`12`.",
+            "minimum": 0
+          },
+          "exp_year": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Expiry year, four digits, e.g. `2027`.",
+            "minimum": 0
+          },
+          "last4": {
+            "type": "string",
+            "description": "The last four digits of the card number, e.g. `\"4242\"`."
+          }
+        }
+      },
+      "PendingChangeView": {
+        "type": "object",
+        "description": "A pending scheduled plan change (today only a downgrade), surfaced by\n[`BillingSubscriptionView`].",
+        "required": [
+          "price_id",
+          "name",
+          "level",
+          "effective_at"
+        ],
+        "properties": {
+          "effective_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the scheduled change takes effect (the current period end)."
+          },
+          "level": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The target plan's level.",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "description": "The target plan's name (resolved through the catalog projection)."
+          },
+          "price_id": {
+            "type": "string",
+            "description": "The Stripe Price id the subscription will move to at [`effective_at`](Self::effective_at)."
+          }
+        }
+      },
+      "PlanChangeEffect": {
+        "type": "string",
+        "description": "What a [change-plan](ChangePlanRequest) did. The actual entitlement change lands\nasynchronously via the Stripe webhook — this only reports the effect + when it takes hold.",
+        "enum": [
+          "upgraded",
+          "downgrade_scheduled",
+          "downgrade_canceled"
+        ]
+      },
+      "PlanView": {
+        "type": "object",
+        "description": "One purchasable [plan](`crate::contract`) row for `GET /v1/plans` (newest catalog,\nascending by [`level`](Self::level)). The whole catalog is sourced from Stripe and\nserved from the Billing projection; this is its public, tenant-agnostic display shape.",
+        "required": [
+          "price_id",
+          "name",
+          "level",
+          "entitlement",
+          "amount_cents",
+          "currency",
+          "interval"
+        ],
+        "properties": {
+          "amount_cents": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The plan's list price in the currency's minor units (e.g. cents) — before any promo."
+          },
+          "currency": {
+            "type": "string",
+            "description": "ISO-4217 currency code, lowercase (e.g. `\"usd\"`)."
+          },
+          "entitlement": {
+            "$ref": "#/components/schemas/Entitlement",
+            "description": "The limits this plan grants (from the price's `max_networks`/`max_daemons` metadata)."
+          },
+          "interval": {
+            "type": "string",
+            "description": "Billing interval as Stripe reports it (`\"month\"` / `\"year\"`). Never assumed."
+          },
+          "level": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The unique integer rank that totally orders the catalog (Stripe price metadata\n`level`). Higher = more. Drives the upgrade/downgrade decision.",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-facing plan name (the Stripe product name)."
+          },
+          "price_id": {
+            "type": "string",
+            "description": "The Stripe Price id Checkout / change-plan is created against."
+          },
+          "promo": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PromoView",
+                "description": "A live global promotion for this plan, or `None`. **Display-only** — the discount\nis re-derived and applied server-side at Checkout/upgrade, never trusted from here."
+              }
+            ]
+          }
+        }
+      },
+      "PromoUnavailableBody": {
+        "type": "object",
+        "description": "`409` body returned by checkout / change-plan when an auto-promo that was displayed\nhas lapsed by the time it is applied (Stripe rejects the coupon). The SPA shows the\nreal price and re-confirms with `accept_full_price = true`. Carries the structured\nprice so the SPA need not re-fetch the catalog to render the prompt.",
+        "required": [
+          "error",
+          "actual_amount_cents",
+          "currency"
+        ],
+        "properties": {
+          "actual_amount_cents": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The plan's full price in the currency's minor units (no discount)."
+          },
+          "currency": {
+            "type": "string",
+            "description": "ISO-4217 currency code, lowercase."
+          },
+          "error": {
+            "type": "string",
+            "description": "Machine tag for the SPA to branch on (`\"promo_unavailable\"`)."
+          }
+        }
+      },
+      "PromoView": {
+        "type": "object",
+        "description": "The display half of a live [promotion](`PlanView::promo`) on a [`PlanView`]. The\ndiscounted amount is computed server-side from the Stripe coupon; the SPA only renders it.",
+        "required": [
+          "amount_cents_after",
+          "label",
+          "ends_at"
+        ],
+        "properties": {
+          "amount_cents_after": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The post-discount price in the currency's minor units (what the customer pays now)."
+          },
+          "ends_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the promotion's window closes (the Stripe coupon `redeem_by`)."
+          },
+          "label": {
+            "type": "string",
+            "description": "Human-facing label for the promotion (the Stripe coupon name)."
+          }
+        }
+      },
+      "ProvisioningState": {
+        "type": "string",
+        "description": "Network lifecycle. `deprovisioned` is intentionally absent — the reaper's final\ntransition deletes the row (freeing the slug).",
+        "enum": [
+          "provisioning",
+          "active",
+          "deprovisioning"
+        ]
+      },
+      "RegisterNetworkRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/networks`.",
+        "required": [
+          "slug",
+          "region"
+        ],
+        "properties": {
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human-facing name; defaults to the slug when omitted/empty."
+          },
+          "region": {
+            "type": "string",
+            "description": "Region that will own this network's DNS/tunnel."
+          },
+          "slug": {
+            "type": "string",
+            "description": "Desired vanity slug (`[a-z0-9-]`, 3–32, not reserved)."
+          }
+        }
+      },
+      "SetPasswordRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/me/password` — an **authenticated** USER sets or changes\ntheir own password. The `code` is a fresh one-time email proof (issued via\n`POST /v1/verification-codes {purpose: \"password_change\"}`) and must be for the\ncaller's own account email. On success every existing session is revoked and a new\nsession cookie is issued for the current browser, so the user stays signed in.",
+        "required": [
+          "code",
+          "password"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "One-time email-proof code for the caller's account email."
+          },
+          "password": {
+            "type": "string",
+            "description": "Plaintext new password (hashed server-side; never stored or logged)."
+          }
+        }
+      },
+      "SubscriptionStatus": {
+        "type": "string",
+        "description": "Subscription lifecycle. A tenant's **current** subscription is its single\nnon-`Canceled` row; losing it (or its cancel) cascades the tenant's networks to\n`deprovisioning`.",
+        "enum": [
+          "trialing",
+          "active",
+          "pastdue",
+          "canceled"
+        ]
+      },
+      "SubscriptionView": {
+        "type": "object",
+        "description": "The full **Subscription** resource — the **license** aggregate that grants a\ntenant's [`Entitlement`]. Provider-agnostic: payment-provider reference ids\n(Stripe customer/subscription/price) live in the **Billing** aggregate and are\nsurfaced by Billing's own read endpoints, not here. Producer: Tenants (account\nplane + embedded in [`TenantView`]). A tenant's *current* subscription is its\nsingle non-`Canceled` row; `Canceled` rows are history and are never embedded as\ncurrent.",
+        "required": [
+          "id",
+          "status",
+          "entitlement",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "current_period_end": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "End of the current paid period (a paid subscription only)."
+          },
+          "entitlement": {
+            "$ref": "#/components/schemas/Entitlement",
+            "description": "The limits this subscription's plan grants."
+          },
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/SubscriptionStatus"
+          },
+          "trial_expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the free trial lapses (a `Trialing` subscription only)."
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "TokenRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/token`.",
+        "required": [
+          "public_key"
+        ],
+        "properties": {
+          "public_key": {
+            "type": "string",
+            "description": "Base64-encoded raw Ed25519 public key (32 bytes) — the enrolled/registered key."
+          }
+        }
+      },
+      "TokenResponse": {
+        "type": "object",
+        "description": "Response body for `POST /v1/token`.",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "The minted identity JWT (`EdDSA`)."
+          }
+        }
+      },
+      "UpdateTenantRequest": {
+        "type": "object",
+        "description": "Request body for `PATCH /v1/tenants/{id}`.",
+        "required": [
+          "subscription_status"
+        ],
+        "properties": {
+          "subscription_status": {
+            "type": "string",
+            "description": "Only `\"canceled\"` is accepted (cancels the subscription + cascades networks)."
+          }
+        }
+      },
+      "VerificationCodeRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/verification-codes` — the unified, `RESTful` one-time\ncode resource (PR3). `purpose` binds the issued code so it can only be consumed\nby the matching flow.",
+        "required": [
+          "email",
+          "purpose"
+        ],
+        "properties": {
+          "email": {
+            "type": "string",
+            "description": "The account email a code should be issued for."
+          },
+          "purpose": {
+            "$ref": "#/components/schemas/CodePurpose",
+            "description": "What the code may be exchanged for (`signup` / `password_reset` / `enrollment`)."
+          }
+        }
+      },
+      "VerificationCodeResponse": {
+        "type": "object",
+        "description": "Response body for `POST /v1/verification-codes`.",
+        "properties": {
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The one-time code — `None` once it has been **emailed** (production), `Some`\nonly in the dev/no-op email path so the flow stays exercisable without a mailbox."
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "health",
+      "description": "Liveness"
+    },
+    {
+      "name": "enrollment",
+      "description": "Daemon enrollment + JWT issuance"
+    },
+    {
+      "name": "networks",
+      "description": "Network registration + availability"
+    },
+    {
+      "name": "tenants",
+      "description": "Account-plane tenant management"
+    },
+    {
+      "name": "auth",
+      "description": "Human/web authentication (password + federated login)"
+    },
+    {
+      "name": "billing",
+      "description": "Stripe billing webhook + checkout/portal"
+    }
+  ]
+}

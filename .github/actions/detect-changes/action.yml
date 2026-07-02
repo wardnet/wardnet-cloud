@@ -58,12 +58,15 @@ runs:
             - 'source/crates/app-tenants/**'
             - 'source/crates/subscriptions/**'
             - 'source/crates/billing/**'
+            - 'source/docs/openapi/tenants.json'
           ddns:
             - 'source/crates/ddns/**'
             - 'source/crates/app-ddns/**'
+            - 'source/docs/openapi/ddns.json'
           tunneller:
             - 'source/crates/tunneller/**'
             - 'source/crates/app-tunneller/**'
+            - 'source/docs/openapi/tunneller.json'
           # The My Account SPA is a self-contained yarn project; its own changes
           # only need the frontend leaf (Rust services are unaffected).
           account-dashboard-app:

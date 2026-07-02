@@ -1,0 +1,85 @@
+name: Deploy API docs site
+
+# Builds the multi-service / multi-version OpenAPI reference site
+# (source/api-docs-site) and publishes it to GitHub Pages.
+#
+# Triggers:
+#   - push to main        → refresh the committed `dev` spec
+#   - a published release  → a new service version appeared (Release assets are
+#                            the version source of truth)
+#   - workflow_dispatch    → manual redeploy
+#
+# One-time setup: Settings → Pages → Source = GitHub Actions.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "source/api-docs-site/**"
+      - "source/docs/openapi/**"
+      - ".github/workflows/deploy-docs-site.yml"
+  release:
+    types: [published]
+  workflow_dispatch:
+
+# Read repo contents (incl. release assets) to build; write Pages to deploy.
+permissions:
+  contents: read
+
+# Never run two Pages deploys at once.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build site
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Node
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+        with:
+          node-version: 22
+
+      - name: Build the docs site
+        working-directory: source/api-docs-site
+        env:
+          # Lets build.mjs enumerate release assets (the version source of truth).
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/build.mjs
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: source/api-docs-site/dist
+
+  deploy:
+    name: Deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

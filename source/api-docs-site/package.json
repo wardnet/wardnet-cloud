@@ -1,0 +1,10 @@
+{
+  "name": "@wardnet/api-docs-site",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Static GitHub Pages site rendering the Wardnet Cloud OpenAPI specs (all services, all versions) with Scalar.",
+  "scripts": {
+    "build": "node scripts/build.mjs"
+  }
+}

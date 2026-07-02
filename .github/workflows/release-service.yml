@@ -222,10 +222,28 @@ jobs:
           minisign-key-b64: ${{ secrets.WARDNET_MINISIGN_KEY }}
           minisign-password: ${{ secrets.WARDNET_MINISIGN_PASSWORD }}
 
+      - name: Stage OpenAPI spec + sha256
+        env:
+          SERVICE: ${{ inputs.service }}
+        run: |
+          set -euo pipefail
+          # The committed spec is drift-gated in CI, so the copy on this tagged
+          # commit is authoritative for this version. Attach it (+ a sha256
+          # sidecar) as a permanent Release asset — the docs site groups versions
+          # by this content hash.
+          SPEC="source/docs/openapi/${SERVICE}.json"
+          test -f "${SPEC}" || { echo "::error::missing ${SPEC}"; exit 1; }
+          cp "${SPEC}" "release-staging/${SERVICE}.json"
+          sha256sum "release-staging/${SERVICE}.json" | awk '{print $1}' \
+            > "release-staging/${SERVICE}.json.sha256"
+          ls -l release-staging
+
       - name: Attest SLSA build provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
-          subject-path: release-staging/*.tar.gz
+          subject-path: |
+            release-staging/*.tar.gz
+            release-staging/${{ inputs.service }}.json
 
       - name: Create GitHub Release
         env:
@@ -254,7 +272,9 @@ jobs:
           gh release create "${TAG}" "${ARGS[@]}" \
             release-staging/*.tar.gz \
             release-staging/*.tar.gz.sha256 \
-            release-staging/*.tar.gz.minisig
+            release-staging/*.tar.gz.minisig \
+            "release-staging/${SERVICE}.json" \
+            "release-staging/${SERVICE}.json.sha256"
 
   deploy:
     name: Deploy ${{ inputs.service }}

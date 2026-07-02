@@ -1,0 +1,40 @@
+name: Check OpenAPI
+
+# Reusable leaf: regenerate every service's OpenAPI spec from source and fail if
+# the committed docs/openapi/<service>.json copies are stale. The committed specs
+# are the source of truth the docs site and per-service Release assets build from,
+# so they must never drift from the annotated handlers. Invoked by the CI/PR
+# orchestrators, gated by detect-changes (any Rust service or shared code change).
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Regenerate specs · verify no drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: check-openapi
+
+      - name: Regenerate specs and verify no drift
+        run: make -C source check-openapi
