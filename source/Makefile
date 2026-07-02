@@ -21,7 +21,10 @@ DEV_CERTS_DIR    ?= dev-stack/certs
 # so it only runs for the dev-* targets, not every make invocation.
 DEV_DOCKER_HOST = $(shell docker info >/dev/null 2>&1 || podman machine inspect --format 'DOCKER_HOST=unix://{{.ConnectionInfo.PodmanSocket.Path}}' 2>/dev/null | head -1)
 
-.PHONY: check fmt clippy test e2e-certs e2e-build e2e-up e2e-test e2e-down e2e-all \
+OPENAPI_DIR ?= docs/openapi
+
+.PHONY: check fmt clippy test openapi check-openapi \
+        e2e-certs e2e-build e2e-up e2e-test e2e-down e2e-all \
         dev-certs dev-up dev-down dev-logs dev-app dev
 
 # ── Standard gates ──────────────────────────────────────────────────────────
@@ -35,6 +38,34 @@ clippy:
 
 test:
 	cargo test --workspace
+
+# ── OpenAPI specs (build artifact) ────────────────────────────────────────────
+# Emit each service's public OpenAPI spec to docs/openapi/<service>.json via its
+# `dump_openapi` bin. The committed specs are the source the docs site and the
+# per-service Release assets are built from; `check-openapi` drift-gates them in CI.
+#
+# The service set is derived from which crates ship a `dump_openapi` bin (single
+# source of truth): a new service is picked up automatically once it adds one.
+# The crate dir name is the service name and its package is `wardnet-<name>`.
+OPENAPI_SERVICES := $(patsubst crates/%/src/bin/dump_openapi.rs,%,$(wildcard crates/*/src/bin/dump_openapi.rs))
+
+openapi:
+	@mkdir -p $(OPENAPI_DIR)
+	@for svc in $(OPENAPI_SERVICES); do \
+	  echo "  dump_openapi $$svc"; \
+	  cargo run -q -p wardnet-$$svc --bin dump_openapi > $(OPENAPI_DIR)/$$svc.json || exit 1; \
+	done
+
+# Regenerate the specs and fail if the committed copies are stale OR uncommitted.
+# `git status --porcelain` (unlike `git diff`) also reports untracked files, so a
+# brand-new service's generated-but-uncommitted spec trips the gate instead of
+# passing green and failing later at release time.
+check-openapi: openapi
+	@if [ -n "$$(git status --porcelain -- $(OPENAPI_DIR))" ]; then \
+	  echo "openapi specs are stale or uncommitted — run 'make openapi' and commit the result:"; \
+	  git status --porcelain -- $(OPENAPI_DIR); \
+	  exit 1; \
+	fi
 
 # ── End-to-end mesh harness ───────────────────────────────────────────────────
 # Generate the dev mesh CA + per-service SPIFFE leaves + JWT keypair.

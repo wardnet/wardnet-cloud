@@ -1,0 +1,96 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  font-family:
+    "Inter Tight Variable", ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, sans-serif;
+}
+
+/* Wardnet design-system tokens (@wardnet/styles — packages/styles/styles.css).
+   These are the exact brand values, not approximations. The sidebar uses the DS
+   "chrome on dark surfaces" palette (the Ink sidebar), so the values below are
+   the light-theme --side-* tokens plus the Emerald accent. */
+:root {
+  --wn-side-bg: #11152b; /* --side-bg (Ink) */
+  --wn-side-line: #2a3155; /* --side-line */
+  --wn-side-ink: #c9cce0; /* --side-ink */
+  --wn-side-ink-2: #7e859b; /* --side-ink-2 (Mist, dark) */
+  --wn-side-ink-active: #ffffff; /* --side-ink-active */
+  --wn-side-active-bg: #1b2140; /* --side-active-bg (Ink 2) */
+  --wn-accent: #12b981; /* --accent (Wardnet Emerald) */
+}
+
+/* Retarget Scalar's sidebar palette to the DS tokens. Scalar attaches these vars
+   to its .dark-mode/.light-mode app-root scope, so overriding at the same scope
+   avoids needing !important. */
+.dark-mode,
+.light-mode {
+  --scalar-sidebar-background-1: var(--wn-side-bg);
+  --scalar-sidebar-color-1: var(--wn-side-ink);
+  --scalar-sidebar-color-2: var(--wn-side-ink-2);
+  --scalar-sidebar-color-active: var(--wn-accent);
+  --scalar-sidebar-item-hover-background: var(--wn-side-active-bg);
+  --scalar-sidebar-item-hover-color: var(--wn-side-ink-active);
+  --scalar-sidebar-item-active-background: var(--wn-side-active-bg);
+  --scalar-sidebar-border-color: var(--wn-side-line);
+  --scalar-sidebar-search-background: var(--wn-side-active-bg);
+  --scalar-sidebar-search-border-color: var(--wn-side-line);
+  --scalar-sidebar-search-color: var(--wn-side-ink);
+}
+
+/* Logo + service/version pickers injected at the top of Scalar's sidebar. */
+.wardnet-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  padding: 1rem 0.75rem 0.875rem;
+  border-bottom: 1px solid var(--wn-side-line);
+}
+
+.wardnet-logo {
+  width: 132px;
+  height: auto;
+  display: block;
+}
+
+.wardnet-subtitle {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--wn-side-ink-2);
+  margin-top: -0.2rem;
+  margin-bottom: 0.5rem; /* extra breathing room after the logo block */
+}
+
+.wardnet-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--wn-side-ink-2);
+}
+
+.wardnet-field select {
+  width: 100%;
+  background: var(--wn-side-active-bg);
+  color: var(--wn-side-ink);
+  border: 1px solid var(--wn-side-line);
+  border-radius: 6px; /* DS --radius-sm */
+  padding: 6px 8px;
+  font-size: 0.85rem;
+  text-transform: none;
+  letter-spacing: normal;
+  cursor: pointer;
+}
+
+.wardnet-field select:focus {
+  outline: 2px solid var(--wn-accent);
+}
