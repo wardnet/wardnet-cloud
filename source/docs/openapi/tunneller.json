@@ -1,0 +1,77 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Wardnet Tunneller API",
+    "description": "Wardnet Tunneller — multi-node SNI-passthrough reverse-tunnel edge",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/v1/health": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "description": "Liveness probe. Returns 200 OK when the bridge process is running. No authentication required. Used by load balancers and uptime monitors.",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "Bridge is alive"
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/v1/tunnel": {
+      "get": {
+        "tags": [
+          "tunnel"
+        ],
+        "description": "Upgrade to a reverse-tunnel WebSocket. The daemon dials this with a network-scoped identity JWT and keeps the connection open; the Tunneller forwards inbound TLS connections arriving at its SNI demuxer down the tunnel, and the daemon decrypts them locally so the private key never leaves the device. \n\n**Frame protocol** (binary WebSocket messages): \n- `CONNECT (0x01)`: node→pi, 7 bytes `[type, conn_id:u32be, dest_port:u16be]` - `READY   (0x02)`: pi→node, 5 bytes `[type, conn_id:u32be]` - `DATA    (0x03)`: both, 5+N bytes `[type, conn_id:u32be, payload…]` - `CLOSE   (0x04)`: both, 5 bytes `[type, conn_id:u32be]` - `PING    (0x05)`: pi→node, 5 bytes (conn_id=0) - `PONG    (0x06)`: node→pi, 5 bytes (conn_id=0)",
+        "operationId": "tunnel_connect",
+        "responses": {
+          "101": {
+            "description": "Switching protocols — tunnel established"
+          },
+          "401": {
+            "description": "Authentication required or invalid"
+          },
+          "403": {
+            "description": "Not a network-scoped daemon, or network/subscription not eligible"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ErrorBody": {
+        "type": "object",
+        "description": "JSON body returned for every error response.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "health",
+      "description": "Liveness"
+    },
+    {
+      "name": "tunnel",
+      "description": "Reverse-tunnel WebSocket endpoint"
+    }
+  ]
+}

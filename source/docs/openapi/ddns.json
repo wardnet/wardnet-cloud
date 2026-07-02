@@ -1,0 +1,186 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Wardnet DDNS API",
+    "description": "Wardnet DDNS service — regional DNS reconciler (provisioner + reaper) + report-IP/ACME",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/v1/acme-challenge": {
+      "put": {
+        "tags": [
+          "acme"
+        ],
+        "description": "Set the DNS-01 ACME challenge TXT records for the calling daemon's network. Creates one `_acme-challenge.<slug>.<parent>` TXT record per supplied value. Returns 409 if the network is not yet active.",
+        "operationId": "set_acme_challenge",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetAcmeChallengeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "TXT records created"
+          },
+          "401": {
+            "description": "Unauthenticated"
+          },
+          "403": {
+            "description": "Not a network-scoped daemon caller"
+          },
+          "409": {
+            "description": "Network not yet active, or a concurrent ACME update was in flight; retry"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "acme"
+        ],
+        "description": "Remove the DNS-01 ACME challenge TXT records for the calling daemon's network. Idempotent — safe to call even if none is set.",
+        "operationId": "delete_acme_challenge",
+        "responses": {
+          "204": {
+            "description": "TXT records deleted (or were already absent)"
+          },
+          "401": {
+            "description": "Unauthenticated"
+          },
+          "403": {
+            "description": "Not a network-scoped daemon caller"
+          },
+          "409": {
+            "description": "A concurrent ACME challenge update was in flight; retry"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/v1/health": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "description": "Liveness probe. Returns 200 OK when the bridge process is running. No authentication required. Used by load balancers and uptime monitors.",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "Bridge is alive"
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/v1/ip": {
+      "put": {
+        "tags": [
+          "ip"
+        ],
+        "description": "Report the calling daemon's current public IPv4 address. DDNS updates the network's A record in place (it never creates one — the provisioner does that) and stores the reported IP. The target network is the token's `net` claim.",
+        "operationId": "report_ip",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReportIpRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "IP reported"
+          },
+          "400": {
+            "description": "Malformed or reserved/non-routable IP"
+          },
+          "401": {
+            "description": "Unauthenticated"
+          },
+          "403": {
+            "description": "Not a network-scoped daemon caller"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ErrorBody": {
+        "type": "object",
+        "description": "JSON body returned for every error response.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "ReportIpRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/ip`.",
+        "required": [
+          "ip"
+        ],
+        "properties": {
+          "ip": {
+            "type": "string",
+            "description": "The daemon's current public IPv4 address, e.g. `\"93.184.216.34\"`.\nMust be a globally routable unicast address (private/reserved/multicast\naddresses are rejected with `400`)."
+          }
+        }
+      },
+      "SetAcmeChallengeRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/acme-challenge`.",
+        "required": [
+          "values"
+        ],
+        "properties": {
+          "values": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The ACME DNS-01 challenge token values (raw, no quoting needed). A\n**per-user wildcard certificate** authorizes its apex and wildcard SANs\nthrough the same `_acme-challenge` name, so this carries one value per SAN\n(typically two), published as that many TXT records at once."
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "health",
+      "description": "Liveness"
+    },
+    {
+      "name": "ip",
+      "description": "Daemon IP reporting"
+    },
+    {
+      "name": "acme",
+      "description": "ACME DNS-01 challenge management"
+    }
+  ]
+}

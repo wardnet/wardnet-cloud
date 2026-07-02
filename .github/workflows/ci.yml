@@ -104,6 +104,20 @@ jobs:
     uses: ./.github/workflows/account-dashboard-app.yml
     secrets: inherit
 
+  # Drift-gate the committed OpenAPI specs (see pr.yml for rationale).
+  check-openapi:
+    name: Check OpenAPI
+    needs: preflight
+    if: >
+      needs.preflight.outputs.tenants == 'true' ||
+      needs.preflight.outputs.ddns == 'true' ||
+      needs.preflight.outputs.tunneller == 'true' ||
+      needs.preflight.outputs.all == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/check-openapi.yml
+    secrets: inherit
+
   # The mesh e2e harness runs nightly (schedule) + on demand, NOT on every push to
   # main — it is heavy and flaky on shared runners (see .github/workflows/e2e.yml).
 

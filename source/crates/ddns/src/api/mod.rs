@@ -22,10 +22,13 @@ use wardnet_common::health;
 
 use crate::state::AppState;
 
+/// Spec version tracks the crate version (== the release tag `ddns-v<version>`).
+const API_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// `OpenAPI` metadata for the DDNS public API.
 #[derive(OpenApi)]
 #[openapi(
-    info(title = "Wardnet DDNS API", version = "0.1.0"),
+    info(title = "Wardnet DDNS API", version = API_VERSION),
     tags(
         (name = "health", description = "Liveness"),
         (name = "ip", description = "Daemon IP reporting"),
@@ -35,17 +38,41 @@ use crate::state::AppState;
 )]
 struct ApiDoc;
 
+// The route registrations, grouped by caller kind. Single-sourced here so [`router`]
+// (which adds the auth `route_layer`s + state) and [`api_doc`] (which needs only the
+// paths) can never drift on which endpoints exist.
+fn bootstrap_routes() -> OpenApiRouter<AppState> {
+    // Bootstrap: health only. No auth middleware.
+    health::register(OpenApiRouter::new())
+}
+
+fn daemon_routes() -> OpenApiRouter<AppState> {
+    // Daemon plane: report-IP + ACME.
+    acme::register(ip::register(OpenApiRouter::new()))
+}
+
+/// The DDNS public `OpenAPI` document (paths + schemas), with no middleware or state.
+///
+/// Emitted as the committed build artifact by the `dump_openapi` bin. Mirrors the
+/// merge chain in [`router`] minus the auth layers, which do not affect the spec.
+#[must_use]
+pub fn api_doc() -> utoipa::openapi::OpenApi {
+    let (_router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
+        .merge(bootstrap_routes())
+        .merge(daemon_routes())
+        .split_for_parts();
+    api
+}
+
 /// Build the public API router.
 pub fn router(state: AppState) -> Router {
-    // Bootstrap: health only. No auth middleware.
-    let bootstrap = health::register(OpenApiRouter::new());
+    let bootstrap = bootstrap_routes();
 
-    // Daemon plane: report-IP + ACME. JWT + PoP, scoped to the token's `net`.
-    let daemon = acme::register(ip::register(OpenApiRouter::new())).route_layer(
-        from_fn_with_state(state.clone(), |st: State<AppState>, r, n| {
-            authenticate(CallerType::DAEMON, st, r, n)
-        }),
-    );
+    // Daemon plane: JWT + PoP, scoped to the token's `net`.
+    let daemon = daemon_routes().route_layer(from_fn_with_state(
+        state.clone(),
+        |st: State<AppState>, r, n| authenticate(CallerType::DAEMON, st, r, n),
+    ));
 
     let (router, _openapi) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .merge(bootstrap)
@@ -54,3 +81,6 @@ pub fn router(state: AppState) -> Router {
 
     wardnet_common::telemetry::install_http_layers(router).with_state(state)
 }
+
+#[cfg(test)]
+mod tests;

@@ -101,6 +101,22 @@ jobs:
     uses: ./.github/workflows/account-dashboard-app.yml
     secrets: inherit
 
+  # Drift-gate the committed OpenAPI specs. A handler/DTO change in any service
+  # (or shared contract in common) alters an emitted spec, so gate on any Rust
+  # service bucket or `all`.
+  check-openapi:
+    name: Check OpenAPI
+    needs: preflight
+    if: >
+      needs.preflight.outputs.tenants == 'true' ||
+      needs.preflight.outputs.ddns == 'true' ||
+      needs.preflight.outputs.tunneller == 'true' ||
+      needs.preflight.outputs.all == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/check-openapi.yml
+    secrets: inherit
+
   # NOTE: the mesh e2e harness is intentionally NOT a PR leaf. It is heavy and
   # flaky on shared runners (see .github/workflows/e2e.yml), so it runs nightly
   # on a schedule + on demand (workflow_dispatch) instead of gating every merge.
@@ -140,6 +156,7 @@ jobs:
         build-ddns,
         build-tunneller,
         account-dashboard-app,
+        check-openapi,
         coverage,
       ]
     if: always()
