@@ -7,11 +7,16 @@ name: E2E Mesh
 # sweep). See source/end2end-tests/mesh/README.md.
 #
 # Triggers: a nightly `schedule`, manual `workflow_dispatch`, and `workflow_call`
-# (so another workflow can still invoke it). It is deliberately NOT a required PR
-# gate: the harness is heavy (multi-minute container build + a timing-sensitive
-# tombstone flow) and flaky on shared CI runners, so it runs OUT of the merge path
-# and is monitored via the nightly run / on demand. Re-promote it to a PR gate once
-# it is hardened (explicit readiness gating + container-log capture on failure).
+# (so another workflow can still invoke it). It is currently NOT a required PR gate
+# while it builds a green-in-CI track record. It is now hardened per issue #4:
+#   - readiness gating: compose `/v1/health` healthchecks + `up --wait` block until
+#     every service is serving, so the flow never races a cold, still-migrating boot;
+#   - build resilience: cargo-chef deps layer cached across runs via the GHA cache
+#     backend (compose.ci.yaml), so a mid-build crates.io drop is survived on a hit;
+#   - CI timeouts: the flow poll is `E2E_POLL_TIMEOUT`-tunable (180s here);
+#   - diagnostics: container logs are captured as an artifact on failure.
+# Re-promote it to a required PR leaf (add to pr.yml + the `all-checks-passed`
+# aggregator) once several nightly / dispatch runs are reliably green.
 
 on:
   workflow_call:
@@ -47,11 +52,55 @@ jobs:
           workspaces: source
           cache-key: e2e
 
-      - name: Run the mesh e2e harness
-        # `make e2e-all` is one-shot: gen certs (xtask) → build+up the compose
-        # stack → run the ignored tombstone test → guaranteed teardown. Driven
-        # from source/. ubuntu-latest ships the Docker Compose v2 plugin as
-        # `docker compose`, not the v1 `docker-compose` hyphen-binary, so
-        # override COMPOSE.
+      # `type=gha` cache export (compose.ci.yaml) needs the docker-container
+      # buildx driver; `install: true` makes it the default builder so
+      # `docker compose build` routes through it.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        with:
+          install: true
+
+      # ubuntu-latest ships Docker Compose v2 as `docker compose` (not the v1
+      # `docker-compose` hyphen-binary), so override COMPOSE on every make call.
+      #
+      # Steps are split (up --wait → test → logs → down) instead of the one-shot
+      # `make e2e-all` so logs can be captured as an artifact and teardown is
+      # guaranteed. Build and up are a SINGLE `up --build --wait`: compose builds
+      # each image (through buildx, so the compose.ci.yaml GHA cache applies) and
+      # loads it into the local image store for the run it is about to start — one
+      # build, no separate-build/`up`-load ambiguity.
+
+      - name: Build + bring the mesh stack up (cargo-chef + GHA cache, wait for healthy)
         working-directory: source
-        run: make e2e-all COMPOSE="docker compose"
+        env:
+          # Route the compose build through buildx bake so the `cache_to`/`cache_from`
+          # in compose.ci.yaml are honoured.
+          COMPOSE_BAKE: "true"
+        run: >-
+          make e2e-up COMPOSE="docker compose"
+          COMPOSE_FILES="-f end2end-tests/mesh/compose.yaml -f end2end-tests/mesh/compose.ci.yaml"
+
+      - name: Run the tombstone + observability flow
+        working-directory: source
+        env:
+          # Headroom over the default 90s for async reconcile lag on a loaded runner.
+          E2E_POLL_TIMEOUT: "180"
+        run: make e2e-test COMPOSE="docker compose"
+
+      - name: Capture container logs on failure
+        if: failure()
+        working-directory: source
+        run: make e2e-logs COMPOSE="docker compose" > e2e-logs.txt 2>&1
+
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: e2e-mesh-logs
+          path: source/e2e-logs.txt
+          if-no-files-found: warn
+
+      - name: Tear down the mesh stack
+        if: always()
+        working-directory: source
+        run: make e2e-down COMPOSE="docker compose"

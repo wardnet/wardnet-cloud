@@ -22,11 +22,16 @@
 
 use std::time::{Duration, Instant};
 
-const POLL_TIMEOUT: Duration = Duration::from_secs(90);
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// How long to wait for each signal to land before failing. Default 90s (local);
+/// CI overrides via `E2E_POLL_TIMEOUT` for headroom on a loaded shared runner.
+fn poll_timeout() -> Duration {
+    Duration::from_secs(env_or("E2E_POLL_TIMEOUT", "90").parse().unwrap_or(90))
 }
 
 /// Poll `check` until it yields `true` or the timeout elapses; returns whether it
@@ -38,7 +43,7 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<bool>>,
 {
-    let deadline = Instant::now() + POLL_TIMEOUT;
+    let deadline = Instant::now() + poll_timeout();
     loop {
         match check().await {
             Ok(true) => return true,

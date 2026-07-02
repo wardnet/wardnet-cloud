@@ -36,12 +36,17 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use wardnet_common::token::{ClaimsSpec, PrincipalType, Signer};
 
-/// How long to wait for each asynchronous reconcile step before failing.
-const POLL_TIMEOUT: Duration = Duration::from_secs(90);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// How long to wait for each asynchronous reconcile step before failing. Default
+/// 90s (local); CI overrides via `E2E_POLL_TIMEOUT` to absorb reconcile lag on a
+/// loaded shared runner.
+fn poll_timeout() -> Duration {
+    Duration::from_secs(env_or("E2E_POLL_TIMEOUT", "90").parse().unwrap_or(90))
 }
 
 #[tokio::test]
@@ -286,20 +291,21 @@ fn parse_status_code(response: &str) -> Option<u16> {
         .ok()
 }
 
-/// Poll `cond` until it returns true or [`POLL_TIMEOUT`] elapses.
+/// Poll `cond` until it returns true or [`poll_timeout`] elapses.
 async fn await_until<F, Fut>(label: &str, mut cond: F)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let deadline = Instant::now() + POLL_TIMEOUT;
+    let timeout = poll_timeout();
+    let deadline = Instant::now() + timeout;
     loop {
         if cond().await {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "timed out after {POLL_TIMEOUT:?} waiting for: {label}"
+            "timed out after {timeout:?} waiting for: {label}"
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }

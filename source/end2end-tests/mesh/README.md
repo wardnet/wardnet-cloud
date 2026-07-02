@@ -48,15 +48,31 @@ instrumented work-queue reads). Both `#[ignore]`d tests run under `make e2e-test
 From `source/`:
 
 ```sh
-make e2e-all      # gen certs → build images → up → run test → tear down (always)
+make e2e-all      # gen certs → build → up (wait for healthy) → test → tear down (always)
 ```
+
+`e2e-all` dumps all container logs before teardown if the run fails, so a red run is
+debuggable even though `down -v` drops the volumes.
 
 Or step by step (useful when iterating):
 
 ```sh
-make e2e-up       # gen certs + compose up -d --build
+make e2e-up       # gen certs + compose up -d --build --wait (blocks until healthy)
 make e2e-test     # cargo test -p wardnet-e2e-mesh -- --ignored
+make e2e-logs     # dump all container logs (diagnostics)
 make e2e-down     # compose down -v
+```
+
+**Readiness gating:** `tenants` and `ddns` carry a `/v1/health` compose healthcheck,
+so `up --wait` blocks until both are actually serving (i.e. migrations have run) —
+the test never races a cold, still-migrating boot.
+
+**Tuning the flow timeout:** each asynchronous reconcile step is polled for
+`E2E_POLL_TIMEOUT` seconds (default `90`). CI raises it for headroom on a loaded
+shared runner:
+
+```sh
+E2E_POLL_TIMEOUT=180 make e2e-test
 ```
 
 ### Container engine
@@ -73,8 +89,10 @@ export DOCKER_HOST="unix://$(podman machine inspect --format '{{.ConnectionInfo.
 | Path                         | What                                              |
 | ---------------------------- | ------------------------------------------------- |
 | `compose.yaml`               | the topology                                      |
+| `compose.ci.yaml`            | CI-only override: GHA build-cache backend         |
 | `wiremock/mappings/`         | mock Cloudflare v4 API responses                  |
-| `tests/tombstone_flow.rs`    | the `#[ignore]`d e2e test                         |
+| `tests/tombstone_flow.rs`    | the `#[ignore]`d tombstone-lifecycle e2e test     |
+| `tests/observability.rs`     | the `#[ignore]`d OTLP-pipeline e2e test           |
 | `certs/`                     | generated dev material (git-ignored)              |
 
 Service Dockerfiles live next to each crate (`crates/{tenants,ddns,tunneller}/Dockerfile`).
